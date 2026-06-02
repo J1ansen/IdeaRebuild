@@ -1,0 +1,27 @@
+experiment:
+  name: faithful_gp2f_baseline
+  seed: 0
+  target_dataset: Cora
+
+pretrained:
+  # Existing checkpoint to reuse. The runner should fail fast if this file is
+  # missing; it should not launch pretraining during a single target run.
+  checkpoint_path: /Users/jackson/MyIdea/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl
+  freeze_backbone: true
+
+model:
+  hidden_dim: 128
+  adapter_bottleneck_dim: 16
+  adapter_beta_init: 0.01
+
+loss:
+  use_cls: true
+  use_original_contrastive: false
+  use_original_topology_fusion: false
+  lambda_ctr: 0.0
+  lambda_fus: 0.0
+
+training:
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0.0005
