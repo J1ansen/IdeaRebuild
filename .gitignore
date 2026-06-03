@@ -5,7 +5,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
-data/
 logs/
 checkpoints/
 outputs/
@@ -13,7 +12,8 @@ wandb/
 *.pt
 *.pth
 *.pkl
+!pretrained_gnns/
+!pretrained_gnns/*.pkl
 *.npz
 *.npy
 .DS_Store
-

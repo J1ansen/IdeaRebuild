@@ -40,4 +40,105 @@ The default baseline config points to:
 
 The loader in `models/backbones.py` fails fast if the checkpoint is missing and
 freezes the loaded GCN by default.
+
+## Reusing Existing Datasets
+
+The default config points to the existing PyG cache:
+
+```text
+/Users/jackson/MyIdea/data
+```
+
+Dataset loaders should use this as their root and should fail if a required
+processed dataset is missing, instead of silently downloading during baseline
+experiments.
+
+## Minimal Baseline Run
+
+```bash
+source .venv/bin/activate
+python -m experiments.run_gp2f_baseline \
+  --config configs/gp2f_baseline.yaml \
+  --target_dataset Cora \
+  --epochs 3
+```
+
+For repeated 5-shot splits, use `--runs`. Seeds are generated as
+`seed, seed + 1, ...` unless explicit seeds are set in the config.
+
+```bash
+python -m experiments.run_gp2f_baseline \
+  --config configs/gp2f_baseline.yaml \
+  --target_dataset PubMed \
+  --runs 5
+```
+
+The command writes metrics, loss curves, and a config snapshot under:
+
+```text
+outputs/gp2f_baseline/<dataset>/<timestamp>/
+```
+
+## Formal Experiment Runs
+
+Run Cora-pretrained GRACE checkpoint on PubMed with 5 seeds:
+
+```bash
+python -m experiments.run_gp2f_baseline \
+  --config configs/gp2f_baseline.yaml \
+  --target_dataset PubMed \
+  --preset B0 \
+  --seeds 0,1,2,3,4
+```
+
+Compare original GP2F structure losses:
+
+```bash
+python -m experiments.run_gp2f_baseline \
+  --config configs/gp2f_baseline.yaml \
+  --target_dataset PubMed \
+  --preset B1 \
+  --seeds 0,1,2,3,4
+```
+
+Useful overrides:
+
+```bash
+--epochs 200
+--lr 0.001
+--weight_decay 0.0005
+--patience 40
+--output_dir outputs/gp2f_baseline
+```
+
+Each run group writes per-seed metrics/checkpoints plus `summary.json` and
+`summary.csv`, including `mean+-std` fields for test accuracy and macro-F1.
+
+## Official-Style GP2F Compatibility
+
+The stable default keeps bounded fusion and conservative zero-init adapters.
+To run closer to the official GP2F implementation, merge the compatibility
+style config:
+
+```bash
+python -m experiments.run_gp2f_baseline \
+  --config configs/gp2f_baseline.yaml \
+  --style_config configs/gp2f_official_style.yaml \
+  --target_dataset Cora \
+  --preset B1 \
+  --seeds 0,1,2,3,4
+```
+
+This switches to:
+
+- `Linear + PReLU` feature projector
+- official GP2F adapter initialization
+- raw learnable fusion alpha
+- train-loss early stopping
+
+The default config remains the stable variant for heterophily-oriented
+experiments.
+
+The runner uses a live `tqdm` progress bar with ETA and prints final
+`mean+-std` summaries for test accuracy and macro-F1.
 - feature-risk candidate pools

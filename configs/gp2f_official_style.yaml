@@ -1,0 +1,11 @@
+model:
+  input_aligner: official_projector
+  adapter_style: official_gp2f
+  adapter_bottleneck_dim: 32
+  adapter_alpha_init: 0.1
+  fusion_alpha_style: raw
+  alpha_init: 0.5
+
+training:
+  early_stop_metric: train_loss
+
