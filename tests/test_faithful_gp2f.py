@@ -53,6 +53,20 @@ def test_forward_outputs_and_alpha_range() -> None:
     assert torch.isfinite(logits).all()
 
 
+def test_forward_with_h_pre_reuses_supplied_representation() -> None:
+    model = _model()
+    model.eval()
+    x, edge_index, _, _ = _toy_graph()
+
+    with torch.no_grad():
+        h_pre = model.encode_frozen(x, edge_index)
+        reused = model.forward_with_h_pre(x, edge_index, h_pre=h_pre, return_aux=True)
+        regular = model(x, edge_index, return_aux=True)
+
+    assert reused["h_pre"].data_ptr() == h_pre.data_ptr()
+    assert torch.allclose(reused["logits"], regular["logits"], atol=1e-6)
+
+
 def test_forward_backward_has_no_nan() -> None:
     model = _model()
     x, edge_index, y, train_mask = _toy_graph()
@@ -104,6 +118,39 @@ def test_disabled_structure_losses_do_not_call_structure_paths(monkeypatch) -> N
     )
 
     assert torch.isfinite(loss_out.total)
+
+
+def test_topology_fusion_loss_depends_on_alpha() -> None:
+    torch.manual_seed(11)
+    x, edge_index, y, train_mask = _toy_graph()
+    h_pre = torch.randn(x.size(0), 7)
+    h_adp = torch.randn(x.size(0), 7)
+    logits = torch.randn(x.size(0), 2, requires_grad=True)
+    alpha = torch.tensor(0.7, requires_grad=True)
+    h_mix = alpha * h_pre + (1.0 - alpha) * h_adp
+
+    loss_out = compute_gp2f_loss(
+        logits=logits,
+        labels=y,
+        train_mask=train_mask,
+        h_pre=h_pre,
+        h_adp=h_adp,
+        h_mix=h_mix,
+        alpha=alpha,
+        edge_index=edge_index,
+        cfg=GP2FLossConfig(
+            use_original_contrastive=False,
+            use_original_topology_fusion=True,
+            lambda_ctr=0.0,
+            lambda_fus=1.0,
+        ),
+    )
+    loss_out.total.backward()
+
+    assert loss_out.topology_mode == "dense_alpha_consistency"
+    assert alpha.grad is not None
+    assert torch.isfinite(alpha.grad)
+    assert abs(float(alpha.grad.item())) > 0.0
 
 
 def test_toy_graph_smoke_training_three_epochs() -> None:

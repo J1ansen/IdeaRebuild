@@ -91,13 +91,22 @@ python -m experiments.run_gp2f_baseline \
   --seeds 0,1,2,3,4
 ```
 
-Compare original GP2F structure losses:
+The built-in presets isolate each GP2F loss component:
+
+| Preset | Losses |
+|---|---|
+| `B0` | `CE` |
+| `B1` | `CE + L_ctr` |
+| `B2` | `CE + L_fus` |
+| `B3` | `CE + L_ctr + L_fus` |
+
+Compare the full original GP2F structure-loss setting:
 
 ```bash
 python -m experiments.run_gp2f_baseline \
   --config configs/gp2f_baseline.yaml \
   --target_dataset PubMed \
-  --preset B1 \
+  --preset B3 \
   --seeds 0,1,2,3,4
 ```
 
@@ -113,12 +122,15 @@ Useful overrides:
 
 Each run group writes per-seed metrics/checkpoints plus `summary.json` and
 `summary.csv`, including `mean+-std` fields for test accuracy and macro-F1.
+The summaries also record whether topology loss used dense faithful consistency
+or the sampled approximation path.
 
 ## Official-Style GP2F Compatibility
 
-The stable default keeps bounded fusion and conservative zero-init adapters.
-To run closer to the official GP2F implementation, merge the compatibility
-style config:
+The stable default is `StableDualBranch`: bounded fusion and conservative
+zero-init adapters. It should not be reported as an exact official GP2F
+reproduction. To run closer to the official GP2F implementation, merge the
+compatibility style config:
 
 ```bash
 python -m experiments.run_gp2f_baseline \

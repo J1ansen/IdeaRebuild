@@ -85,6 +85,16 @@ class FaithfulGP2F(nn.Module):
     ) -> torch.Tensor:
         return self.backbone(x, edge_index, edge_weight)
 
+    def encode_frozen(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encode with the frozen pretrained branch without changing forward semantics."""
+
+        return self._encode_backbone(x, edge_index, edge_weight)
+
     def _encode_adapted(
         self,
         x: torch.Tensor,
@@ -125,6 +135,39 @@ class FaithfulGP2F(nn.Module):
             adapted_edge_weight = edge_weight
 
         h_pre = self._encode_backbone(x, edge_index, edge_weight)
+        return self.forward_with_h_pre(
+            x,
+            edge_index,
+            h_pre=h_pre,
+            adapted_x=adapted_x,
+            adapted_edge_index=adapted_edge_index,
+            adapted_edge_weight=adapted_edge_weight,
+            return_aux=return_aux,
+        )
+
+    def forward_with_h_pre(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        h_pre: torch.Tensor,
+        adapted_x: torch.Tensor | None = None,
+        adapted_edge_index: torch.Tensor | None = None,
+        adapted_edge_weight: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | dict[str, Any]:
+        """Forward using a precomputed frozen-branch representation.
+
+        This keeps the default ``forward`` behavior unchanged while allowing
+        prompt runners to share exactly the same ``h_pre`` tensor between
+        prompt evidence and final GP2F fusion.
+        """
+
+        if adapted_x is None:
+            adapted_x = x
+        if adapted_edge_index is None:
+            adapted_edge_index = edge_index
+
         h_adp_full = self._encode_adapted(adapted_x, adapted_edge_index, adapted_edge_weight)
         h_adp = h_adp_full[: h_pre.size(0)]
 

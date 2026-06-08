@@ -31,6 +31,8 @@ class GP2FLossOutput:
     cls: torch.Tensor
     contrastive: torch.Tensor
     topology_fusion: torch.Tensor
+    contrastive_mode: str = "disabled"
+    topology_mode: str = "disabled"
 
     def to_log_dict(self) -> dict[str, float]:
         return {
@@ -38,6 +40,12 @@ class GP2FLossOutput:
             "cls": float(self.cls.detach().item()),
             "contrastive": float(self.contrastive.detach().item()),
             "topology_fusion": float(self.topology_fusion.detach().item()),
+        }
+
+    def to_metadata_dict(self) -> dict[str, str]:
+        return {
+            "contrastive_mode": self.contrastive_mode,
+            "topology_mode": self.topology_mode,
         }
 
 
@@ -119,6 +127,12 @@ def _similarity_threshold(fused_similarity: torch.Tensor, percentile: float) -> 
     return torch.quantile(fused_similarity[mask], float(percentile) / 100.0)
 
 
+def _as_alpha_tensor(alpha: torch.Tensor | float, reference: torch.Tensor) -> torch.Tensor:
+    if isinstance(alpha, torch.Tensor):
+        return alpha.to(device=reference.device, dtype=reference.dtype)
+    return torch.tensor(float(alpha), device=reference.device, dtype=reference.dtype)
+
+
 def original_topology_fusion_loss(
     fused_similarity: torch.Tensor,
     edge_index: torch.Tensor,
@@ -141,25 +155,77 @@ def original_topology_fusion_loss(
     return (loss_map * constraint_mask).sum() / (constraint_mask.sum() + 1e-8)
 
 
+def _alpha_fused_similarity(
+    h_pre: torch.Tensor,
+    h_adp: torch.Tensor,
+    alpha: torch.Tensor | float,
+) -> torch.Tensor:
+    alpha_t = _as_alpha_tensor(alpha, h_pre)
+    pre_sim = _similarity(h_pre, h_pre)
+    adp_sim = _similarity(h_adp, h_adp)
+    return alpha_t * pre_sim + (1.0 - alpha_t) * adp_sim
+
+
+def _sample_negative_pairs(
+    *,
+    num_nodes: int,
+    edge_index: torch.Tensor,
+    count: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if count <= 0:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+
+    edge_hash = edge_index[0] * num_nodes + edge_index[1]
+    neg_src_parts: list[torch.Tensor] = []
+    neg_dst_parts: list[torch.Tensor] = []
+    remaining = int(count)
+    attempts = 0
+    while remaining > 0 and attempts < 10:
+        attempts += 1
+        draw = max(remaining * 2, 16)
+        src = torch.randint(0, num_nodes, (draw,), device=device)
+        dst = torch.randint(0, num_nodes, (draw,), device=device)
+        candidate_hash = src * num_nodes + dst
+        keep = (src != dst) & ~torch.isin(candidate_hash, edge_hash)
+        src = src[keep][:remaining]
+        dst = dst[keep][:remaining]
+        if src.numel() > 0:
+            neg_src_parts.append(src)
+            neg_dst_parts.append(dst)
+            remaining -= int(src.numel())
+
+    if not neg_src_parts:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+    neg_src = torch.cat(neg_src_parts, dim=0)[:count]
+    neg_dst = torch.cat(neg_dst_parts, dim=0)[:count]
+    return neg_src, neg_dst
+
+
 def sampled_original_topology_fusion_loss(
-    h_mix: torch.Tensor,
+    h_pre: torch.Tensor,
+    h_adp: torch.Tensor,
+    alpha: torch.Tensor | float,
     edge_index: torch.Tensor,
     *,
     tau: float = 0.05,
+    percentile: float = 70.0,
     sample_size: int = 20000,
 ) -> torch.Tensor:
-    """Memory-safe sampled BCE against original topology for large graphs."""
+    """Sampled approximation of GP2F topology consistency against original topology."""
 
-    num_nodes = h_mix.size(0)
-    device = h_mix.device
+    num_nodes = h_pre.size(0)
+    device = h_pre.device
     if num_nodes <= 1 or edge_index.numel() == 0:
-        return h_mix.new_tensor(0.0)
+        return h_pre.new_tensor(0.0)
 
     edge_src, edge_dst = edge_index[0], edge_index[1]
     keep = edge_src != edge_dst
     edge_src, edge_dst = edge_src[keep], edge_dst[keep]
     if edge_src.numel() == 0:
-        return h_mix.new_tensor(0.0)
+        return h_pre.new_tensor(0.0)
 
     half = max(1, int(sample_size) // 2)
     pos_count = min(half, int(edge_src.numel()))
@@ -168,26 +234,42 @@ def sampled_original_topology_fusion_loss(
     pos_dst = edge_dst[pos_perm]
 
     neg_count = max(1, int(sample_size) - pos_count)
-    neg_src = torch.randint(0, num_nodes, (neg_count,), device=device)
-    neg_dst = torch.randint(0, num_nodes, (neg_count,), device=device)
-    non_self = neg_src != neg_dst
-    neg_src, neg_dst = neg_src[non_self], neg_dst[non_self]
+    neg_src, neg_dst = _sample_negative_pairs(
+        num_nodes=num_nodes,
+        edge_index=edge_index,
+        count=neg_count,
+        device=device,
+    )
     if neg_src.numel() == 0:
-        return h_mix.new_tensor(0.0)
+        return h_pre.new_tensor(0.0)
 
     src = torch.cat([pos_src, neg_src], dim=0)
     dst = torch.cat([pos_dst, neg_dst], dim=0)
     target = torch.cat(
         [
-            torch.ones(pos_src.size(0), device=device, dtype=h_mix.dtype),
-            torch.zeros(neg_src.size(0), device=device, dtype=h_mix.dtype),
+            torch.ones(pos_src.size(0), device=device, dtype=h_pre.dtype),
+            torch.zeros(neg_src.size(0), device=device, dtype=h_pre.dtype),
         ],
         dim=0,
     )
-    h_norm = F.normalize(h_mix, dim=-1, eps=1e-12)
-    logits = (h_norm[src] * h_norm[dst]).sum(dim=-1)
-    prob = torch.sigmoid(logits / max(float(tau), 1e-6))
-    return F.binary_cross_entropy(prob, target)
+    alpha_t = _as_alpha_tensor(alpha, h_pre)
+    pre_norm = F.normalize(h_pre, dim=-1, eps=1e-12)
+    adp_norm = F.normalize(h_adp, dim=-1, eps=1e-12)
+    pre_sim = (pre_norm[src] * pre_norm[dst]).sum(dim=-1)
+    adp_sim = (adp_norm[src] * adp_norm[dst]).sum(dim=-1)
+    fused_similarity = alpha_t * pre_sim + (1.0 - alpha_t) * adp_sim
+
+    with torch.no_grad():
+        threshold = torch.quantile(fused_similarity.detach(), float(percentile) / 100.0)
+        constraint_mask = ((fused_similarity > threshold) & (target > 0)) | (
+            (fused_similarity <= threshold) & (target <= 0)
+        )
+    if not bool(constraint_mask.any()):
+        return h_pre.new_tensor(0.0)
+
+    prob = torch.sigmoid(fused_similarity / max(float(tau), 1e-6))
+    loss_map = F.binary_cross_entropy(prob, target, reduction="none")
+    return (loss_map * constraint_mask.float()).sum() / (constraint_mask.float().sum() + 1e-8)
 
 
 def compute_gp2f_loss(
@@ -198,6 +280,7 @@ def compute_gp2f_loss(
     h_pre: torch.Tensor,
     h_adp: torch.Tensor,
     h_mix: torch.Tensor,
+    alpha: torch.Tensor | float | None = None,
     edge_index: torch.Tensor,
     cfg: GP2FLossConfig,
 ) -> GP2FLossOutput:
@@ -207,9 +290,11 @@ def compute_gp2f_loss(
         cls = logits.new_tensor(0.0)
 
     contrastive = logits.new_tensor(0.0)
+    contrastive_mode = "disabled"
     pre_sim = adp_sim = None
     if cfg.use_original_contrastive and float(cfg.lambda_ctr) > 0:
         if h_pre.size(0) > int(cfg.dense_contrastive_max_nodes):
+            contrastive_mode = "sampled_induced"
             contrastive, pre_sim, adp_sim = sampled_original_contrastive_loss(
                 h_pre,
                 h_adp,
@@ -218,6 +303,7 @@ def compute_gp2f_loss(
                 sample_size=cfg.contrastive_sample_size,
             )
         else:
+            contrastive_mode = "dense_original"
             contrastive, pre_sim, adp_sim = original_contrastive_loss(
                 h_pre,
                 h_adp,
@@ -226,24 +312,28 @@ def compute_gp2f_loss(
             )
 
     topology = logits.new_tensor(0.0)
+    topology_mode = "disabled"
     if cfg.use_original_topology_fusion and float(cfg.lambda_fus) > 0:
+        if alpha is None:
+            raise ValueError("alpha must be provided when original topology fusion loss is enabled.")
         if h_mix.size(0) > int(cfg.dense_topology_max_nodes):
+            topology_mode = "sampled_alpha_consistency_approx"
             topology = sampled_original_topology_fusion_loss(
-                h_mix,
-                edge_index,
-                tau=cfg.tau_fus,
-                sample_size=cfg.topology_sample_size,
-            )
-        elif pre_sim is None or adp_sim is None:
-            fused_similarity = _similarity(h_mix, h_mix)
-            topology = original_topology_fusion_loss(
-                fused_similarity,
+                h_pre,
+                h_adp,
+                alpha,
                 edge_index,
                 tau=cfg.tau_fus,
                 percentile=cfg.topology_percentile,
+                sample_size=cfg.topology_sample_size,
             )
         else:
-            fused_similarity = 0.5 * (pre_sim + adp_sim)
+            topology_mode = "dense_alpha_consistency"
+            if pre_sim is None or adp_sim is None:
+                fused_similarity = _alpha_fused_similarity(h_pre, h_adp, alpha)
+            else:
+                alpha_t = _as_alpha_tensor(alpha, h_pre)
+                fused_similarity = alpha_t * pre_sim + (1.0 - alpha_t) * adp_sim
             topology = original_topology_fusion_loss(
                 fused_similarity,
                 edge_index,
@@ -252,4 +342,11 @@ def compute_gp2f_loss(
             )
 
     total = cls + float(cfg.lambda_ctr) * contrastive + float(cfg.lambda_fus) * topology
-    return GP2FLossOutput(total=total, cls=cls, contrastive=contrastive, topology_fusion=topology)
+    return GP2FLossOutput(
+        total=total,
+        cls=cls,
+        contrastive=contrastive,
+        topology_fusion=topology,
+        contrastive_mode=contrastive_mode,
+        topology_mode=topology_mode,
+    )

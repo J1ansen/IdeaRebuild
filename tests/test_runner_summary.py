@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from experiments.run_gp2f_baseline import _format_mean_std, _resolve_run_seeds
+from experiments.run_gp2f_baseline import PRESETS, _format_mean_std, _resolve_run_seeds
 from experiments.run_gp2f_baseline import InputAligner
 from data.datasets import resolve_dataset_name
 import torch
@@ -45,3 +45,23 @@ def test_official_projector_aligner_shape() -> None:
 
 def test_resolve_actor_accepts_canonical_name() -> None:
     assert resolve_dataset_name("Actor") == "Actor"
+
+
+def test_presets_isolate_ctr_and_fus_losses() -> None:
+    assert PRESETS["B0"]["loss"]["lambda_ctr"] == 0.0
+    assert PRESETS["B0"]["loss"]["lambda_fus"] == 0.0
+
+    assert PRESETS["B1"]["loss"]["use_original_contrastive"] is True
+    assert PRESETS["B1"]["loss"]["use_original_topology_fusion"] is False
+    assert PRESETS["B1"]["loss"]["lambda_ctr"] > 0.0
+    assert PRESETS["B1"]["loss"]["lambda_fus"] == 0.0
+
+    assert PRESETS["B2"]["loss"]["use_original_contrastive"] is False
+    assert PRESETS["B2"]["loss"]["use_original_topology_fusion"] is True
+    assert PRESETS["B2"]["loss"]["lambda_ctr"] == 0.0
+    assert PRESETS["B2"]["loss"]["lambda_fus"] > 0.0
+
+    assert PRESETS["B3"]["loss"]["use_original_contrastive"] is True
+    assert PRESETS["B3"]["loss"]["use_original_topology_fusion"] is True
+    assert PRESETS["B3"]["loss"]["lambda_ctr"] > 0.0
+    assert PRESETS["B3"]["loss"]["lambda_fus"] > 0.0

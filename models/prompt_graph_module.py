@@ -1,0 +1,739 @@
+"""Prompt graph construction for P1 adapted-branch graph prompting."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from models.prompt_module import mean_neighbor_summary, mean_neighbor_variance
+
+
+def _as_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    return dict(config or {})
+
+
+def _init_logit(value: float, max_value: float) -> torch.Tensor:
+    max_value = float(max_value)
+    if max_value <= 0:
+        raise ValueError("max_value must be positive")
+    ratio = min(max(float(value) / max_value, 1e-6), 1.0 - 1e-6)
+    return torch.logit(torch.tensor(ratio, dtype=torch.float32))
+
+
+def _safe_cosine(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return F.cosine_similarity(x, y, dim=-1, eps=1e-12)
+
+
+def _minmax_normalize(values: torch.Tensor) -> torch.Tensor:
+    if values.numel() == 0:
+        return values
+    lo = values.min()
+    hi = values.max()
+    return (values - lo) / (hi - lo).clamp_min(1e-12)
+
+
+def _deterministic_random_scores(num_nodes: int, *, seed: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    idx = torch.arange(num_nodes, dtype=dtype, device=device)
+    scores = torch.sin(idx * 12.9898 + float(seed) * 78.233) * 43758.5453
+    return scores - torch.floor(scores)
+
+
+def _normalized_entropy(values: torch.Tensor) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.new_tensor(0.0)
+    entropy = -(values * values.clamp_min(1e-12).log()).sum()
+    if values.numel() > 1:
+        entropy = entropy / math.log(float(values.numel()))
+    return entropy
+
+
+class PromptGraphModuleP1(nn.Module):
+    """Build a prompt-augmented graph for the adapted GP2F branch.
+
+    Prompt nodes are appended after original nodes. Prompt edges are
+    bidirectional and only appear in the adapted branch graph.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        hidden_dim: int,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.source_dim = int(source_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.config = _as_config(config)
+
+        self.num_prompt_nodes = int(self.config.get("num_prompt_nodes", 8))
+        if self.num_prompt_nodes <= 0:
+            raise ValueError("num_prompt_nodes must be positive")
+        self.rho = float(self.config.get("rho", 0.2))
+        self.topk_prompt_per_node = int(self.config.get("topk_prompt_per_node", 2))
+        if self.topk_prompt_per_node <= 0:
+            raise ValueError("topk_prompt_per_node must be positive")
+        self.structural_base = str(self.config.get("structural_base", "z_detached"))
+        self.pool_strategy = str(self.config.get("pool_strategy", "structural"))
+        if self.pool_strategy not in {"structural", "random"}:
+            raise ValueError(f"Unsupported pool_strategy={self.pool_strategy!r}")
+        self.random_seed = int(self.config.get("random_seed", 0))
+        self.tau = float(self.config.get("tau", 0.5))
+        self.normalize_query_key = bool(self.config.get("normalize_query_key", True))
+        self.use_capacity_routing = bool(self.config.get("use_capacity_routing", False))
+        self.capacity_factor = float(self.config.get("capacity_factor", 1.25))
+        self.query_dim = int(self.config.get("query_dim", self.hidden_dim))
+        self.query_hidden_dim = int(self.config.get("query_hidden_dim", self.hidden_dim))
+        self.query_dropout = float(self.config.get("query_dropout", 0.2))
+        self.prompt_init_std = float(self.config.get("prompt_init_std", 0.02))
+        self.use_rejection_gate = bool(self.config.get("use_rejection_gate", False))
+        self.rejection_gate_hidden_dim = int(self.config.get("rejection_gate_hidden_dim", self.query_hidden_dim))
+        self.rejection_gate_bias_init = float(self.config.get("rejection_gate_bias_init", -1.0))
+        self.rejection_gate_use_role_context = bool(self.config.get("rejection_gate_use_role_context", False))
+        self.rejection_gate_use_routing_features = bool(self.config.get("rejection_gate_use_routing_features", False))
+        self.use_multiview_routing = bool(self.config.get("use_multiview_routing", False))
+        self.view_gate_hidden_dim = int(self.config.get("view_gate_hidden_dim", self.query_hidden_dim))
+        self.role_hidden_dim = int(self.config.get("role_hidden_dim", max(16, self.query_hidden_dim // 2)))
+
+        self.prompt_node_x = nn.Parameter(torch.empty(self.num_prompt_nodes, self.source_dim))
+        nn.init.normal_(self.prompt_node_x, mean=0.0, std=self.prompt_init_std)
+        self.prompt_keys = nn.Parameter(torch.empty(self.num_prompt_nodes, self.query_dim))
+        nn.init.xavier_uniform_(self.prompt_keys)
+        self.semantic_prompt_keys = nn.Parameter(torch.empty(self.num_prompt_nodes, self.query_dim))
+        self.structural_prompt_keys = nn.Parameter(torch.empty(self.num_prompt_nodes, self.query_dim))
+        self.role_prompt_keys = nn.Parameter(torch.empty(self.num_prompt_nodes, self.query_dim))
+        nn.init.xavier_uniform_(self.semantic_prompt_keys)
+        nn.init.xavier_uniform_(self.structural_prompt_keys)
+        nn.init.xavier_uniform_(self.role_prompt_keys)
+
+        base_dim = self._base_dim()
+        self.query_mlp = nn.Sequential(
+            nn.Linear(5 * base_dim, self.query_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.query_hidden_dim, self.query_dim),
+        )
+        self.semantic_query_mlp = nn.Sequential(
+            nn.Linear(base_dim, self.query_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.query_hidden_dim, self.query_dim),
+        )
+        self.structural_query_mlp = nn.Sequential(
+            nn.Linear(5 * base_dim, self.query_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.query_hidden_dim, self.query_dim),
+        )
+        self.role_query_mlp = nn.Sequential(
+            nn.Linear(6, self.role_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.role_hidden_dim, self.query_dim),
+        )
+        self.view_gate_mlp = nn.Sequential(
+            nn.Linear(5 * base_dim + 6, self.view_gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.view_gate_hidden_dim, 3),
+        )
+        rejection_gate_input_dim = 5 * base_dim
+        if self.rejection_gate_use_role_context:
+            rejection_gate_input_dim += 6
+        if self.rejection_gate_use_routing_features:
+            rejection_gate_input_dim += 4
+        self.rejection_gate_mlp = nn.Sequential(
+            nn.Linear(rejection_gate_input_dim, self.rejection_gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.rejection_gate_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.rejection_gate_mlp[-1].weight)
+        nn.init.constant_(self.rejection_gate_mlp[-1].bias, self.rejection_gate_bias_init)
+        self.edge_scale_max = float(self.config.get("edge_scale_max", 0.2))
+        edge_scale_init = float(self.config.get("edge_scale_init", 0.01))
+        self.edge_scale_logit = nn.Parameter(_init_logit(edge_scale_init, self.edge_scale_max))
+
+    @property
+    def edge_scale(self) -> torch.Tensor:
+        return self.edge_scale_max * torch.sigmoid(self.edge_scale_logit)
+
+    def _base_dim(self) -> int:
+        if self.structural_base in {"z_detached", "z"}:
+            return self.source_dim
+        if self.structural_base in {"h_pre_detached", "h_pre"}:
+            return self.hidden_dim
+        raise ValueError(f"Unsupported structural_base={self.structural_base!r}")
+
+    def _base_features(self, z: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
+        if self.structural_base == "z_detached":
+            return z.detach()
+        if self.structural_base == "z":
+            return z
+        if self.structural_base == "h_pre_detached":
+            return h_pre.detach()
+        if self.structural_base == "h_pre":
+            return h_pre
+        raise ValueError(f"Unsupported structural_base={self.structural_base!r}")
+
+    def structural_scores(
+        self,
+        *,
+        z: torch.Tensor,
+        h_pre: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        base = self._base_features(z, h_pre)
+        m1 = mean_neighbor_summary(base, edge_index, num_nodes=base.size(0))
+        m2 = mean_neighbor_summary(m1, edge_index, num_nodes=base.size(0))
+        var = mean_neighbor_variance(base, edge_index, num_nodes=base.size(0)).mean(dim=-1)
+        sim_1 = 1.0 - _safe_cosine(base, m1)
+        sim_2 = 1.0 - _safe_cosine(m1, m2)
+        var_norm = _minmax_normalize(var)
+        score = torch.stack([sim_1.clamp_min(0.0), sim_2.clamp_min(0.0), var_norm], dim=-1).mean(dim=-1)
+        context = torch.cat([base, m1, m2, base - m1, m1 - m2], dim=-1)
+        degree = torch.zeros(base.size(0), dtype=base.dtype, device=base.device)
+        if edge_index.numel() > 0:
+            degree.index_add_(0, edge_index[1], torch.ones(edge_index.size(1), dtype=base.dtype, device=base.device))
+        role_context = torch.stack(
+            [
+                _minmax_normalize(degree),
+                sim_1.clamp_min(0.0),
+                sim_2.clamp_min(0.0),
+                var_norm,
+                (base - m1).norm(dim=-1),
+                (m1 - m2).norm(dim=-1),
+            ],
+            dim=-1,
+        )
+        return score, {
+            "base": base,
+            "m1": m1,
+            "m2": m2,
+            "neighbor_variance": var,
+            "neighbor_variance_norm": var_norm,
+            "structural_score": score,
+            "query_context": context,
+            "role_context": role_context,
+        }
+
+    def _routing_logits(
+        self,
+        aux: dict[str, torch.Tensor],
+        pool_idx: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if not self.use_multiview_routing:
+            query = self.query_mlp(aux["query_context"][pool_idx])
+            prompt_keys = self.prompt_keys.to(dtype=dtype, device=device)
+            if self.normalize_query_key:
+                query_for_logits = F.normalize(query, dim=-1, eps=1e-12)
+                keys_for_logits = F.normalize(prompt_keys, dim=-1, eps=1e-12)
+            else:
+                query_for_logits = query
+                keys_for_logits = prompt_keys
+            logits = query_for_logits @ keys_for_logits.t()
+            logits = logits / max(self.tau, 1e-6)
+            view_gate = torch.zeros((pool_idx.numel(), 3), dtype=dtype, device=device)
+            if view_gate.numel() > 0:
+                view_gate[:, 1] = 1.0
+            return logits, {
+                "query": query,
+                "semantic_query": query,
+                "structural_query": query,
+                "role_query": query,
+                "semantic_logits": logits,
+                "structural_logits": logits,
+                "role_logits": logits,
+                "view_gate": view_gate,
+            }
+
+        semantic_query = self.semantic_query_mlp(aux["base"][pool_idx])
+        structural_query = self.structural_query_mlp(aux["query_context"][pool_idx])
+        role_query = self.role_query_mlp(aux["role_context"][pool_idx])
+        semantic_keys = self.semantic_prompt_keys.to(dtype=dtype, device=device)
+        structural_keys = self.structural_prompt_keys.to(dtype=dtype, device=device)
+        role_keys = self.role_prompt_keys.to(dtype=dtype, device=device)
+        if self.normalize_query_key:
+            semantic_query_for_logits = F.normalize(semantic_query, dim=-1, eps=1e-12)
+            structural_query_for_logits = F.normalize(structural_query, dim=-1, eps=1e-12)
+            role_query_for_logits = F.normalize(role_query, dim=-1, eps=1e-12)
+            semantic_keys_for_logits = F.normalize(semantic_keys, dim=-1, eps=1e-12)
+            structural_keys_for_logits = F.normalize(structural_keys, dim=-1, eps=1e-12)
+            role_keys_for_logits = F.normalize(role_keys, dim=-1, eps=1e-12)
+        else:
+            semantic_query_for_logits = semantic_query
+            structural_query_for_logits = structural_query
+            role_query_for_logits = role_query
+            semantic_keys_for_logits = semantic_keys
+            structural_keys_for_logits = structural_keys
+            role_keys_for_logits = role_keys
+        semantic_logits = semantic_query_for_logits @ semantic_keys_for_logits.t()
+        structural_logits = structural_query_for_logits @ structural_keys_for_logits.t()
+        role_logits = role_query_for_logits @ role_keys_for_logits.t()
+        view_context = torch.cat([aux["query_context"][pool_idx], aux["role_context"][pool_idx]], dim=-1)
+        view_gate = torch.softmax(self.view_gate_mlp(view_context), dim=-1)
+        stacked_logits = torch.stack([semantic_logits, structural_logits, role_logits], dim=1)
+        logits = (view_gate.unsqueeze(-1) * stacked_logits).sum(dim=1)
+        logits = logits / max(self.tau, 1e-6)
+        return logits, {
+            "query": structural_query,
+            "semantic_query": semantic_query,
+            "structural_query": structural_query,
+            "role_query": role_query,
+            "semantic_logits": semantic_logits / max(self.tau, 1e-6),
+            "structural_logits": structural_logits / max(self.tau, 1e-6),
+            "role_logits": role_logits / max(self.tau, 1e-6),
+            "view_gate": view_gate,
+        }
+
+    def _rejection_gate_context(
+        self,
+        aux: dict[str, torch.Tensor],
+        pool_idx: torch.Tensor,
+        logits: torch.Tensor,
+        full_prob: torch.Tensor,
+    ) -> torch.Tensor:
+        pieces = [aux["query_context"][pool_idx]]
+        if self.rejection_gate_use_role_context:
+            pieces.append(aux["role_context"][pool_idx])
+        if self.rejection_gate_use_routing_features:
+            top_prob = full_prob.max(dim=-1).values
+            entropy = -(full_prob * full_prob.clamp_min(1e-12).log()).sum(dim=-1)
+            if full_prob.size(1) > 1:
+                entropy = entropy / math.log(float(full_prob.size(1)))
+            if logits.size(1) > 1:
+                top2 = torch.topk(logits, k=2, dim=-1).values
+                logit_margin = top2[:, 0] - top2[:, 1]
+            else:
+                logit_margin = torch.ones_like(top_prob)
+            structural_score = aux["structural_score"][pool_idx]
+            pieces.append(
+                torch.stack(
+                    [
+                        top_prob,
+                        entropy,
+                        _minmax_normalize(logit_margin),
+                        _minmax_normalize(structural_score),
+                    ],
+                    dim=-1,
+                )
+            )
+        return torch.cat(pieces, dim=-1)
+
+    def _pool_mask(
+        self,
+        scores: torch.Tensor,
+        train_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        num_nodes = int(scores.numel())
+        pool_mask = train_mask.bool().clone()
+        k = int(math.ceil(max(0.0, self.rho) * num_nodes))
+        k = min(max(k, 0), num_nodes)
+        if k > 0:
+            if self.pool_strategy == "random":
+                rank_scores = _deterministic_random_scores(
+                    num_nodes,
+                    seed=self.random_seed,
+                    device=scores.device,
+                    dtype=scores.dtype,
+                )
+            else:
+                rank_scores = scores
+            top_idx = torch.topk(rank_scores, k=k, largest=True).indices
+            pool_mask[top_idx] = True
+        return pool_mask
+
+    def _capacity_aware_topk(
+        self,
+        logits: torch.Tensor,
+        *,
+        priority: torch.Tensor,
+        k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
+        if not self.use_capacity_routing:
+            top_values, top_prompt_ids = torch.topk(logits, k=k, dim=-1)
+            return top_values, top_prompt_ids, {
+                "capacity_routing_enabled": 0,
+                "prompt_capacity": 0,
+                "capacity_overflow_count": 0,
+            }
+
+        num_pool, num_prompt = int(logits.size(0)), int(logits.size(1))
+        total_assignments = num_pool * int(k)
+        capacity = max(1, int(math.ceil(total_assignments / max(1, num_prompt) * max(1.0, self.capacity_factor))))
+        counts = [0 for _ in range(num_prompt)]
+        selected_rows: list[list[int]] = [[0 for _ in range(k)] for _ in range(num_pool)]
+        overflow_count = 0
+        order = torch.argsort(priority, descending=True).tolist()
+        ranked_prompts = torch.argsort(logits.detach(), dim=-1, descending=True).tolist()
+
+        for row in order:
+            selected: list[int] = []
+            selected_set: set[int] = set()
+            for prompt_id in ranked_prompts[row]:
+                if counts[prompt_id] < capacity:
+                    selected.append(prompt_id)
+                    selected_set.add(prompt_id)
+                    counts[prompt_id] += 1
+                    if len(selected) == k:
+                        break
+            if len(selected) < k:
+                overflow_count += k - len(selected)
+                for prompt_id in ranked_prompts[row]:
+                    if prompt_id in selected_set:
+                        continue
+                    selected.append(prompt_id)
+                    counts[prompt_id] += 1
+                    if len(selected) == k:
+                        break
+            selected_rows[row] = selected
+
+        top_prompt_ids = torch.tensor(selected_rows, dtype=torch.long, device=logits.device)
+        top_values = logits.gather(1, top_prompt_ids)
+        return top_values, top_prompt_ids, {
+            "capacity_routing_enabled": 1,
+            "prompt_capacity": capacity,
+            "capacity_overflow_count": overflow_count,
+        }
+
+    def _empty_prompt_graph(
+        self,
+        z: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+        aux: dict[str, torch.Tensor],
+        pool_mask: torch.Tensor,
+        effective_edge_scale: torch.Tensor,
+        edge_scale_multiplier: torch.Tensor,
+    ) -> dict[str, Any]:
+        prompt_node_x = self.prompt_node_x.to(dtype=z.dtype, device=z.device)
+        adapted_x = torch.cat([z, prompt_node_x], dim=0)
+        usage = z.new_zeros(self.num_prompt_nodes)
+        aux = {
+            **aux,
+            "prompt_edge_weight": z.new_zeros(0),
+            "prompt_usage": usage,
+            "prompt_usage_full": usage,
+            "prompt_usage_entropy": z.new_tensor(0.0),
+            "prompt_usage_full_entropy": z.new_tensor(0.0),
+            "pool_acceptance_gate": z.new_zeros(0),
+            "pool_acceptance_mean": z.new_tensor(0.0),
+            "pool_acceptance_min": z.new_tensor(0.0),
+            "pool_acceptance_max": z.new_tensor(0.0),
+            "raw_edge_scale": self.edge_scale,
+            "edge_scale_multiplier": edge_scale_multiplier,
+            "capacity_routing_enabled": int(self.use_capacity_routing),
+            "prompt_capacity": 0,
+            "capacity_overflow_count": 0,
+            "connected_edge_count": 0,
+            "edge_type_counts": [int(edge_index.size(1)), 0, 0],
+            "use_multiview_routing": int(self.use_multiview_routing),
+            "view_gate_mean": z.new_tensor([0.0, 1.0, 0.0]),
+            "view_gate_entropy": z.new_tensor(0.0),
+            "routing_full_prob": z.new_zeros((0, self.num_prompt_nodes)),
+        }
+        return {
+            "adapted_x": adapted_x,
+            "adapted_edge_index": edge_index,
+            "adapted_edge_weight": edge_weight,
+            "adapted_edge_type": torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device),
+            "prompt_node_x": prompt_node_x,
+            "pool_mask": pool_mask,
+            "prompt_edge_count": 0,
+            "edge_scale": effective_edge_scale,
+            "aux": aux,
+        }
+
+    def forward(
+        self,
+        *,
+        z: torch.Tensor,
+        h_pre: torch.Tensor,
+        edge_index: torch.Tensor,
+        train_mask: torch.Tensor,
+        edge_scale_multiplier: float | torch.Tensor = 1.0,
+    ) -> dict[str, Any]:
+        if edge_index.ndim != 2 or edge_index.size(0) != 2:
+            raise ValueError("edge_index must have shape [2, num_edges]")
+        num_nodes = int(z.size(0))
+        device = z.device
+        dtype = z.dtype
+        prompt_node_x = self.prompt_node_x.to(dtype=dtype, device=device)
+        prompt_offset = num_nodes
+        if isinstance(edge_scale_multiplier, torch.Tensor):
+            multiplier = edge_scale_multiplier.to(dtype=dtype, device=device)
+        else:
+            multiplier = z.new_tensor(float(edge_scale_multiplier))
+        multiplier = multiplier.clamp_min(0.0)
+        effective_edge_scale = self.edge_scale * multiplier
+
+        structural_score, aux = self.structural_scores(z=z, h_pre=h_pre, edge_index=edge_index)
+        pool_mask = self._pool_mask(structural_score, train_mask)
+        pool_idx = torch.where(pool_mask)[0]
+        original_edge_weight = torch.ones(edge_index.size(1), dtype=dtype, device=device)
+        if pool_idx.numel() == 0:
+            return self._empty_prompt_graph(
+                z,
+                edge_index,
+                original_edge_weight,
+                aux,
+                pool_mask,
+                effective_edge_scale,
+                multiplier,
+            )
+
+        logits, routing_aux = self._routing_logits(aux, pool_idx, dtype=dtype, device=device)
+        full_prob = torch.softmax(logits, dim=-1)
+        k = min(self.topk_prompt_per_node, self.num_prompt_nodes)
+        top_values, top_prompt_ids, capacity_info = self._capacity_aware_topk(
+            logits,
+            priority=structural_score[pool_idx].detach(),
+            k=k,
+        )
+        assign_prob = torch.softmax(top_values, dim=-1)
+        if self.use_rejection_gate:
+            rejection_context = self._rejection_gate_context(aux, pool_idx, logits, full_prob)
+            pool_acceptance_logit = self.rejection_gate_mlp(rejection_context).squeeze(-1)
+            pool_acceptance = torch.sigmoid(pool_acceptance_logit)
+        else:
+            rejection_context = aux["query_context"][pool_idx]
+            pool_acceptance_logit = torch.full(
+                (pool_idx.numel(),),
+                30.0,
+                dtype=dtype,
+                device=device,
+            )
+            pool_acceptance = torch.ones(pool_idx.numel(), dtype=dtype, device=device)
+        prompt_weights = effective_edge_scale * pool_acceptance.unsqueeze(-1) * assign_prob
+
+        src_node = pool_idx.repeat_interleave(k)
+        dst_prompt = (prompt_offset + top_prompt_ids.reshape(-1)).long()
+        flat_weights = prompt_weights.reshape(-1)
+        prompt_edges_forward = torch.stack([src_node, dst_prompt], dim=0)
+        prompt_edges_backward = torch.stack([dst_prompt, src_node], dim=0)
+        prompt_edges = torch.cat([prompt_edges_forward, prompt_edges_backward], dim=1)
+        prompt_edge_weight = torch.cat([flat_weights, flat_weights], dim=0)
+        original_edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=device)
+        forward_edge_type = torch.ones(prompt_edges_forward.size(1), dtype=torch.long, device=device)
+        backward_edge_type = torch.full(
+            (prompt_edges_backward.size(1),),
+            2,
+            dtype=torch.long,
+            device=device,
+        )
+        adapted_edge_type = torch.cat([original_edge_type, forward_edge_type, backward_edge_type], dim=0)
+
+        adapted_x = torch.cat([z, prompt_node_x], dim=0)
+        adapted_edge_index = torch.cat([edge_index, prompt_edges], dim=1)
+        adapted_edge_weight = torch.cat([original_edge_weight, prompt_edge_weight], dim=0)
+
+        usage_raw = torch.zeros(self.num_prompt_nodes, dtype=dtype, device=device)
+        usage_raw.index_add_(0, top_prompt_ids.reshape(-1), assign_prob.reshape(-1))
+        usage = usage_raw / usage_raw.sum().clamp_min(1e-12)
+        usage_full = full_prob.mean(dim=0)
+        usage_entropy = _normalized_entropy(usage)
+        usage_full_entropy = _normalized_entropy(usage_full)
+
+        aux = {
+            **aux,
+            **routing_aux,
+            "routing_logits": logits,
+            "rejection_gate_context": rejection_context,
+            "routing_full_prob": full_prob,
+            "top_prompt_ids": top_prompt_ids,
+            "assignment_prob": assign_prob,
+            "prompt_edge_weight": prompt_edge_weight,
+            "pool_acceptance_logit": pool_acceptance_logit,
+            "pool_acceptance_gate": pool_acceptance,
+            "pool_acceptance_mean": pool_acceptance.mean(),
+            "pool_acceptance_min": pool_acceptance.min(),
+            "pool_acceptance_max": pool_acceptance.max(),
+            "prompt_usage": usage,
+            "prompt_usage_full": usage_full,
+            "prompt_usage_entropy": usage_entropy,
+            "prompt_usage_full_entropy": usage_full_entropy,
+            "raw_edge_scale": self.edge_scale,
+            "edge_scale_multiplier": multiplier,
+            **capacity_info,
+            "connected_edge_count": int(prompt_edges.size(1)),
+            "edge_type_counts": [
+                int(original_edge_type.numel()),
+                int(forward_edge_type.numel()),
+                int(backward_edge_type.numel()),
+            ],
+            "use_multiview_routing": int(self.use_multiview_routing),
+            "view_gate_mean": routing_aux["view_gate"].mean(dim=0),
+            "view_gate_entropy": (
+                -(routing_aux["view_gate"] * routing_aux["view_gate"].clamp_min(1e-12).log()).sum(dim=-1).mean()
+                / math.log(3.0)
+            ),
+        }
+        return {
+            "adapted_x": adapted_x,
+            "adapted_edge_index": adapted_edge_index,
+            "adapted_edge_weight": adapted_edge_weight,
+            "adapted_edge_type": adapted_edge_type,
+            "prompt_node_x": prompt_node_x,
+            "pool_mask": pool_mask,
+            "prompt_edge_count": int(prompt_edges.size(1)),
+            "edge_scale": effective_edge_scale,
+            "aux": aux,
+        }
+
+
+def prompt_edge_l1_loss(prompt_out: dict[str, Any]) -> torch.Tensor:
+    weights = prompt_out.get("aux", {}).get("prompt_edge_weight")
+    if isinstance(weights, torch.Tensor) and weights.numel() > 0:
+        return weights.mean()
+    edge_scale = prompt_out.get("edge_scale")
+    if isinstance(edge_scale, torch.Tensor):
+        return edge_scale.new_tensor(0.0)
+    return torch.tensor(0.0)
+
+
+def prompt_balance_loss(prompt_out: dict[str, Any]) -> torch.Tensor:
+    aux = prompt_out.get("aux", {})
+    usage = aux.get("prompt_usage_full", aux.get("prompt_usage"))
+    if isinstance(usage, torch.Tensor) and usage.numel() > 0:
+        target = usage.new_full(usage.shape, 1.0 / float(usage.numel()))
+        return (usage - target).pow(2).sum()
+    edge_scale = prompt_out.get("edge_scale")
+    if isinstance(edge_scale, torch.Tensor):
+        return edge_scale.new_tensor(0.0)
+    return torch.tensor(0.0)
+
+
+def prompt_role_diversity_loss(module: PromptGraphModuleP1 | None) -> torch.Tensor:
+    """Penalize highly similar prompt keys to encourage role separation."""
+
+    if module is None:
+        return torch.tensor(0.0)
+    if bool(getattr(module, "use_multiview_routing", False)):
+        keys = torch.cat(
+            [
+                module.semantic_prompt_keys,
+                module.structural_prompt_keys,
+                module.role_prompt_keys,
+            ],
+            dim=0,
+        )
+    else:
+        keys = module.prompt_keys
+    if keys.size(0) < 2:
+        return keys.new_tensor(0.0)
+    norm_keys = F.normalize(keys, dim=-1, eps=1e-12)
+    sim = norm_keys @ norm_keys.t()
+    eye = torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
+    off_diag = sim[~eye]
+    return off_diag.pow(2).mean()
+
+
+def prompt_acceptance_loss(prompt_out: dict[str, Any]) -> torch.Tensor:
+    """Small regularizer that discourages accepting every pool node by default."""
+
+    aux = prompt_out.get("aux", {})
+    gates = aux.get("pool_acceptance_gate")
+    edge_scale = prompt_out.get("edge_scale")
+    if isinstance(gates, torch.Tensor) and gates.numel() > 0:
+        return gates.mean()
+    if isinstance(edge_scale, torch.Tensor):
+        return edge_scale.new_tensor(0.0)
+    return torch.tensor(0.0)
+
+
+def prompt_acceptance_budget_loss(
+    prompt_out: dict[str, Any],
+    *,
+    min_acceptance: float | None = None,
+    max_acceptance: float | None = None,
+) -> torch.Tensor:
+    """Soft safety budget over the mean acceptance gate.
+
+    This is a null-route style constraint for prompt graphs. It does not decide
+    which nodes are correct; it only prevents the acceptance gate from drifting
+    into always-off or always-on behavior when the available supervision is weak.
+    """
+
+    aux = prompt_out.get("aux", {})
+    gates = aux.get("pool_acceptance_gate")
+    edge_scale = prompt_out.get("edge_scale")
+    if not (isinstance(gates, torch.Tensor) and gates.numel() > 0):
+        if isinstance(edge_scale, torch.Tensor):
+            return edge_scale.new_tensor(0.0)
+        return torch.tensor(0.0)
+    mean_gate = gates.mean()
+    losses: list[torch.Tensor] = []
+    if min_acceptance is not None:
+        losses.append(F.relu(float(min_acceptance) - mean_gate).pow(2))
+    if max_acceptance is not None:
+        losses.append(F.relu(mean_gate - float(max_acceptance)).pow(2))
+    if not losses:
+        return mean_gate.new_tensor(0.0)
+    return torch.stack(losses).sum()
+
+
+def prompt_usage_consistency_loss(
+    prompt_out: dict[str, Any],
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    *,
+    margin: float = 0.25,
+    negative_weight: float = 0.05,
+) -> torch.Tensor:
+    """Train-only class consistency over prompt usage distributions.
+
+    This does not assign a class to any prompt node. It only nudges labeled
+    train-pool nodes from the same class to use similar prompt distributions.
+    Validation/test labels are ignored because the mask is always restricted
+    to ``train_mask``.
+    """
+
+    aux = prompt_out.get("aux", {})
+    full_prob = aux.get("routing_full_prob")
+    pool_mask = prompt_out.get("pool_mask")
+    edge_scale = prompt_out.get("edge_scale")
+    if not (isinstance(full_prob, torch.Tensor) and isinstance(pool_mask, torch.Tensor)):
+        if isinstance(edge_scale, torch.Tensor):
+            return edge_scale.new_tensor(0.0)
+        return torch.tensor(0.0)
+    pool_idx = torch.where(pool_mask.bool())[0]
+    if pool_idx.numel() != full_prob.size(0):
+        raise ValueError("routing_full_prob rows must match pool_mask true count")
+    train_pool = train_mask.to(device=pool_mask.device, dtype=torch.bool)[pool_idx]
+    if int(train_pool.sum().item()) < 2:
+        return full_prob.new_tensor(0.0)
+    probs = full_prob[train_pool]
+    y = labels.to(device=pool_mask.device)[pool_idx][train_pool]
+    dist = torch.cdist(probs, probs, p=2).pow(2)
+    same = y[:, None] == y[None, :]
+    eye = torch.eye(same.size(0), dtype=torch.bool, device=same.device)
+    same = same & ~eye
+    diff = ~same & ~eye
+    losses: list[torch.Tensor] = []
+    if bool(same.any()):
+        losses.append(dist[same].mean())
+    if negative_weight > 0 and bool(diff.any()):
+        diff_dist = torch.sqrt(dist[diff].clamp_min(1e-12))
+        losses.append(float(negative_weight) * F.relu(float(margin) - diff_dist).pow(2).mean())
+    if not losses:
+        return full_prob.new_tensor(0.0)
+    return torch.stack(losses).sum()
+
+
+def prompt_view_entropy_loss(prompt_out: dict[str, Any]) -> torch.Tensor:
+    """Optional small loss encouraging node-wise view gates to make choices."""
+
+    aux = prompt_out.get("aux", {})
+    entropy = aux.get("view_gate_entropy")
+    edge_scale = prompt_out.get("edge_scale")
+    if isinstance(entropy, torch.Tensor):
+        return entropy
+    if isinstance(edge_scale, torch.Tensor):
+        return edge_scale.new_tensor(0.0)
+    return torch.tensor(0.0)

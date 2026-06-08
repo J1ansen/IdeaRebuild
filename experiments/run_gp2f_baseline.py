@@ -118,6 +118,16 @@ def _adapter_stats(model: FaithfulGP2F) -> dict[str, float]:
     }
 
 
+def _model_variant(model_cfg: dict[str, Any]) -> str:
+    if (
+        str(model_cfg.get("input_aligner", "")) == "official_projector"
+        and str(model_cfg.get("adapter_style", "")) == "official_gp2f"
+        and str(model_cfg.get("fusion_alpha_style", "")) == "raw"
+    ):
+        return "OfficialStyleGP2F"
+    return "StableDualBranch"
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -307,6 +317,7 @@ def run_single(
             h_pre=h_pre,
             h_adp=h_adp,
             h_mix=h_mix,
+            alpha=alpha,
             edge_index=graph.edge_index,
             cfg=loss_cfg,
         )
@@ -316,7 +327,12 @@ def run_single(
         torch.nn.utils.clip_grad_norm_(trainable_params, float(training_cfg.get("grad_clip", 1.0)))
         optimizer.step()
 
-        log_item = {"epoch": float(epoch), **loss_out.to_log_dict(), "alpha": float(alpha.detach().item())}
+        log_item = {
+            "epoch": float(epoch),
+            **loss_out.to_log_dict(),
+            **loss_out.to_metadata_dict(),
+            "alpha": float(alpha.detach().item()),
+        }
         loss_curve.append(log_item)
 
         metrics = evaluate(
@@ -340,6 +356,7 @@ def run_single(
                 "monitor_value": monitor_value,
                 **metrics,
                 **loss_out.to_log_dict(),
+                **loss_out.to_metadata_dict(),
                 **_adapter_stats(model),
             }
             _save_checkpoint(
@@ -401,6 +418,7 @@ def run_single(
         "aligner_style": aligner_style,
         "adapter_style": str(model_cfg.get("adapter_style", "stable_zero_init")),
         "fusion_alpha_style": str(model_cfg.get("fusion_alpha_style", "sigmoid")),
+        "model_variant": _model_variant(model_cfg),
         "final": final_metrics,
         "best": best_metrics,
         "early_stopped": early_stopped,
@@ -470,6 +488,8 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
 
     summary = {
         "dataset": target_dataset,
+        "preset": str(config.get("experiment", {}).get("preset", "")),
+        "model_variant": results[0].get("model_variant", "") if results else "",
         "seeds": seeds,
         "num_runs": len(seeds),
         "best_test_acc_mean_std": _format_mean_std(best_test),
@@ -490,6 +510,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "final_test_macro_f1",
             "alpha",
             "branch_cosine",
+            "contrastive_mode",
+            "topology_mode",
+            "model_variant",
             "early_stopped",
             "stopped_epoch",
         ]
@@ -506,6 +529,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "final_test_macro_f1": result["final"].get("test_macro_f1", 0.0),
                     "alpha": result["best"].get("alpha", 0.0),
                     "branch_cosine": result["best"].get("branch_cosine", 0.0),
+                    "contrastive_mode": result["best"].get("contrastive_mode", "disabled"),
+                    "topology_mode": result["best"].get("topology_mode", "disabled"),
+                    "model_variant": result.get("model_variant", ""),
                     "early_stopped": result.get("early_stopped", False),
                     "stopped_epoch": result.get("stopped_epoch", 0),
                 }
@@ -532,17 +558,17 @@ PRESETS: dict[str, dict[str, Any]] = {
     "B1": {
         "loss": {
             "use_original_contrastive": True,
-            "use_original_topology_fusion": True,
+            "use_original_topology_fusion": False,
             "lambda_ctr": 0.05,
-            "lambda_fus": 0.1,
+            "lambda_fus": 0.0,
         }
     },
     "B2": {
         "loss": {
             "use_original_contrastive": False,
-            "use_original_topology_fusion": False,
+            "use_original_topology_fusion": True,
             "lambda_ctr": 0.0,
-            "lambda_fus": 0.0,
+            "lambda_fus": 0.1,
         }
     },
     "B3": {

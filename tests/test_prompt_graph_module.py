@@ -1,0 +1,424 @@
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from models.backbones import BaseGCN
+from models.faithful_gp2f import FaithfulGP2F
+from models.prompt_graph_module import (
+    PromptGraphModuleP1,
+    prompt_acceptance_budget_loss,
+    prompt_acceptance_loss,
+    prompt_balance_loss,
+    prompt_edge_l1_loss,
+    prompt_role_diversity_loss,
+    prompt_usage_consistency_loss,
+    prompt_view_entropy_loss,
+)
+from experiments.run_gp2f_prompt_graph import _acceptance_supervision_loss
+
+
+def _config(**overrides: object) -> dict:
+    cfg: dict[str, object] = {
+        "num_prompt_nodes": 4,
+        "rho": 0.4,
+        "topk_prompt_per_node": 2,
+        "structural_base": "z_detached",
+        "pool_strategy": "structural",
+        "tau": 0.5,
+        "query_dim": 3,
+        "query_hidden_dim": 5,
+        "query_dropout": 0.0,
+        "prompt_init_std": 0.02,
+        "edge_scale_init": 0.01,
+        "edge_scale_max": 0.20,
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _toy_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    z = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ]
+    )
+    h_pre = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 0.5, 0.0],
+            [0.0, 0.5, 1.0],
+        ]
+    )
+    edge_index = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 1, 3],
+            [1, 2, 3, 4, 5, 0, 0, 2],
+        ],
+        dtype=torch.long,
+    )
+    y = torch.tensor([0, 0, 1, 1, 0, 1], dtype=torch.long)
+    train_mask = torch.tensor([True, False, True, False, False, False])
+    return z, h_pre, edge_index, y, train_mask
+
+
+def _node_to_prompt_edges(out: dict, num_nodes: int, original_edges: int) -> torch.Tensor:
+    prompt_edges = out["adapted_edge_index"][:, original_edges:]
+    mask = (prompt_edges[0] < num_nodes) & (prompt_edges[1] >= num_nodes)
+    return prompt_edges[:, mask]
+
+
+def test_prompt_nodes_are_appended_after_original_nodes() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert torch.allclose(out["adapted_x"][: z.size(0)], z)
+    assert out["adapted_x"].shape == (z.size(0) + module.num_prompt_nodes, z.size(1))
+    assert torch.allclose(out["adapted_x"][z.size(0) :], out["prompt_node_x"])
+
+
+def test_augmented_graph_contains_original_edges_prompt_edges_and_weights() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert torch.equal(out["adapted_edge_index"][:, : edge_index.size(1)], edge_index)
+    assert out["adapted_edge_index"].size(1) == edge_index.size(1) + out["prompt_edge_count"]
+    assert out["adapted_edge_weight"].numel() == out["adapted_edge_index"].size(1)
+    assert out["adapted_edge_type"].numel() == out["adapted_edge_index"].size(1)
+    assert torch.allclose(out["adapted_edge_weight"][: edge_index.size(1)], torch.ones(edge_index.size(1)))
+    assert torch.equal(out["adapted_edge_type"][: edge_index.size(1)], torch.zeros(edge_index.size(1), dtype=torch.long))
+
+
+def test_prompt_edges_have_directional_edge_types() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    prompt_edge_type = out["adapted_edge_type"][edge_index.size(1) :]
+    half = prompt_edge_type.numel() // 2
+
+    assert torch.equal(prompt_edge_type[:half], torch.ones(half, dtype=torch.long))
+    assert torch.equal(prompt_edge_type[half:], torch.full((half,), 2, dtype=torch.long))
+    assert out["aux"]["edge_type_counts"] == [edge_index.size(1), half, half]
+
+
+def test_prompt_edges_are_bidirectional() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    prompt_edges = out["adapted_edge_index"][:, edge_index.size(1) :]
+    edge_set = {(int(src), int(dst)) for src, dst in prompt_edges.t().tolist()}
+
+    for src, dst in list(edge_set):
+        assert (dst, src) in edge_set
+
+
+def test_pool_nodes_have_at_most_topk_prompt_connections_and_nonpool_has_none() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(rho=0.0, topk_prompt_per_node=2))
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    node_prompt_edges = _node_to_prompt_edges(out, z.size(0), edge_index.size(1))
+    pool_mask = out["pool_mask"]
+
+    for node_id in range(z.size(0)):
+        count = int((node_prompt_edges[0] == node_id).sum().item())
+        if bool(pool_mask[node_id].item()):
+            assert count <= module.topk_prompt_per_node
+        else:
+            assert count == 0
+
+
+def test_pool_mask_contains_train_nodes_and_rho_zero_keeps_supervised_pool() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(rho=0.0))
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert torch.all(out["pool_mask"][train_mask])
+    assert int(out["pool_mask"].sum().item()) == int(train_mask.sum().item())
+
+
+def test_val_test_labels_do_not_affect_p1_outputs() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    changed_y = y.clone()
+    changed_y[~train_mask] = 1 - changed_y[~train_mask]
+    module = PromptGraphModuleP1(4, 3, _config())
+    module.eval()
+
+    with torch.no_grad():
+        original = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+        relabeled = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert torch.equal(y[train_mask], changed_y[train_mask])
+    assert torch.allclose(original["adapted_x"], relabeled["adapted_x"])
+    assert torch.equal(original["adapted_edge_index"], relabeled["adapted_edge_index"])
+    assert torch.allclose(original["adapted_edge_weight"], relabeled["adapted_edge_weight"])
+
+
+def test_prompt_edge_count_matches_connected_edge_count() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert out["prompt_edge_count"] == out["aux"]["connected_edge_count"]
+    assert out["prompt_edge_count"] == out["adapted_edge_index"].size(1) - edge_index.size(1)
+
+
+def test_losses_are_finite_and_have_expected_shape() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert torch.isfinite(prompt_edge_l1_loss(out))
+    assert torch.isfinite(prompt_balance_loss(out))
+    assert out["aux"]["prompt_usage"].shape == (module.num_prompt_nodes,)
+    assert out["aux"]["prompt_usage_full"].shape == (module.num_prompt_nodes,)
+    assert torch.allclose(out["aux"]["prompt_usage_full"].sum(), torch.tensor(1.0))
+
+
+def test_edge_scale_multiplier_controls_prompt_edge_weights() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    zero = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask, edge_scale_multiplier=0.0)
+    full = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask, edge_scale_multiplier=1.0)
+
+    original_edges = edge_index.size(1)
+    assert torch.allclose(zero["adapted_edge_weight"][original_edges:], torch.zeros_like(zero["adapted_edge_weight"][original_edges:]))
+    assert float(full["adapted_edge_weight"][original_edges:].max().item()) > 0.0
+
+
+def test_rejection_gate_scales_prompt_edges_and_is_reported() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    gated = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_rejection_gate=True, rejection_gate_bias_init=-2.0),
+    )
+    open_gate = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_rejection_gate=True, rejection_gate_bias_init=2.0),
+    )
+    open_gate.load_state_dict(gated.state_dict(), strict=False)
+    with torch.no_grad():
+        open_gate.rejection_gate_mlp[-1].bias.fill_(2.0)
+
+    gated_out = gated(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    open_out = open_gate(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    original_edges = edge_index.size(1)
+
+    assert 0.0 < gated_out["aux"]["pool_acceptance_mean"].item() < 1.0
+    assert open_out["aux"]["pool_acceptance_mean"].item() > gated_out["aux"]["pool_acceptance_mean"].item()
+    assert open_out["adapted_edge_weight"][original_edges:].mean() > gated_out["adapted_edge_weight"][original_edges:].mean()
+    assert torch.isfinite(prompt_acceptance_loss(gated_out))
+
+
+def test_rejection_gate_can_use_role_and_routing_features() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(
+            use_rejection_gate=True,
+            use_multiview_routing=True,
+            rejection_gate_use_role_context=True,
+            rejection_gate_use_routing_features=True,
+            rho=1.0,
+        ),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    context = out["aux"]["rejection_gate_context"]
+
+    assert context.shape[0] == int(out["pool_mask"].sum().item())
+    assert context.shape[1] == 5 * z.size(1) + 6 + 4
+    assert out["aux"]["pool_acceptance_gate"].shape[0] == context.shape[0]
+
+
+def test_acceptance_budget_penalizes_only_out_of_range_mean() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_rejection_gate=True, rejection_gate_bias_init=-2.0),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert torch.isfinite(prompt_acceptance_budget_loss(out, min_acceptance=0.01, max_acceptance=0.50))
+    assert prompt_acceptance_budget_loss(out, min_acceptance=0.90, max_acceptance=None) > 0
+    assert prompt_acceptance_budget_loss(out, min_acceptance=None, max_acceptance=0.01) > 0
+
+
+def test_train_only_acceptance_supervision_ignores_val_test_labels() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_rejection_gate=True, rejection_gate_bias_init=-1.0, rho=1.0),
+    )
+    changed_y = y.clone()
+    changed_y[~train_mask] = 1 - changed_y[~train_mask]
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]
+    )
+    logits_on = logits_off.clone()
+    logits_on[0] = torch.tensor([0.0, 2.0])
+    logits_on[2] = torch.tensor([2.0, 0.0])
+
+    original_loss, original_stats = _acceptance_supervision_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+    )
+    relabeled_loss, relabeled_stats = _acceptance_supervision_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=changed_y,
+        train_mask=train_mask,
+    )
+
+    assert torch.isfinite(original_loss)
+    assert torch.allclose(original_loss, relabeled_loss)
+    assert original_stats == relabeled_stats
+
+
+def test_prompt_role_diversity_loss_is_finite_and_has_gradients() -> None:
+    module = PromptGraphModuleP1(4, 3, _config())
+
+    loss = prompt_role_diversity_loss(module)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert module.prompt_keys.grad is not None
+
+
+def test_capacity_routing_spreads_tied_assignments_across_prompts() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(rho=1.0, topk_prompt_per_node=1, use_capacity_routing=True, capacity_factor=1.0),
+    )
+    with torch.no_grad():
+        for parameter in module.query_mlp.parameters():
+            parameter.zero_()
+        module.prompt_keys.zero_()
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert out["aux"]["capacity_routing_enabled"] == 1
+    assert out["aux"]["capacity_overflow_count"] == 0
+    assert int((out["aux"]["prompt_usage"] > 0).sum().item()) >= 3
+
+
+def test_prompt_graph_receives_gradients_through_faithful_gp2f() -> None:
+    z, _, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config())
+    model = FaithfulGP2F(BaseGCN(in_channels=4, hidden_channels=3, num_layers=2), hidden_dim=3, num_classes=2)
+
+    h_pre = model.encode_frozen(z, edge_index)
+    prompt_out = module(z=z, h_pre=h_pre.detach(), edge_index=edge_index, train_mask=train_mask)
+    model_out = model.forward_with_h_pre(
+        z,
+        edge_index,
+        h_pre=h_pre,
+        adapted_x=prompt_out["adapted_x"],
+        adapted_edge_index=prompt_out["adapted_edge_index"],
+        adapted_edge_weight=prompt_out["adapted_edge_weight"],
+        return_aux=True,
+    )
+    loss = (
+        F.cross_entropy(model_out["logits"][train_mask], y[train_mask])
+        + prompt_edge_l1_loss(prompt_out)
+        + prompt_balance_loss(prompt_out)
+    )
+    loss.backward()
+
+    assert model_out["logits"].shape == (z.size(0), 2)
+    assert module.prompt_node_x.grad is not None
+    assert module.prompt_keys.grad is not None
+    assert module.edge_scale_logit.grad is not None
+    assert any(parameter.grad is not None for parameter in module.query_mlp.parameters())
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(param.grad).all() for param in module.parameters() if param.grad is not None)
+
+
+def test_full_softmax_balance_gives_all_prompt_keys_gradient() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(num_prompt_nodes=4, topk_prompt_per_node=1))
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    loss = prompt_balance_loss(out)
+    loss.backward()
+
+    assert module.prompt_keys.grad is not None
+    assert torch.all(module.prompt_keys.grad.abs().sum(dim=1) > 0)
+
+
+def test_forward_backward_has_no_nan() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(structural_base="h_pre_detached"))
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    loss = out["adapted_edge_weight"].pow(2).mean() + out["prompt_node_x"].pow(2).mean()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(param.grad).all() for param in module.parameters() if param.grad is not None)
+
+
+def test_multiview_routing_reports_view_gate_distribution() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(use_multiview_routing=True, rho=1.0))
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    view_gate = out["aux"]["view_gate"]
+
+    assert out["aux"]["use_multiview_routing"] == 1
+    assert view_gate.shape == (int(out["pool_mask"].sum().item()), 3)
+    assert torch.allclose(view_gate.sum(dim=-1), torch.ones(view_gate.size(0)))
+    assert out["aux"]["view_gate_mean"].shape == (3,)
+    assert torch.isfinite(prompt_view_entropy_loss(out))
+
+
+def test_train_only_usage_consistency_ignores_val_test_labels() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(use_multiview_routing=True, rho=1.0))
+    changed_y = y.clone()
+    changed_y[~train_mask] = 1 - changed_y[~train_mask]
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    original_loss = prompt_usage_consistency_loss(out, y, train_mask)
+    relabeled_loss = prompt_usage_consistency_loss(out, changed_y, train_mask)
+
+    assert torch.isfinite(original_loss)
+    assert torch.allclose(original_loss, relabeled_loss)
