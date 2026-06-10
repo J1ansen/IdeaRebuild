@@ -10,7 +10,9 @@ from models.prompt_graph_module import (
     prompt_acceptance_budget_loss,
     prompt_acceptance_loss,
     prompt_balance_loss,
+    prompt_class_route_loss,
     prompt_edge_l1_loss,
+    prompt_key_proto_loss,
     prompt_role_diversity_loss,
     prompt_usage_consistency_loss,
     prompt_view_entropy_loss,
@@ -252,6 +254,34 @@ def test_rejection_gate_can_use_role_and_routing_features() -> None:
     assert out["aux"]["pool_acceptance_gate"].shape[0] == context.shape[0]
 
 
+def test_hard_acceptance_keeps_only_top_ratio_prompt_edges() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(
+            use_rejection_gate=True,
+            rejection_gate_bias_init=0.0,
+            use_hard_acceptance=True,
+            hard_acceptance_ratio=0.5,
+            hard_acceptance_straight_through=False,
+            rho=1.0,
+            topk_prompt_per_node=1,
+        ),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    mask = out["aux"]["hard_acceptance_mask"]
+    prompt_weights = out["aux"]["prompt_edge_weight"]
+    forward_weights = prompt_weights[: int(mask.numel())]
+
+    assert out["aux"]["use_hard_acceptance"] == 1
+    assert torch.allclose(out["aux"]["hard_acceptance_selected_ratio"], mask.mean())
+    assert int(mask.sum().item()) == 3
+    assert torch.all(forward_weights[mask.bool()] > 0)
+    assert torch.allclose(forward_weights[~mask.bool()], torch.zeros_like(forward_weights[~mask.bool()]))
+
+
 def test_acceptance_budget_penalizes_only_out_of_range_mean() -> None:
     z, h_pre, edge_index, _, train_mask = _toy_inputs()
     module = PromptGraphModuleP1(
@@ -309,6 +339,43 @@ def test_train_only_acceptance_supervision_ignores_val_test_labels() -> None:
     assert torch.isfinite(original_loss)
     assert torch.allclose(original_loss, relabeled_loss)
     assert original_stats == relabeled_stats
+
+
+def test_acceptance_supervision_ce_delta_produces_positive_and_negative_targets() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_rejection_gate=True, rejection_gate_bias_init=-1.0, rho=1.0),
+    )
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [0.0, 2.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]
+    )
+    logits_on = logits_off.clone()
+    logits_on[0] = torch.tensor([2.0, 0.0])
+    logits_on[2] = torch.tensor([2.0, 0.0])
+
+    loss, stats = _acceptance_supervision_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        signal="ce_delta",
+    )
+
+    assert torch.isfinite(loss)
+    assert stats["acceptance_supervised_count"] == 2.0
+    assert stats["acceptance_positive_count"] == 1.0
+    assert stats["acceptance_negative_count"] == 1.0
 
 
 def test_prompt_role_diversity_loss_is_finite_and_has_gradients() -> None:
@@ -422,3 +489,134 @@ def test_train_only_usage_consistency_ignores_val_test_labels() -> None:
 
     assert torch.isfinite(original_loss)
     assert torch.allclose(original_loss, relabeled_loss)
+
+
+def test_class_aware_routing_expands_prompt_slots() -> None:
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(num_prompt_nodes=2, use_class_aware_routing=True, num_classes=3, residual_prompt_count=2),
+    )
+
+    assert module.num_prompt_nodes == 5
+    assert module.num_class_prompt_slots == 3
+    assert module.prompt_node_x.shape[0] == 5
+    assert module.prompt_keys.shape[0] == 5
+
+
+def test_train_only_class_key_prototype_initialization_ignores_val_test_labels() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    changed_y = y.clone()
+    changed_y[~train_mask] = 1 - changed_y[~train_mask]
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(
+            use_multiview_routing=True,
+            use_class_aware_routing=True,
+            num_classes=2,
+            residual_prompt_count=1,
+            query_dim=3,
+            rho=1.0,
+        ),
+    )
+
+    stats = module.initialize_class_keys_from_train_prototypes(
+        z=z,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=y,
+    )
+    initialized_keys = module.structural_prompt_keys.detach().clone()
+    module.initialize_class_keys_from_train_prototypes(
+        z=z,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=changed_y,
+    )
+
+    assert stats["class_key_proto_init_coverage"] == 1.0
+    assert stats["class_key_proto_init_missing_classes"] == []
+    assert torch.allclose(initialized_keys[:2], module.structural_prompt_keys.detach()[:2])
+    assert module.class_key_init_coverage == 1.0
+
+
+def test_class_key_prototype_initialization_reports_missing_classes() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    only_class_zero = train_mask & (y == 0)
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_class_aware_routing=True, num_classes=2, residual_prompt_count=1, query_dim=3, rho=1.0),
+    )
+
+    stats = module.initialize_class_keys_from_train_prototypes(
+        z=z,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=only_class_zero,
+        labels=y,
+    )
+
+    assert stats["class_key_proto_init_coverage"] == 0.5
+    assert stats["class_key_proto_init_missing_classes"] == [1]
+
+
+def test_class_route_loss_is_train_only_and_ignores_val_test_labels() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    changed_y = y.clone()
+    changed_y[~train_mask] = 1 - changed_y[~train_mask]
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_class_aware_routing=True, num_classes=2, residual_prompt_count=1, rho=1.0),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    original_loss = prompt_class_route_loss(out, y, train_mask)
+    relabeled_loss = prompt_class_route_loss(out, changed_y, train_mask)
+
+    assert torch.isfinite(original_loss)
+    assert torch.allclose(original_loss, relabeled_loss)
+
+
+def test_key_proto_loss_uses_class_slots_and_has_gradients() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(
+            use_class_aware_routing=True,
+            use_multiview_routing=True,
+            num_classes=2,
+            residual_prompt_count=1,
+            rho=1.0,
+        ),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    loss = prompt_key_proto_loss(module, out, y, train_mask) + prompt_class_route_loss(out, y, train_mask)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert module.structural_prompt_keys.grad is not None
+    assert module.structural_prompt_keys.grad[:2].abs().sum() > 0
+    assert any(parameter.grad is not None for parameter in module.structural_query_mlp.parameters())
+
+
+def test_residual_prompt_slots_are_not_class_targets() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_class_aware_routing=True, num_classes=2, residual_prompt_count=2, rho=1.0),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits = out["aux"]["routing_logits"]
+    loss = prompt_class_route_loss(out, y, train_mask)
+    manual = F.cross_entropy(logits[train_mask[out["aux"]["pool_idx"]]][:, :2], y[train_mask])
+
+    assert torch.allclose(loss, manual)

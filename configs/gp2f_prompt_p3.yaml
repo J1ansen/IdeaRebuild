@@ -1,5 +1,5 @@
 experiment:
-  name: gp2f_prompt_p2_multiview
+  name: gp2f_prompt_p3
   seed: 0
   runs: 1
   source_dataset: Cora
@@ -61,6 +61,9 @@ prompt_graph:
   use_multiview_routing: true
   use_class_aware_routing: true
   residual_prompt_count: 2
+  init_class_keys_from_train_proto: true
+  class_key_init_source: structural_query
+  class_key_init_normalize: true
   view_gate_hidden_dim: 128
   role_hidden_dim: 64
   edge_scale_init: 0.05
@@ -88,10 +91,13 @@ prompt_graph:
 
 prompt_aware:
   enabled: true
+  receiver_version: v2_conditioned
+  prompt_fusion: residual_gate
   dropout: 0.2
   gate_init: 0.05
+  receiver_gate_init: 0.01
   zero_init_prompt_messages: true
-  message_norm: weighted_mean
+  prompt_message_norm: layernorm
   message_scale: 5.0
   message_scale_grid: [0.0, 0.1, 0.25, 0.5, 1.0]
   pool_only_prompt_update: true
@@ -108,7 +114,7 @@ training:
   grad_clip: 1.0
   log_every: 20
   eval_every: 5
-  output_dir: outputs/gp2f_prompt_p2_multiview
+  output_dir: outputs/gp2f_prompt_p3
   early_stop_patience: 40
   early_stop_min_epochs: 20
   early_stop_metric: val_acc

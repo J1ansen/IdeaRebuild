@@ -31,7 +31,9 @@ from models.prompt_graph_module import (
     prompt_acceptance_budget_loss,
     prompt_acceptance_loss,
     prompt_balance_loss,
+    prompt_class_route_loss,
     prompt_edge_l1_loss,
+    prompt_key_proto_loss,
     prompt_role_diversity_loss,
     prompt_usage_consistency_loss,
     prompt_view_entropy_loss,
@@ -90,6 +92,10 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         prompt_graph.setdefault("lambda_prompt_balance", 0.02)
     if variant == "p2_multiview":
         prompt_graph["use_multiview_routing"] = True
+        prompt_graph.setdefault("use_class_aware_routing", True)
+        prompt_graph.setdefault("residual_prompt_count", 2)
+        prompt_graph.setdefault("lambda_class_route", 0.05)
+        prompt_graph.setdefault("lambda_key_proto", 0.001)
         prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.02)
     if variant in {"p1_random_pool", "p2_strength_random_pool"}:
         prompt_graph["pool_strategy"] = "random"
@@ -103,12 +109,52 @@ def _build_prompt_graph_module(
     variant: str,
     source_dim: int,
     hidden_dim: int,
+    num_classes: int,
     prompt_graph_cfg: dict[str, Any],
     device: torch.device,
 ) -> PromptGraphModuleP1 | None:
     if variant == "noprompt" or not bool(prompt_graph_cfg.get("enabled", True)):
         return None
-    return PromptGraphModuleP1(source_dim, hidden_dim, prompt_graph_cfg).to(device)
+    resolved_cfg = dict(prompt_graph_cfg)
+    resolved_cfg.setdefault("num_classes", int(num_classes))
+    return PromptGraphModuleP1(source_dim, hidden_dim, resolved_cfg).to(device)
+
+
+@torch.no_grad()
+def _maybe_initialize_class_keys(
+    *,
+    prompt_graph_module: PromptGraphModuleP1 | None,
+    input_aligner: InputAligner,
+    model: FaithfulGP2F,
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    prompt_graph_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    if prompt_graph_module is None or not bool(prompt_graph_cfg.get("init_class_keys_from_train_proto", False)):
+        return {"class_key_proto_init_coverage": 0.0, "class_key_proto_init_missing_classes": []}
+    was_training = prompt_graph_module.training
+    input_was_training = input_aligner.training
+    model_was_training = model.training
+    input_aligner.eval()
+    model.eval()
+    prompt_graph_module.eval()
+    z = input_aligner(x)
+    h_pre = model.encode_frozen(z, edge_index)
+    stats = prompt_graph_module.initialize_class_keys_from_train_prototypes(
+        z=z,
+        h_pre=h_pre.detach(),
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        normalize=bool(prompt_graph_cfg.get("class_key_init_normalize", True)),
+        source=str(prompt_graph_cfg.get("class_key_init_source", "structural_query")),
+    )
+    input_aligner.train(input_was_training)
+    model.train(model_was_training)
+    prompt_graph_module.train(was_training)
+    return stats
 
 
 def _default_prompt_graph_out(z: torch.Tensor, edge_index: torch.Tensor) -> dict[str, Any]:
@@ -148,7 +194,14 @@ def _trainable_parameters(module: torch.nn.Module | None) -> list[torch.nn.Param
 def _prompt_aware_parameter_names(model: FaithfulGP2F) -> set[str]:
     if not isinstance(model, PromptAwareGP2F):
         return set()
-    prefixes = ("prompt_gate_logit", "node_to_prompt_msgs.", "prompt_to_node_msgs.")
+    prefixes = (
+        "prompt_gate_logit",
+        "node_to_prompt_msgs.",
+        "prompt_to_node_msgs.",
+        "node_to_prompt_conditioned_msgs.",
+        "prompt_to_node_conditioned_msgs.",
+        "prompt_update_norms.",
+    )
     return {
         name
         for name, parameter in model.named_parameters()
@@ -165,7 +218,14 @@ def _set_prompt_aware_trainable(model: FaithfulGP2F, trainable: bool) -> None:
             if name in names:
                 parameter.requires_grad = bool(trainable)
         return
-    prefixes = ("prompt_gate_logit", "node_to_prompt_msgs.", "prompt_to_node_msgs.")
+    prefixes = (
+        "prompt_gate_logit",
+        "node_to_prompt_msgs.",
+        "prompt_to_node_msgs.",
+        "node_to_prompt_conditioned_msgs.",
+        "prompt_to_node_conditioned_msgs.",
+        "prompt_update_norms.",
+    )
     for name, parameter in model.named_parameters():
         if any(name == prefix.rstrip(".") or name.startswith(prefix) for prefix in prefixes):
             parameter.requires_grad = bool(trainable)
@@ -384,11 +444,93 @@ def _prompt_mediated_same_label_reachability(prompt_out: dict[str, Any], labels:
     return float(same_pairs / total_pairs)
 
 
+def _class_router_hit_rate(
+    prompt_out: dict[str, Any],
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+) -> float:
+    aux = prompt_out.get("aux", {})
+    full_prob = aux.get("routing_full_prob")
+    pool_mask = prompt_out.get("pool_mask")
+    class_slots = int(aux.get("num_class_prompt_slots", 0))
+    if not (isinstance(full_prob, torch.Tensor) and isinstance(pool_mask, torch.Tensor) and class_slots > 0):
+        return 0.0
+    pool_idx = aux.get("pool_idx")
+    if not isinstance(pool_idx, torch.Tensor):
+        pool_idx = torch.where(pool_mask)[0]
+    selected = mask.to(device=pool_mask.device, dtype=torch.bool)[pool_idx]
+    if int(selected.sum().item()) == 0:
+        return 0.0
+    y = labels.to(device=pool_mask.device)[pool_idx][selected]
+    valid = (y >= 0) & (y < class_slots)
+    if int(valid.sum().item()) == 0:
+        return 0.0
+    top1 = full_prob[selected].argmax(dim=-1)[valid]
+    return float((top1 == y[valid]).float().mean().detach().item())
+
+
+def _prompt_label_purity(prompt_out: dict[str, Any], labels: torch.Tensor, mask: torch.Tensor) -> float:
+    aux = prompt_out.get("aux", {})
+    full_prob = aux.get("routing_full_prob")
+    pool_mask = prompt_out.get("pool_mask")
+    if not (isinstance(full_prob, torch.Tensor) and isinstance(pool_mask, torch.Tensor)):
+        return 0.0
+    pool_idx = aux.get("pool_idx")
+    if not isinstance(pool_idx, torch.Tensor):
+        pool_idx = torch.where(pool_mask)[0]
+    selected = mask.to(device=pool_mask.device, dtype=torch.bool)[pool_idx]
+    if int(selected.sum().item()) < 2:
+        return 0.0
+    top1 = full_prob[selected].argmax(dim=-1)
+    y = labels.to(device=pool_mask.device)[pool_idx][selected]
+    total_pairs = 0
+    same_pairs = 0
+    for prompt_id in top1.unique().tolist():
+        group_labels = y[top1 == int(prompt_id)]
+        group_size = int(group_labels.numel())
+        if group_size < 2:
+            continue
+        same = group_labels[:, None] == group_labels[None, :]
+        pair_count = group_size * (group_size - 1) // 2
+        total_pairs += pair_count
+        same_pairs += int(torch.triu(same, diagonal=1).sum().item())
+    if total_pairs == 0:
+        return 0.0
+    return float(same_pairs / total_pairs)
+
+
+def _route_compactness_stats(prompt_out: dict[str, Any], labels: torch.Tensor, train_mask: torch.Tensor) -> dict[str, float]:
+    aux = prompt_out.get("aux", {})
+    full_prob = aux.get("routing_full_prob")
+    pool_mask = prompt_out.get("pool_mask")
+    if not (isinstance(full_prob, torch.Tensor) and isinstance(pool_mask, torch.Tensor)):
+        return {"same_class_route_compactness": 0.0, "different_class_route_separation": 0.0}
+    pool_idx = aux.get("pool_idx")
+    if not isinstance(pool_idx, torch.Tensor):
+        pool_idx = torch.where(pool_mask)[0]
+    train_pool = train_mask.to(device=pool_mask.device, dtype=torch.bool)[pool_idx]
+    if int(train_pool.sum().item()) < 2:
+        return {"same_class_route_compactness": 0.0, "different_class_route_separation": 0.0}
+    probs = full_prob[train_pool]
+    y = labels.to(device=pool_mask.device)[pool_idx][train_pool]
+    dist = torch.cdist(probs, probs, p=2)
+    same = y[:, None] == y[None, :]
+    eye = torch.eye(same.size(0), dtype=torch.bool, device=same.device)
+    same = same & ~eye
+    diff = (~same) & ~eye
+    return {
+        "same_class_route_compactness": float(dist[same].mean().detach().item()) if bool(same.any()) else 0.0,
+        "different_class_route_separation": float(dist[diff].mean().detach().item()) if bool(diff.any()) else 0.0,
+    }
+
+
 def _prompt_graph_diagnostics(
     prompt_out: dict[str, Any],
     *,
     z: torch.Tensor,
     train_mask: torch.Tensor,
+    val_mask: torch.Tensor | None = None,
+    test_mask: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
     num_classes: int | None = None,
 ) -> dict[str, Any]:
@@ -437,6 +579,17 @@ def _prompt_graph_diagnostics(
             if isinstance(aux.get("pool_acceptance_max"), torch.Tensor)
             else 1.0
         ),
+        "use_hard_acceptance": float(aux.get("use_hard_acceptance", 0)),
+        "hard_acceptance_ratio": (
+            float(aux["hard_acceptance_ratio"].detach().item())
+            if isinstance(aux.get("hard_acceptance_ratio"), torch.Tensor)
+            else 0.0
+        ),
+        "hard_acceptance_selected_ratio": (
+            float(aux["hard_acceptance_selected_ratio"].detach().item())
+            if isinstance(aux.get("hard_acceptance_selected_ratio"), torch.Tensor)
+            else 0.0
+        ),
         "prompt_usage_entropy": (
             float(aux["prompt_usage_entropy"].detach().item())
             if isinstance(aux.get("prompt_usage_entropy"), torch.Tensor)
@@ -453,6 +606,10 @@ def _prompt_graph_diagnostics(
         "adapted_node_count": int(prompt_out["adapted_x"].size(0)),
         "connected_edge_count": int(aux.get("connected_edge_count", prompt_edge_count)),
         "use_multiview_routing": float(aux.get("use_multiview_routing", 0)),
+        "use_class_aware_routing": float(aux.get("use_class_aware_routing", 0)),
+        "num_class_prompt_slots": float(aux.get("num_class_prompt_slots", 0)),
+        "residual_prompt_count": float(aux.get("residual_prompt_count", 0)),
+        "class_key_proto_init_coverage": float(aux.get("class_key_proto_init_coverage", 0.0)),
         "view_gate_entropy": (
             float(aux["view_gate_entropy"].detach().item())
             if isinstance(aux.get("view_gate_entropy"), torch.Tensor)
@@ -479,6 +636,16 @@ def _prompt_graph_diagnostics(
         diagnostics["pool_label_distribution"] = _pool_label_distribution(pool_mask, labels, int(num_classes))
         diagnostics["prompt_usage_by_true_class"] = _prompt_usage_by_true_class(prompt_out, labels, int(num_classes))
         diagnostics["prompt_mediated_same_label_reachability"] = _prompt_mediated_same_label_reachability(prompt_out, labels)
+        diagnostics["class_router_hit_rate_train"] = _class_router_hit_rate(prompt_out, labels, train_mask)
+        diagnostics["prompt_label_purity_train"] = _prompt_label_purity(prompt_out, labels, train_mask)
+        diagnostics["residual_prompt_usage_ratio"] = sum(
+            diagnostics.get("prompt_usage_full_distribution", [])[int(aux.get("num_class_prompt_slots", 0)) :]
+        )
+        diagnostics.update(_route_compactness_stats(prompt_out, labels, train_mask))
+        if val_mask is not None:
+            diagnostics["class_router_hit_rate_val"] = _class_router_hit_rate(prompt_out, labels, val_mask)
+        if test_mask is not None:
+            diagnostics["class_router_hit_rate_test"] = _class_router_hit_rate(prompt_out, labels, test_mask)
     edge_type_counts = aux.get("edge_type_counts")
     if isinstance(edge_type_counts, list):
         diagnostics["edge_type_counts"] = [int(value) for value in edge_type_counts]
@@ -526,7 +693,11 @@ def _prompt_aware_diagnostics(model_out: dict[str, Any]) -> dict[str, Any]:
         "adapted_branch_delta_norm": scalar("adapted_branch_delta_norm"),
         "prompt_message_scale": scalar("prompt_message_scale"),
         "prompt_message_norm": str(aux.get("prompt_message_norm", "")),
+        "receiver_version": str(aux.get("receiver_version", "")),
+        "prompt_fusion": str(aux.get("prompt_fusion", "")),
+        "prompt_receiver_gate_mean": scalar("prompt_receiver_gate_mean"),
         "pool_only_prompt_update": scalar("pool_only_prompt_update"),
+        "zero_init_prompt_messages": scalar("zero_init_prompt_messages"),
     }
 
 
@@ -596,6 +767,7 @@ def _acceptance_supervision_loss(
     positive_margin: float = 0.0,
     negative_margin: float = 0.0,
     balance_targets: bool = True,
+    signal: str = "ce_delta",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Train-only supervision for whether a pool node should receive prompt.
 
@@ -615,6 +787,11 @@ def _acceptance_supervision_loss(
         "acceptance_negative_count": 0.0,
         "acceptance_ignored_count": 0.0,
         "acceptance_target_mean": 0.0,
+        "acceptance_score_delta_mean": 0.0,
+        "ce_delta_positive_ratio_train": 0.0,
+        "ce_delta_negative_ratio_train": 0.0,
+        "prompt_helpful_acceptance_precision_train": 0.0,
+        "prompt_harmful_rejection_precision_train": 0.0,
     }
     if not (isinstance(pool_mask, torch.Tensor) and isinstance(gate_logits, torch.Tensor) and gate_logits.numel() > 0):
         return fallback, empty_stats
@@ -633,15 +810,29 @@ def _acceptance_supervision_loss(
     off_pred = off.argmax(dim=-1)
     on_correct = on_pred == y
     off_correct = off_pred == y
-    true_delta = on.gather(1, y.view(-1, 1)).squeeze(1) - off.gather(1, y.view(-1, 1)).squeeze(1)
 
-    positive = (on_correct & ~off_correct) | (true_delta >= float(positive_margin))
-    negative = (off_correct & ~on_correct) | (true_delta <= -float(negative_margin))
+    positive_margin = max(float(positive_margin), 0.0)
+    negative_margin = max(float(negative_margin), 0.0)
+    if signal == "true_logit_delta":
+        score_delta = on.gather(1, y.view(-1, 1)).squeeze(1) - off.gather(1, y.view(-1, 1)).squeeze(1)
+    elif signal == "ce_delta":
+        off_ce = F.cross_entropy(off, y, reduction="none")
+        on_ce = F.cross_entropy(on, y, reduction="none")
+        score_delta = off_ce - on_ce
+    else:
+        raise ValueError(
+            f"Unsupported acceptance supervision signal={signal!r}; expected 'ce_delta' or 'true_logit_delta'"
+        )
+    positive = (on_correct & ~off_correct) | (score_delta > positive_margin)
+    negative = (off_correct & ~on_correct) | (score_delta < -negative_margin)
     valid = positive ^ negative
     ignored = ~valid
+    train_pool_count = max(1, int(train_pool.sum().item()))
     if int(valid.sum().item()) == 0:
         stats = dict(empty_stats)
         stats["acceptance_ignored_count"] = float(ignored.sum().item())
+        stats["ce_delta_positive_ratio_train"] = float(positive.sum().item() / train_pool_count)
+        stats["ce_delta_negative_ratio_train"] = float(negative.sum().item() / train_pool_count)
         return fallback, stats
 
     targets = positive[valid].to(dtype=gate_logits.dtype)
@@ -653,6 +844,21 @@ def _acceptance_supervision_loss(
         loss = F.binary_cross_entropy_with_logits(selected_logits, targets, pos_weight=pos_weight)
     else:
         loss = F.binary_cross_entropy_with_logits(selected_logits, targets)
+    selected_gate = torch.sigmoid(selected_logits)
+    accepted = selected_gate >= 0.5
+    rejected = ~accepted
+    helpful = targets > 0.5
+    harmful = targets < 0.5
+    helpful_acceptance_precision = (
+        float((helpful & accepted).float().sum().item() / max(1, int(accepted.sum().item())))
+        if int(accepted.sum().item()) > 0
+        else 0.0
+    )
+    harmful_rejection_precision = (
+        float((harmful & rejected).float().sum().item() / max(1, int(rejected.sum().item())))
+        if int(rejected.sum().item()) > 0
+        else 0.0
+    )
     stats = {
         "prompt_acceptance_supervision": float(loss.detach().item()),
         "acceptance_supervised_count": float(valid.sum().item()),
@@ -660,6 +866,11 @@ def _acceptance_supervision_loss(
         "acceptance_negative_count": float((negative & valid).sum().item()),
         "acceptance_ignored_count": float(ignored.sum().item()),
         "acceptance_target_mean": float(targets.mean().detach().item()),
+        "acceptance_score_delta_mean": float(score_delta[valid].mean().detach().item()),
+        "ce_delta_positive_ratio_train": float(positive.sum().item() / train_pool_count),
+        "ce_delta_negative_ratio_train": float(negative.sum().item() / train_pool_count),
+        "prompt_helpful_acceptance_precision_train": helpful_acceptance_precision,
+        "prompt_harmful_rejection_precision_train": harmful_rejection_precision,
     }
     return loss, stats
 
@@ -825,6 +1036,8 @@ def evaluate_prompt_graph(
             prompt_out,
             z=z,
             train_mask=train_mask,
+            val_mask=val_mask,
+            test_mask=test_mask,
             labels=labels,
             num_classes=num_classes,
         ),
@@ -902,6 +1115,7 @@ def run_single(
         variant=variant,
         source_dim=source_dim,
         hidden_dim=hidden_dim,
+        num_classes=loaded.num_classes,
         prompt_graph_cfg=prompt_graph_cfg,
         device=device,
     )
@@ -916,6 +1130,16 @@ def run_single(
             device=device,
             load_prompt=bool(training_cfg.get("load_prompt_from_base_checkpoint", False)),
         )
+    class_key_init_stats = _maybe_initialize_class_keys(
+        prompt_graph_module=prompt_graph_module,
+        input_aligner=input_aligner,
+        model=model,
+        x=graph.x,
+        edge_index=graph.edge_index,
+        labels=graph.y,
+        train_mask=split.train_mask,
+        prompt_graph_cfg=prompt_graph_cfg,
+    )
     freeze_base_model = bool(training_cfg.get("freeze_base_model", False))
     if freeze_base_model:
         _set_module_trainable(input_aligner, False)
@@ -980,10 +1204,13 @@ def run_single(
     acceptance_supervision_positive_margin = float(prompt_graph_cfg.get("acceptance_supervision_positive_margin", 0.0))
     acceptance_supervision_negative_margin = float(prompt_graph_cfg.get("acceptance_supervision_negative_margin", 0.0))
     acceptance_supervision_balance_targets = bool(prompt_graph_cfg.get("acceptance_supervision_balance_targets", True))
+    acceptance_supervision_signal = str(prompt_graph_cfg.get("acceptance_supervision_signal", "ce_delta"))
     lambda_prompt_usage_consistency = float(prompt_graph_cfg.get("lambda_prompt_usage_consistency", 0.0))
     usage_consistency_margin = float(prompt_graph_cfg.get("usage_consistency_margin", 0.25))
     usage_consistency_negative_weight = float(prompt_graph_cfg.get("usage_consistency_negative_weight", 0.05))
     lambda_prompt_view_entropy = float(prompt_graph_cfg.get("lambda_prompt_view_entropy", 0.0))
+    lambda_class_route = float(prompt_graph_cfg.get("lambda_class_route", 0.0))
+    lambda_key_proto = float(prompt_graph_cfg.get("lambda_key_proto", 0.0))
     edge_scale_warmup_epochs = int(prompt_graph_cfg.get("edge_scale_warmup_epochs", 0))
     edge_scale_warmup_start = float(prompt_graph_cfg.get("edge_scale_warmup_start", 1.0 if edge_scale_warmup_epochs <= 0 else 0.0))
     best_checkpoint_path = run_dir / "best_model.pt"
@@ -1049,6 +1276,7 @@ def run_single(
                 positive_margin=acceptance_supervision_positive_margin,
                 negative_margin=acceptance_supervision_negative_margin,
                 balance_targets=acceptance_supervision_balance_targets,
+                signal=acceptance_supervision_signal,
             )
         else:
             prompt_acceptance_supervision = z.new_tensor(0.0)
@@ -1059,6 +1287,7 @@ def run_single(
                 "acceptance_negative_count": 0.0,
                 "acceptance_ignored_count": 0.0,
                 "acceptance_target_mean": 0.0,
+                "acceptance_score_delta_mean": 0.0,
             }
         prompt_usage_consistency = (
             prompt_usage_consistency_loss(
@@ -1072,6 +1301,16 @@ def run_single(
             else z.new_tensor(0.0)
         )
         prompt_view_entropy = prompt_view_entropy_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
+        class_route = (
+            prompt_class_route_loss(prompt_out, graph.y, split.train_mask)
+            if prompt_graph_module is not None
+            else z.new_tensor(0.0)
+        )
+        key_proto = (
+            prompt_key_proto_loss(prompt_graph_module, prompt_out, graph.y, split.train_mask)
+            if prompt_graph_module is not None
+            else z.new_tensor(0.0)
+        )
         loss = (
             cls_loss
             + lambda_edge_l1 * edge_l1
@@ -1082,6 +1321,8 @@ def run_single(
             + lambda_prompt_acceptance_supervision * prompt_acceptance_supervision
             + lambda_prompt_usage_consistency * prompt_usage_consistency
             + lambda_prompt_view_entropy * prompt_view_entropy
+            + lambda_class_route * class_route
+            + lambda_key_proto * key_proto
         )
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite loss at epoch {epoch}: {loss.item()}")
@@ -1107,6 +1348,8 @@ def run_single(
             "prompt_acceptance_supervision": float(prompt_acceptance_supervision.detach().item()),
             "prompt_usage_consistency": float(prompt_usage_consistency.detach().item()),
             "prompt_view_entropy": float(prompt_view_entropy.detach().item()),
+            "class_route": float(class_route.detach().item()),
+            "key_proto": float(key_proto.detach().item()),
             "lambda_edge_l1": lambda_edge_l1,
             "lambda_prompt_balance": lambda_prompt_balance,
             "lambda_prompt_role_diversity": lambda_prompt_role_diversity,
@@ -1115,6 +1358,8 @@ def run_single(
             "lambda_prompt_acceptance_supervision": lambda_prompt_acceptance_supervision,
             "lambda_prompt_usage_consistency": lambda_prompt_usage_consistency,
             "lambda_prompt_view_entropy": lambda_prompt_view_entropy,
+            "lambda_class_route": lambda_class_route,
+            "lambda_key_proto": lambda_key_proto,
             "edge_scale_multiplier": current_edge_scale_multiplier,
             "alpha": float(model_out["alpha"].detach().item()),
             **prompt_aware_log,
@@ -1165,6 +1410,8 @@ def run_single(
                     "prompt_acceptance_supervision": float(prompt_acceptance_supervision.detach().item()),
                     "prompt_usage_consistency": float(prompt_usage_consistency.detach().item()),
                     "prompt_view_entropy": float(prompt_view_entropy.detach().item()),
+                    "class_route": float(class_route.detach().item()),
+                    "key_proto": float(key_proto.detach().item()),
                     **acceptance_supervision_stats,
                     "edge_scale_multiplier": current_edge_scale_multiplier,
                     **_adapter_stats(model),
@@ -1268,6 +1515,7 @@ def run_single(
         "final": {**final_metrics, **init_eq},
         "best": {**best_metrics, **init_eq},
         "prompt_graph_parameter_count": count_trainable_parameters(prompt_graph_module),
+        "class_key_initialization": class_key_init_stats,
         "trainable_parameters": trainable_summary,
         "optimizer": optimizer_summary,
         "regularization": {
@@ -1282,10 +1530,13 @@ def run_single(
             "acceptance_supervision_positive_margin": acceptance_supervision_positive_margin,
             "acceptance_supervision_negative_margin": acceptance_supervision_negative_margin,
             "acceptance_supervision_balance_targets": acceptance_supervision_balance_targets,
+            "acceptance_supervision_signal": acceptance_supervision_signal,
             "lambda_prompt_usage_consistency": lambda_prompt_usage_consistency,
             "usage_consistency_margin": usage_consistency_margin,
             "usage_consistency_negative_weight": usage_consistency_negative_weight,
             "lambda_prompt_view_entropy": lambda_prompt_view_entropy,
+            "lambda_class_route": lambda_class_route,
+            "lambda_key_proto": lambda_key_proto,
             "edge_scale_warmup_epochs": edge_scale_warmup_epochs,
             "edge_scale_warmup_start": edge_scale_warmup_start,
         },
@@ -1408,6 +1659,10 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "raw_edge_scale",
             "edge_scale_multiplier",
             "use_multiview_routing",
+            "use_class_aware_routing",
+            "num_class_prompt_slots",
+            "residual_prompt_count",
+            "class_key_proto_init_coverage",
             "semantic_view_weight",
             "structural_view_weight",
             "role_view_weight",
@@ -1416,6 +1671,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "pool_acceptance_mean",
             "pool_acceptance_min",
             "pool_acceptance_max",
+            "use_hard_acceptance",
+            "hard_acceptance_ratio",
+            "hard_acceptance_selected_ratio",
             "prompt_acceptance_budget",
             "prompt_acceptance_supervision",
             "acceptance_supervised_count",
@@ -1423,6 +1681,20 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "acceptance_negative_count",
             "acceptance_ignored_count",
             "acceptance_target_mean",
+            "acceptance_score_delta_mean",
+            "ce_delta_positive_ratio_train",
+            "ce_delta_negative_ratio_train",
+            "prompt_helpful_acceptance_precision_train",
+            "prompt_harmful_rejection_precision_train",
+            "class_route",
+            "key_proto",
+            "class_router_hit_rate_train",
+            "class_router_hit_rate_val",
+            "class_router_hit_rate_test",
+            "prompt_label_purity_train",
+            "residual_prompt_usage_ratio",
+            "same_class_route_compactness",
+            "different_class_route_separation",
             "prompt_usage_entropy",
             "prompt_usage_full_entropy",
             "prompt_msg_norm",
@@ -1434,10 +1706,14 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "prompt_gate_mean",
             "prompt_gate_node_to_prompt_mean",
             "prompt_gate_prompt_to_node_mean",
+            "prompt_receiver_gate_mean",
             "prompt_message_scale",
             "selected_message_scale",
             "prompt_message_norm",
+            "receiver_version",
+            "prompt_fusion",
             "pool_only_prompt_update",
+            "zero_init_prompt_messages",
             "adapted_branch_delta_norm",
             "capacity_routing_enabled",
             "prompt_capacity",
@@ -1471,6 +1747,10 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "raw_edge_scale": result["best"].get("raw_edge_scale", 0.0),
                     "edge_scale_multiplier": result["best"].get("edge_scale_multiplier", 0.0),
                     "use_multiview_routing": result["best"].get("use_multiview_routing", 0.0),
+                    "use_class_aware_routing": result["best"].get("use_class_aware_routing", 0.0),
+                    "num_class_prompt_slots": result["best"].get("num_class_prompt_slots", 0.0),
+                    "residual_prompt_count": result["best"].get("residual_prompt_count", 0.0),
+                    "class_key_proto_init_coverage": result["best"].get("class_key_proto_init_coverage", 0.0),
                     "semantic_view_weight": result["best"].get("semantic_view_weight", 0.0),
                     "structural_view_weight": result["best"].get("structural_view_weight", 0.0),
                     "role_view_weight": result["best"].get("role_view_weight", 0.0),
@@ -1479,6 +1759,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "pool_acceptance_mean": result["best"].get("pool_acceptance_mean", 1.0),
                     "pool_acceptance_min": result["best"].get("pool_acceptance_min", 1.0),
                     "pool_acceptance_max": result["best"].get("pool_acceptance_max", 1.0),
+                    "use_hard_acceptance": result["best"].get("use_hard_acceptance", 0.0),
+                    "hard_acceptance_ratio": result["best"].get("hard_acceptance_ratio", 0.0),
+                    "hard_acceptance_selected_ratio": result["best"].get("hard_acceptance_selected_ratio", 0.0),
                     "prompt_acceptance_budget": result["best"].get("prompt_acceptance_budget", 0.0),
                     "prompt_acceptance_supervision": result["best"].get("prompt_acceptance_supervision", 0.0),
                     "acceptance_supervised_count": result["best"].get("acceptance_supervised_count", 0.0),
@@ -1486,6 +1769,24 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "acceptance_negative_count": result["best"].get("acceptance_negative_count", 0.0),
                     "acceptance_ignored_count": result["best"].get("acceptance_ignored_count", 0.0),
                     "acceptance_target_mean": result["best"].get("acceptance_target_mean", 0.0),
+                    "acceptance_score_delta_mean": result["best"].get("acceptance_score_delta_mean", 0.0),
+                    "ce_delta_positive_ratio_train": result["best"].get("ce_delta_positive_ratio_train", 0.0),
+                    "ce_delta_negative_ratio_train": result["best"].get("ce_delta_negative_ratio_train", 0.0),
+                    "prompt_helpful_acceptance_precision_train": result["best"].get(
+                        "prompt_helpful_acceptance_precision_train", 0.0
+                    ),
+                    "prompt_harmful_rejection_precision_train": result["best"].get(
+                        "prompt_harmful_rejection_precision_train", 0.0
+                    ),
+                    "class_route": result["best"].get("class_route", 0.0),
+                    "key_proto": result["best"].get("key_proto", 0.0),
+                    "class_router_hit_rate_train": result["best"].get("class_router_hit_rate_train", 0.0),
+                    "class_router_hit_rate_val": result["best"].get("class_router_hit_rate_val", 0.0),
+                    "class_router_hit_rate_test": result["best"].get("class_router_hit_rate_test", 0.0),
+                    "prompt_label_purity_train": result["best"].get("prompt_label_purity_train", 0.0),
+                    "residual_prompt_usage_ratio": result["best"].get("residual_prompt_usage_ratio", 0.0),
+                    "same_class_route_compactness": result["best"].get("same_class_route_compactness", 0.0),
+                    "different_class_route_separation": result["best"].get("different_class_route_separation", 0.0),
                     "prompt_usage_entropy": result["best"].get("prompt_usage_entropy", 0.0),
                     "prompt_usage_full_entropy": result["best"].get("prompt_usage_full_entropy", 0.0),
                     "prompt_msg_norm": result["best"].get("prompt_msg_norm", 0.0),
@@ -1497,10 +1798,14 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "prompt_gate_mean": result["best"].get("prompt_gate_mean", 0.0),
                     "prompt_gate_node_to_prompt_mean": result["best"].get("prompt_gate_node_to_prompt_mean", 0.0),
                     "prompt_gate_prompt_to_node_mean": result["best"].get("prompt_gate_prompt_to_node_mean", 0.0),
+                    "prompt_receiver_gate_mean": result["best"].get("prompt_receiver_gate_mean", 0.0),
                     "prompt_message_scale": result["best"].get("prompt_message_scale", 0.0),
                     "selected_message_scale": result.get("selected_message_scale", result["best"].get("prompt_message_scale", 0.0)),
                     "prompt_message_norm": result["best"].get("prompt_message_norm", ""),
+                    "receiver_version": result["best"].get("receiver_version", ""),
+                    "prompt_fusion": result["best"].get("prompt_fusion", ""),
                     "pool_only_prompt_update": result["best"].get("pool_only_prompt_update", 0.0),
+                    "zero_init_prompt_messages": result["best"].get("zero_init_prompt_messages", 0.0),
                     "adapted_branch_delta_norm": result["best"].get("adapted_branch_delta_norm", 0.0),
                     "capacity_routing_enabled": result["best"].get("capacity_routing_enabled", 0.0),
                     "prompt_capacity": result["best"].get("prompt_capacity", 0.0),
@@ -1529,6 +1834,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_dataset", type=str, default=None)
     parser.add_argument("--shots", type=int, default=None)
     parser.add_argument("--shot_ratio", type=float, default=None)
+    parser.add_argument("--shot_mode", type=str, choices=["shots", "percent"], default=None)
+    parser.add_argument("--shot_value", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--seeds", type=str, default=None)
@@ -1551,22 +1858,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt_message_norm",
         type=str,
-        choices=["weighted_mean", "weighted_sum", "degree_mean"],
+        choices=["weighted_mean", "weighted_sum", "degree_mean", "layernorm"],
         default=None,
     )
+    parser.add_argument("--receiver_version", type=str, choices=["v1_linear", "v2_conditioned"], default=None)
     parser.add_argument("--prompt_message_scale", type=float, default=None)
     parser.add_argument("--prompt_message_scale_grid", type=str, default=None)
     parser.add_argument("--message_scale_selection_metric", type=str, default=None)
+    parser.add_argument("--zero_init_prompt_messages", action="store_true")
+    parser.add_argument("--disable_zero_init_prompt_messages", action="store_true")
     parser.add_argument("--pool_only_prompt_update", action="store_true")
     parser.add_argument("--disable_pool_only_prompt_update", action="store_true")
     parser.add_argument("--lambda_edge_l1", type=float, default=None)
     parser.add_argument("--lambda_prompt_balance", type=float, default=None)
     parser.add_argument("--lambda_prompt_usage_consistency", type=float, default=None)
     parser.add_argument("--lambda_prompt_view_entropy", type=float, default=None)
+    parser.add_argument("--lambda_class_route", type=float, default=None)
+    parser.add_argument("--lambda_key_proto", type=float, default=None)
+    parser.add_argument("--residual_prompt_count", type=int, default=None)
+    parser.add_argument("--enable_class_aware_routing", action="store_true")
+    parser.add_argument("--disable_class_aware_routing", action="store_true")
+    parser.add_argument("--enable_class_key_proto_init", action="store_true")
+    parser.add_argument("--disable_class_key_proto_init", action="store_true")
     parser.add_argument("--lambda_prompt_acceptance_budget", type=float, default=None)
     parser.add_argument("--acceptance_budget_min", type=float, default=None)
     parser.add_argument("--acceptance_budget_max", type=float, default=None)
+    parser.add_argument("--enable_hard_acceptance", action="store_true")
+    parser.add_argument("--disable_hard_acceptance", action="store_true")
+    parser.add_argument("--hard_acceptance_ratio", type=float, default=None)
     parser.add_argument("--lambda_prompt_acceptance_supervision", type=float, default=None)
+    parser.add_argument("--acceptance_supervision_signal", type=str, default=None)
     parser.add_argument("--acceptance_supervision_positive_margin", type=float, default=None)
     parser.add_argument("--acceptance_supervision_negative_margin", type=float, default=None)
     parser.add_argument("--enable_multiview_routing", action="store_true")
@@ -1598,6 +1919,14 @@ def main() -> None:
         overrides.setdefault("data", {})["shot_ratio"] = None
     if args.shot_ratio is not None:
         overrides.setdefault("data", {})["shot_ratio"] = float(args.shot_ratio)
+    if args.shot_value is not None:
+        if args.shot_mode == "percent":
+            overrides.setdefault("data", {})["shot_ratio"] = float(args.shot_value)
+        elif args.shot_mode == "shots":
+            overrides.setdefault("data", {})["shots"] = int(args.shot_value)
+            overrides.setdefault("data", {})["shot_ratio"] = None
+        else:
+            raise ValueError("--shot_value requires --shot_mode to be either 'percent' or 'shots'")
     if args.seed is not None:
         overrides.setdefault("experiment", {})["seed"] = args.seed
     if args.seeds is not None:
@@ -1656,7 +1985,9 @@ def main() -> None:
     if args.prompt_to_node_gate_init is not None:
         overrides.setdefault("prompt_aware", {})["prompt_to_node_gate_init"] = float(args.prompt_to_node_gate_init)
     if args.prompt_message_norm is not None:
-        overrides.setdefault("prompt_aware", {})["message_norm"] = args.prompt_message_norm
+        overrides.setdefault("prompt_aware", {})["prompt_message_norm"] = args.prompt_message_norm
+    if args.receiver_version is not None:
+        overrides.setdefault("prompt_aware", {})["receiver_version"] = args.receiver_version
     if args.prompt_message_scale is not None:
         overrides.setdefault("prompt_aware", {})["message_scale"] = float(args.prompt_message_scale)
         overrides.setdefault("prompt_aware", {})["message_scale_grid"] = [float(args.prompt_message_scale)]
@@ -1666,6 +1997,10 @@ def main() -> None:
         ]
     if args.message_scale_selection_metric is not None:
         overrides.setdefault("training", {})["message_scale_selection_metric"] = args.message_scale_selection_metric
+    if args.zero_init_prompt_messages:
+        overrides.setdefault("prompt_aware", {})["zero_init_prompt_messages"] = True
+    if args.disable_zero_init_prompt_messages:
+        overrides.setdefault("prompt_aware", {})["zero_init_prompt_messages"] = False
     if args.pool_only_prompt_update:
         overrides.setdefault("prompt_aware", {})["pool_only_prompt_update"] = True
     if args.disable_pool_only_prompt_update:
@@ -1678,16 +2013,38 @@ def main() -> None:
         overrides.setdefault("prompt_graph", {})["lambda_prompt_usage_consistency"] = float(args.lambda_prompt_usage_consistency)
     if args.lambda_prompt_view_entropy is not None:
         overrides.setdefault("prompt_graph", {})["lambda_prompt_view_entropy"] = float(args.lambda_prompt_view_entropy)
+    if args.lambda_class_route is not None:
+        overrides.setdefault("prompt_graph", {})["lambda_class_route"] = float(args.lambda_class_route)
+    if args.lambda_key_proto is not None:
+        overrides.setdefault("prompt_graph", {})["lambda_key_proto"] = float(args.lambda_key_proto)
+    if args.residual_prompt_count is not None:
+        overrides.setdefault("prompt_graph", {})["residual_prompt_count"] = int(args.residual_prompt_count)
+    if args.enable_class_aware_routing:
+        overrides.setdefault("prompt_graph", {})["use_class_aware_routing"] = True
+    if args.disable_class_aware_routing:
+        overrides.setdefault("prompt_graph", {})["use_class_aware_routing"] = False
+    if args.enable_class_key_proto_init:
+        overrides.setdefault("prompt_graph", {})["init_class_keys_from_train_proto"] = True
+    if args.disable_class_key_proto_init:
+        overrides.setdefault("prompt_graph", {})["init_class_keys_from_train_proto"] = False
     if args.lambda_prompt_acceptance_budget is not None:
         overrides.setdefault("prompt_graph", {})["lambda_prompt_acceptance_budget"] = float(args.lambda_prompt_acceptance_budget)
     if args.acceptance_budget_min is not None:
         overrides.setdefault("prompt_graph", {})["acceptance_budget_min"] = float(args.acceptance_budget_min)
     if args.acceptance_budget_max is not None:
         overrides.setdefault("prompt_graph", {})["acceptance_budget_max"] = float(args.acceptance_budget_max)
+    if args.enable_hard_acceptance:
+        overrides.setdefault("prompt_graph", {})["use_hard_acceptance"] = True
+    if args.disable_hard_acceptance:
+        overrides.setdefault("prompt_graph", {})["use_hard_acceptance"] = False
+    if args.hard_acceptance_ratio is not None:
+        overrides.setdefault("prompt_graph", {})["hard_acceptance_ratio"] = float(args.hard_acceptance_ratio)
     if args.lambda_prompt_acceptance_supervision is not None:
         overrides.setdefault("prompt_graph", {})["lambda_prompt_acceptance_supervision"] = float(
             args.lambda_prompt_acceptance_supervision
         )
+    if args.acceptance_supervision_signal is not None:
+        overrides.setdefault("prompt_graph", {})["acceptance_supervision_signal"] = args.acceptance_supervision_signal
     if args.acceptance_supervision_positive_margin is not None:
         overrides.setdefault("prompt_graph", {})["acceptance_supervision_positive_margin"] = float(
             args.acceptance_supervision_positive_margin

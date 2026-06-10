@@ -72,6 +72,17 @@ class PromptGraphModuleP1(nn.Module):
         self.num_prompt_nodes = int(self.config.get("num_prompt_nodes", 8))
         if self.num_prompt_nodes <= 0:
             raise ValueError("num_prompt_nodes must be positive")
+        self.use_class_aware_routing = bool(self.config.get("use_class_aware_routing", False))
+        self.num_classes = int(self.config.get("num_classes", 0))
+        self.residual_prompt_count = int(self.config.get("residual_prompt_count", 2))
+        if self.use_class_aware_routing:
+            if self.num_classes <= 0:
+                raise ValueError("num_classes must be positive when use_class_aware_routing=true")
+            if self.residual_prompt_count < 0:
+                raise ValueError("residual_prompt_count must be non-negative")
+            min_prompt_nodes = self.num_classes + self.residual_prompt_count
+            self.num_prompt_nodes = max(self.num_prompt_nodes, min_prompt_nodes)
+        self.num_class_prompt_slots = self.num_classes if self.use_class_aware_routing else 0
         self.rho = float(self.config.get("rho", 0.2))
         self.topk_prompt_per_node = int(self.config.get("topk_prompt_per_node", 2))
         if self.topk_prompt_per_node <= 0:
@@ -94,9 +105,16 @@ class PromptGraphModuleP1(nn.Module):
         self.rejection_gate_bias_init = float(self.config.get("rejection_gate_bias_init", -1.0))
         self.rejection_gate_use_role_context = bool(self.config.get("rejection_gate_use_role_context", False))
         self.rejection_gate_use_routing_features = bool(self.config.get("rejection_gate_use_routing_features", False))
+        self.use_hard_acceptance = bool(self.config.get("use_hard_acceptance", False))
+        self.hard_acceptance_ratio = float(self.config.get("hard_acceptance_ratio", 0.10))
+        self.hard_acceptance_straight_through = bool(
+            self.config.get("hard_acceptance_straight_through", True)
+        )
         self.use_multiview_routing = bool(self.config.get("use_multiview_routing", False))
         self.view_gate_hidden_dim = int(self.config.get("view_gate_hidden_dim", self.query_hidden_dim))
         self.role_hidden_dim = int(self.config.get("role_hidden_dim", max(16, self.query_hidden_dim // 2)))
+        self.class_key_init_coverage = 0.0
+        self.class_key_init_missing_classes: list[int] = []
 
         self.prompt_node_x = nn.Parameter(torch.empty(self.num_prompt_nodes, self.source_dim))
         nn.init.normal_(self.prompt_node_x, mean=0.0, std=self.prompt_init_std)
@@ -292,6 +310,79 @@ class PromptGraphModuleP1(nn.Module):
             "view_gate": view_gate,
         }
 
+    @torch.no_grad()
+    def initialize_class_keys_from_train_prototypes(
+        self,
+        *,
+        z: torch.Tensor,
+        h_pre: torch.Tensor,
+        edge_index: torch.Tensor,
+        train_mask: torch.Tensor,
+        labels: torch.Tensor,
+        normalize: bool = True,
+        source: str = "structural_query",
+    ) -> dict[str, Any]:
+        """Initialize class routing keys from train-only structural prototypes.
+
+        This method must be called after a split is built. It only reads labels
+        at ``train_mask`` nodes and never inspects validation/test labels.
+        """
+
+        if not self.use_class_aware_routing or self.num_class_prompt_slots <= 0:
+            self.class_key_init_coverage = 0.0
+            self.class_key_init_missing_classes = []
+            return {"class_key_proto_init_coverage": 0.0, "class_key_proto_init_missing_classes": []}
+
+        if source not in {"query", "structural_query"}:
+            raise ValueError("class_key_init_source must be 'query' or 'structural_query'")
+
+        self.eval()
+        structural_score, aux = self.structural_scores(z=z, h_pre=h_pre, edge_index=edge_index)
+        pool_mask = self._pool_mask(structural_score, train_mask)
+        pool_idx = torch.where(pool_mask)[0]
+        if pool_idx.numel() == 0:
+            self.class_key_init_coverage = 0.0
+            self.class_key_init_missing_classes = list(range(self.num_class_prompt_slots))
+            return {
+                "class_key_proto_init_coverage": 0.0,
+                "class_key_proto_init_missing_classes": self.class_key_init_missing_classes,
+            }
+        _, routing_aux = self._routing_logits(aux, pool_idx, dtype=z.dtype, device=z.device)
+        query = routing_aux[source]
+        train_pool = train_mask.to(device=z.device, dtype=torch.bool)[pool_idx]
+        y = labels.to(device=z.device)[pool_idx]
+
+        if self.use_multiview_routing:
+            key_targets = [
+                self.semantic_prompt_keys,
+                self.structural_prompt_keys,
+                self.role_prompt_keys,
+            ]
+        else:
+            key_targets = [self.prompt_keys]
+
+        initialized = 0
+        missing: list[int] = []
+        for class_id in range(self.num_class_prompt_slots):
+            rows = train_pool & (y == class_id)
+            if not bool(rows.any()):
+                missing.append(class_id)
+                continue
+            proto = query[rows].mean(dim=0)
+            if normalize:
+                proto = F.normalize(proto, dim=0, eps=1e-12)
+            for key_param in key_targets:
+                key_param[class_id].copy_(proto.to(dtype=key_param.dtype, device=key_param.device))
+            initialized += 1
+
+        coverage = float(initialized / max(1, self.num_class_prompt_slots))
+        self.class_key_init_coverage = coverage
+        self.class_key_init_missing_classes = missing
+        return {
+            "class_key_proto_init_coverage": coverage,
+            "class_key_proto_init_missing_classes": missing,
+        }
+
     def _rejection_gate_context(
         self,
         aux: dict[str, torch.Tensor],
@@ -325,6 +416,19 @@ class PromptGraphModuleP1(nn.Module):
                 )
             )
         return torch.cat(pieces, dim=-1)
+
+    def _hard_acceptance_mask(self, pool_acceptance: torch.Tensor) -> torch.Tensor:
+        if pool_acceptance.numel() == 0:
+            return pool_acceptance
+        ratio = min(max(float(self.hard_acceptance_ratio), 0.0), 1.0)
+        if ratio <= 0.0:
+            return torch.zeros_like(pool_acceptance)
+        keep = int(math.ceil(ratio * int(pool_acceptance.numel())))
+        keep = min(max(keep, 1), int(pool_acceptance.numel()))
+        top_idx = torch.topk(pool_acceptance, k=keep, largest=True).indices
+        mask = torch.zeros_like(pool_acceptance)
+        mask[top_idx] = 1.0
+        return mask
 
     def _pool_mask(
         self,
@@ -423,6 +527,11 @@ class PromptGraphModuleP1(nn.Module):
             "prompt_usage_entropy": z.new_tensor(0.0),
             "prompt_usage_full_entropy": z.new_tensor(0.0),
             "pool_acceptance_gate": z.new_zeros(0),
+            "effective_acceptance_gate": z.new_zeros(0),
+            "hard_acceptance_mask": z.new_zeros(0),
+            "use_hard_acceptance": int(self.use_hard_acceptance),
+            "hard_acceptance_ratio": z.new_tensor(float(self.hard_acceptance_ratio)),
+            "hard_acceptance_selected_ratio": z.new_tensor(0.0),
             "pool_acceptance_mean": z.new_tensor(0.0),
             "pool_acceptance_min": z.new_tensor(0.0),
             "pool_acceptance_max": z.new_tensor(0.0),
@@ -437,6 +546,12 @@ class PromptGraphModuleP1(nn.Module):
             "view_gate_mean": z.new_tensor([0.0, 1.0, 0.0]),
             "view_gate_entropy": z.new_tensor(0.0),
             "routing_full_prob": z.new_zeros((0, self.num_prompt_nodes)),
+            "pool_idx": torch.empty(0, dtype=torch.long, device=z.device),
+            "use_class_aware_routing": int(self.use_class_aware_routing),
+            "num_class_prompt_slots": int(self.num_class_prompt_slots),
+            "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else 0),
+            "class_key_proto_init_coverage": float(self.class_key_init_coverage),
+            "class_key_proto_init_missing_classes": list(self.class_key_init_missing_classes),
         }
         return {
             "adapted_x": adapted_x,
@@ -510,7 +625,12 @@ class PromptGraphModuleP1(nn.Module):
                 device=device,
             )
             pool_acceptance = torch.ones(pool_idx.numel(), dtype=dtype, device=device)
-        prompt_weights = effective_edge_scale * pool_acceptance.unsqueeze(-1) * assign_prob
+        hard_acceptance_mask = self._hard_acceptance_mask(pool_acceptance) if self.use_hard_acceptance else pool_acceptance
+        if self.use_hard_acceptance and self.hard_acceptance_straight_through:
+            effective_acceptance = hard_acceptance_mask.detach() + pool_acceptance - pool_acceptance.detach()
+        else:
+            effective_acceptance = hard_acceptance_mask
+        prompt_weights = effective_edge_scale * effective_acceptance.unsqueeze(-1) * assign_prob
 
         src_node = pool_idx.repeat_interleave(k)
         dst_prompt = (prompt_offset + top_prompt_ids.reshape(-1)).long()
@@ -544,6 +664,7 @@ class PromptGraphModuleP1(nn.Module):
             **aux,
             **routing_aux,
             "routing_logits": logits,
+            "pool_idx": pool_idx,
             "rejection_gate_context": rejection_context,
             "routing_full_prob": full_prob,
             "top_prompt_ids": top_prompt_ids,
@@ -551,6 +672,11 @@ class PromptGraphModuleP1(nn.Module):
             "prompt_edge_weight": prompt_edge_weight,
             "pool_acceptance_logit": pool_acceptance_logit,
             "pool_acceptance_gate": pool_acceptance,
+            "effective_acceptance_gate": effective_acceptance,
+            "hard_acceptance_mask": hard_acceptance_mask,
+            "use_hard_acceptance": int(self.use_hard_acceptance),
+            "hard_acceptance_ratio": pool_acceptance.new_tensor(float(self.hard_acceptance_ratio)),
+            "hard_acceptance_selected_ratio": hard_acceptance_mask.mean(),
             "pool_acceptance_mean": pool_acceptance.mean(),
             "pool_acceptance_min": pool_acceptance.min(),
             "pool_acceptance_max": pool_acceptance.max(),
@@ -573,6 +699,11 @@ class PromptGraphModuleP1(nn.Module):
                 -(routing_aux["view_gate"] * routing_aux["view_gate"].clamp_min(1e-12).log()).sum(dim=-1).mean()
                 / math.log(3.0)
             ),
+            "use_class_aware_routing": int(self.use_class_aware_routing),
+            "num_class_prompt_slots": int(self.num_class_prompt_slots),
+            "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else 0),
+            "class_key_proto_init_coverage": float(self.class_key_init_coverage),
+            "class_key_proto_init_missing_classes": list(self.class_key_init_missing_classes),
         }
         return {
             "adapted_x": adapted_x,
@@ -724,6 +855,102 @@ def prompt_usage_consistency_loss(
     if not losses:
         return full_prob.new_tensor(0.0)
     return torch.stack(losses).sum()
+
+
+def _train_pool_rows(
+    prompt_out: dict[str, Any],
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    aux = prompt_out.get("aux", {})
+    full_prob = aux.get("routing_full_prob")
+    pool_mask = prompt_out.get("pool_mask")
+    edge_scale = prompt_out.get("edge_scale")
+    if not (isinstance(full_prob, torch.Tensor) and isinstance(pool_mask, torch.Tensor)):
+        return None
+    pool_idx = aux.get("pool_idx")
+    if not isinstance(pool_idx, torch.Tensor):
+        pool_idx = torch.where(pool_mask.bool())[0]
+    if pool_idx.numel() != full_prob.size(0):
+        raise ValueError("routing rows must match pool index count")
+    train_pool = train_mask.to(device=pool_mask.device, dtype=torch.bool)[pool_idx]
+    if int(train_pool.sum().item()) == 0:
+        return None
+    y = labels.to(device=pool_mask.device)[pool_idx][train_pool]
+    return train_pool, y, edge_scale if isinstance(edge_scale, torch.Tensor) else full_prob.new_tensor(0.0)
+
+
+def prompt_class_route_loss(
+    prompt_out: dict[str, Any],
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Train-only class-slot routing loss for labeled pool nodes.
+
+    Only labeled training nodes inside the prompt pool are supervised. The first
+    ``num_class_prompt_slots`` prompt slots are treated as routing anchors; all
+    remaining prompt slots stay residual and are never class targets.
+    """
+
+    aux = prompt_out.get("aux", {})
+    logits = aux.get("routing_logits")
+    class_slots = int(aux.get("num_class_prompt_slots", 0))
+    if not (isinstance(logits, torch.Tensor) and class_slots > 0):
+        edge_scale = prompt_out.get("edge_scale")
+        if isinstance(edge_scale, torch.Tensor):
+            return edge_scale.new_tensor(0.0)
+        return torch.tensor(0.0)
+    rows = _train_pool_rows(prompt_out, labels, train_mask)
+    if rows is None:
+        return logits.new_tensor(0.0)
+    train_pool, y, _ = rows
+    valid = (y >= 0) & (y < class_slots)
+    if int(valid.sum().item()) == 0:
+        return logits.new_tensor(0.0)
+    class_logits = logits[train_pool][:, :class_slots][valid]
+    targets = y[valid].long()
+    return F.cross_entropy(class_logits, targets)
+
+
+def prompt_key_proto_loss(
+    module: PromptGraphModuleP1 | None,
+    prompt_out: dict[str, Any],
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Align class prompt keys to train-only structural query prototypes."""
+
+    if module is None:
+        return torch.tensor(0.0)
+    class_slots = int(getattr(module, "num_class_prompt_slots", 0))
+    if class_slots <= 0:
+        return module.prompt_keys.new_tensor(0.0)
+    aux = prompt_out.get("aux", {})
+    query = aux.get("structural_query", aux.get("query"))
+    if not isinstance(query, torch.Tensor):
+        return module.prompt_keys.new_tensor(0.0)
+    rows = _train_pool_rows(prompt_out, labels, train_mask)
+    if rows is None:
+        return query.new_tensor(0.0)
+    train_pool, y, _ = rows
+    train_query = query[train_pool]
+    if train_query.numel() == 0:
+        return query.new_tensor(0.0)
+    if bool(getattr(module, "use_multiview_routing", False)):
+        class_keys = module.structural_prompt_keys[:class_slots]
+    else:
+        class_keys = module.prompt_keys[:class_slots]
+    losses: list[torch.Tensor] = []
+    for class_id in range(class_slots):
+        mask = y == class_id
+        if not bool(mask.any()):
+            continue
+        proto = train_query[mask].detach().mean(dim=0)
+        key = class_keys[class_id].to(dtype=query.dtype, device=query.device)
+        losses.append(1.0 - F.cosine_similarity(key.unsqueeze(0), proto.unsqueeze(0), dim=-1, eps=1e-12).squeeze(0))
+    if not losses:
+        return query.new_tensor(0.0)
+    return torch.stack(losses).mean()
 
 
 def prompt_view_entropy_loss(prompt_out: dict[str, Any]) -> torch.Tensor:

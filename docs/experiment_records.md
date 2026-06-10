@@ -1784,3 +1784,234 @@ Notes:
 - The 3-epoch smoke is only an implementation check.
 - Early supervised acceptance targets are sparse because prompt edge warmup keeps prompt-on/off behavior close at the start.
 - Full validation should rerun Actor 5% and chameleon 50-shot with the same seeds used in the P2.1 check, then repeat rejection diagnostics.
+
+## 2026-06-09 CST - P2.3 Hard Acceptance Budget
+
+Purpose:
+
+- Make prompt intervention genuinely sparse instead of only relying on a soft acceptance gate.
+- Check whether a stricter top-budget rejection mechanism can improve the model's ability to decide which pool nodes should receive prompt messages.
+- Keep the setting label-isolated: no validation/test label is used for routing, acceptance, budget, or scale selection.
+
+Implementation:
+
+- Added hard acceptance to `PromptGraphModuleP1`.
+  - `use_hard_acceptance=true`
+  - `hard_acceptance_ratio=0.10`
+  - `hard_acceptance_straight_through=true`
+- The module now keeps only the top-ratio pool nodes by learned acceptance score.
+- Prompt edge weights are multiplied by the effective hard acceptance mask.
+- Added diagnostics:
+  - `use_hard_acceptance`
+  - `hard_acceptance_ratio`
+  - `hard_acceptance_selected_ratio`
+- Added CLI overrides:
+  - `--enable_hard_acceptance`
+  - `--disable_hard_acceptance`
+  - `--hard_acceptance_ratio`
+- Added unit test for hard acceptance edge masking.
+
+Validation:
+
+```bash
+.venv/bin/python -m pytest tests/test_prompt_graph_module.py tests/test_prompt_aware_gp2f.py tests/test_splits.py -q
+.venv/bin/python -m py_compile models/prompt_graph_module.py experiments/run_gp2f_prompt_graph.py experiments/run_gp2f_prompt_p2.py
+```
+
+Result: `33 passed`.
+
+Experiment command:
+
+```bash
+.venv/bin/python -m experiments.run_gp2f_prompt_p2 \
+  --config configs/gp2f_prompt_p2_multiview.yaml \
+  --target_dataset Actor \
+  --prompt_variant p2_multiview \
+  --shot_ratio 0.05 \
+  --seeds 0,1,2 \
+  --epochs 100 \
+  --eval_every 5 \
+  --output_dir outputs/p2_hard_acceptance_5pct
+
+.venv/bin/python -m experiments.run_gp2f_prompt_p2 \
+  --config configs/gp2f_prompt_p2_multiview.yaml \
+  --target_dataset chameleon \
+  --prompt_variant p2_multiview \
+  --shot_ratio 0.05 \
+  --seeds 0,1,2 \
+  --epochs 100 \
+  --eval_every 5 \
+  --output_dir outputs/p2_hard_acceptance_5pct
+
+.venv/bin/python -m experiments.run_gp2f_prompt_p2 \
+  --config configs/gp2f_prompt_p2_multiview.yaml \
+  --target_dataset squirrel \
+  --prompt_variant p2_multiview \
+  --shot_ratio 0.05 \
+  --seeds 0,1,2 \
+  --epochs 100 \
+  --eval_every 5 \
+  --output_dir outputs/p2_hard_acceptance_5pct
+```
+
+Summary:
+
+| Dataset | Best Acc | Best Macro-F1 | Final Acc | Final Macro-F1 | Selected scale |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Actor | 25.74+-1.01 | 16.83+-7.51 | 26.07+-1.34 | 21.99+-2.51 | all seeds 0.0 |
+| chameleon | 34.49+-3.16 | 31.97+-2.59 | 33.25+-2.80 | 31.84+-3.13 | all seeds 0.0 |
+| squirrel | 23.70+-0.53 | 22.38+-2.59 | 23.47+-0.53 | 23.30+-0.56 | all seeds 0.0 |
+
+Key diagnostics:
+
+| Dataset | Hard selected ratio | Mean prompt edge weight | Prompt message norm | View gate entropy |
+| --- | ---: | ---: | ---: | ---: |
+| Actor | ~0.100 | 0.0001-0.0033 | 0.0 | ~1.000 |
+| chameleon | ~0.100 | 0.0028-0.0032 | 0.0 | ~1.000 |
+| squirrel | ~0.100 | 0.0026-0.0029 | 0.0 | ~1.000 |
+
+Rejection diagnostics:
+
+```bash
+.venv/bin/python -m experiments.diagnose_prompt_rejection \
+  --summary_path outputs/p2_hard_acceptance_5pct/Actor/20260609_113253/summary.json \
+  --summary_path outputs/p2_hard_acceptance_5pct/chameleon/20260609_114218/summary.json \
+  --summary_path outputs/p2_hard_acceptance_5pct/squirrel/20260609_114714/summary.json \
+  --output_dir outputs/prompt_diagnostics/p2_hard_acceptance_5pct
+```
+
+| Dataset | Prompt Off | Prompt On All Pool | Oracle Test Upper Bound |
+| --- | ---: | ---: | ---: |
+| Actor | 25.74 | 25.74 | 25.74 |
+| chameleon | 34.49 | 34.49 | 34.49 |
+| squirrel | 23.70 | 23.70 | 23.70 |
+
+Interpretation:
+
+- Hard acceptance works mechanically: selected ratio is close to 10% on every dataset.
+- However, validation consistently selected `message_scale=0.0`, so the final reported models effectively disabled prompt messages.
+- This means P2.3 is stable but too conservative under the current scale-selection protocol.
+- The identical prompt-off / prompt-on / oracle diagnostic is not evidence that rejection is solved. It only means the selected checkpoint has no active prompt message.
+- The view gate still has near-maximum entropy, so semantic / structural / role views are not specializing.
+- Current bottleneck is not only pool capacity. The stronger issue is that the prompt message path is not producing validation-visible gains, so the runner rationally chooses to turn it off.
+
+Next diagnosis:
+
+- Run fixed positive message-scale experiments instead of allowing scale 0 during diagnosis.
+- Compare `message_scale=0.5` and `1.0` with hard ratios `0.10`, `0.20`, and soft gate.
+- Temporarily disable validation selection of scale 0 when testing whether prompt messages can help.
+- Inspect train-pool supervised acceptance: current full summaries show `acceptance_supervised_count=0`, so the acceptance supervision is not firing at selected checkpoints.
+- Improve the train-only acceptance target generation or compute the acceptance supervision after prompt warmup.
+
+## 2026-06-09 CST - P2.4 Zero-init Prompt Message Safety
+
+Purpose:
+
+- The positive-scale diagnostic showed that forcing prompt messages to be active hurts Actor, chameleon, and squirrel.
+- The earlier hard-acceptance experiment was stable only because validation selected `message_scale=0.0`.
+- This update makes the prompt-aware message path start exactly as NoPrompt and lets training wake it up only if useful.
+
+Implementation:
+
+- Added `prompt_aware.zero_init_prompt_messages`.
+  - When enabled, node-to-prompt and prompt-to-node message projections are initialized to zero.
+  - Initial full-edge prompt logits match NoPrompt: `init_logit_delta_full_edge_scale=0.0`.
+  - The projection still receives gradients, so the prompt message path is not frozen.
+- Restored safe validation-only message-scale selection.
+  - `message_scale_grid: [0.0, 0.1, 0.25, 0.5, 1.0]`
+  - `0.0` remains the no-message fallback.
+- Added logging for `zero_init_prompt_messages`.
+- Fixed acceptance target ambiguity by using strict margins (`>` / `<`) instead of allowing zero delta to be both positive and negative.
+
+Validation:
+
+```bash
+.venv/bin/python -m pytest tests/test_prompt_graph_module.py tests/test_prompt_aware_gp2f.py tests/test_splits.py -q
+.venv/bin/python -m py_compile models/prompt_aware_gp2f.py experiments/run_gp2f_prompt_graph.py experiments/run_gp2f_prompt_p2.py
+```
+
+Result: `34 passed`.
+
+Positive-scale diagnostic before this fix:
+
+| Dataset | Best Acc | Best Macro-F1 | Final Acc | Final Macro-F1 |
+| --- | ---: | ---: | ---: | ---: |
+| Actor | 17.99+-7.51 | 7.16+-2.65 | 21.51+-7.75 | 7.81+-0.78 |
+| chameleon | 24.27+-0.91 | 11.50+-2.89 | 23.19+-0.64 | 9.46+-0.82 |
+| squirrel | 20.22+-0.08 | 8.37+-1.31 | 20.16+-0.38 | 8.51+-0.60 |
+
+Zero-init safe-scale experiment:
+
+```bash
+.venv/bin/python -m experiments.run_gp2f_prompt_p2 \
+  --config configs/gp2f_prompt_p2_multiview.yaml \
+  --target_dataset Actor \
+  --prompt_variant p2_multiview \
+  --shot_ratio 0.05 \
+  --seeds 0,1,2 \
+  --epochs 80 \
+  --eval_every 5 \
+  --output_dir outputs/p2_zero_init_safe_5pct
+
+.venv/bin/python -m experiments.run_gp2f_prompt_p2 \
+  --config configs/gp2f_prompt_p2_multiview.yaml \
+  --target_dataset chameleon \
+  --prompt_variant p2_multiview \
+  --shot_ratio 0.05 \
+  --seeds 0,1,2 \
+  --epochs 80 \
+  --eval_every 5 \
+  --output_dir outputs/p2_zero_init_safe_5pct
+```
+
+Summary:
+
+| Dataset | Best Acc | Best Macro-F1 | Final Acc | Final Macro-F1 | Selected scale |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Actor | 26.25+-0.33 | 17.18+-7.30 | 26.44+-0.76 | 18.65+-8.96 | 0.0, 0.0, 0.1 |
+| chameleon | 33.95+-3.01 | 31.29+-1.89 | 32.90+-2.08 | 31.37+-2.44 | all seeds 0.0 |
+
+Key diagnostics:
+
+- `zero_init_prompt_messages=1.0` for every selected run.
+- `init_logit_delta_full_edge_scale=0.0`, confirming strict NoPrompt equivalence at initialization.
+- `acceptance_supervised_count=0` in selected checkpoints, so the train-only acceptance target still does not provide useful supervision.
+- The validation selector still mostly chooses `message_scale=0.0`, meaning the current prompt message path is stable but not yet useful.
+
+Interpretation:
+
+- P2.4 fixes the initialization/stability issue and prevents forced positive prompt messages from damaging performance.
+- It does not solve the core effectiveness problem: the model still cannot reliably identify when prompt messages should be enabled.
+- The next optimization should not increase pool size or message scale first. The priority is to create a validation-visible training signal for prompt activation, such as a delayed acceptance-supervision phase after warmup or a train-only auxiliary objective that compares prompt-on/off logits after the prompt message path has nonzero capacity.
+
+Follow-up CE-delta acceptance smoke:
+
+```bash
+.venv/bin/python -m experiments.run_gp2f_prompt_p2 \
+  --config configs/gp2f_prompt_p2_multiview.yaml \
+  --target_dataset Actor \
+  --prompt_variant p2_multiview \
+  --shot_ratio 0.05 \
+  --seeds 0 \
+  --epochs 40 \
+  --eval_every 5 \
+  --prompt_message_scale 0.1 \
+  --output_dir outputs/smoke_p2_ce_delta_acceptance
+```
+
+Result:
+
+- Best Test Acc: `19.23`
+- Final Test Acc: `17.12`
+- `acceptance_supervised_count=42`
+- `acceptance_positive_count=12`
+- `acceptance_negative_count=30`
+- `acceptance_target_mean=0.286`
+- `prompt_msg_norm=1.69e-06`
+
+Interpretation:
+
+- CE-delta supervision does create nonzero train-only acceptance targets.
+- The fixed positive prompt message still hurts, so the remaining issue is not only missing gate supervision.
+- The learned signal is mostly negative, which supports the current validation behavior of selecting `message_scale=0.0`.
+- Next improvement should focus on prompt message quality and representation alignment, not simply accepting more pool nodes.

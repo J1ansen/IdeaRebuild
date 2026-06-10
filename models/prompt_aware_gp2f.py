@@ -72,13 +72,19 @@ class PromptAwareGP2F(FaithfulGP2F):
         self.prompt_aware_dropout = float(cfg.get("dropout", 0.2))
         self.use_node_to_prompt = bool(cfg.get("use_node_to_prompt", True))
         self.use_prompt_to_node = bool(cfg.get("use_prompt_to_node", True))
+        self.receiver_version = str(cfg.get("receiver_version", "v1_linear"))
+        if self.receiver_version not in {"v1_linear", "v2_conditioned"}:
+            raise ValueError("prompt_aware.receiver_version must be 'v1_linear' or 'v2_conditioned'")
+        self.prompt_fusion = str(cfg.get("prompt_fusion", "residual_gate"))
         gate_init = float(cfg.get("gate_init", 0.01))
+        gate_init = float(cfg.get("receiver_gate_init", gate_init))
         node_to_prompt_gate_init = cfg.get("node_to_prompt_gate_init")
         prompt_to_node_gate_init = cfg.get("prompt_to_node_gate_init")
         self.prompt_message_scale = float(cfg.get("message_scale", 1.0))
-        self.prompt_message_norm = str(cfg.get("message_norm", "weighted_mean"))
+        self.prompt_message_norm = str(cfg.get("prompt_message_norm", cfg.get("message_norm", "weighted_mean")))
         self.pool_only_prompt_update = bool(cfg.get("pool_only_prompt_update", False))
-        valid_norms = {"weighted_mean", "weighted_sum", "degree_mean"}
+        self.zero_init_prompt_messages = bool(cfg.get("zero_init_prompt_messages", False))
+        valid_norms = {"weighted_mean", "weighted_sum", "degree_mean", "layernorm"}
         if self.prompt_message_norm not in valid_norms:
             raise ValueError(
                 f"Unsupported prompt_aware.message_norm={self.prompt_message_norm!r}; "
@@ -93,6 +99,38 @@ class PromptAwareGP2F(FaithfulGP2F):
         self.prompt_to_node_msgs = nn.ModuleList(
             [nn.Linear(dim, self.hidden_dim) for dim in layer_input_dims]
         )
+        self.node_to_prompt_conditioned_msgs = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(4 * dim, self.hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(self.prompt_aware_dropout),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+                for dim in layer_input_dims
+            ]
+        )
+        self.prompt_to_node_conditioned_msgs = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(4 * dim, self.hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(self.prompt_aware_dropout),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+                for dim in layer_input_dims
+            ]
+        )
+        self.prompt_update_norms = nn.ModuleList([nn.LayerNorm(self.hidden_dim) for _ in layer_input_dims])
+        if self.zero_init_prompt_messages:
+            for module in [*self.node_to_prompt_msgs, *self.prompt_to_node_msgs]:
+                nn.init.zeros_(module.weight)
+                nn.init.zeros_(module.bias)
+            for module in [*self.node_to_prompt_conditioned_msgs, *self.prompt_to_node_conditioned_msgs]:
+                final = module[-1]
+                if isinstance(final, nn.Linear):
+                    nn.init.zeros_(final.weight)
+                    nn.init.zeros_(final.bias)
         self.prompt_gate_logit = nn.Parameter(
             _prompt_gate_init_tensor(
                 num_layers=len(self.backbone.convs),
@@ -144,6 +182,41 @@ class PromptAwareGP2F(FaithfulGP2F):
             denom.index_add_(0, dst, weight)
         return out / denom.clamp_min(1e-12).unsqueeze(-1)
 
+    def _aggregate_conditioned_prompt_message(
+        self,
+        *,
+        h: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor | None,
+        edge_type: torch.Tensor,
+        type_id: int,
+        transform: nn.Module,
+    ) -> torch.Tensor:
+        mask = edge_type == int(type_id)
+        out = h.new_zeros((h.size(0), self.hidden_dim))
+        if not bool(mask.any()):
+            return out
+        src = edge_index[0, mask]
+        dst = edge_index[1, mask]
+        src_h = h[src]
+        dst_h = h[dst]
+        msg_input = torch.cat([dst_h, src_h, dst_h - src_h, dst_h * src_h], dim=-1)
+        msg = transform(msg_input)
+        if edge_weight is None:
+            weight = h.new_ones(src.numel())
+        else:
+            weight = edge_weight[mask].to(dtype=h.dtype, device=h.device)
+        weighted_msg = msg * weight.unsqueeze(-1)
+        out.index_add_(0, dst, weighted_msg)
+        if self.prompt_message_norm == "weighted_sum":
+            return out
+        denom = h.new_zeros(h.size(0))
+        if self.prompt_message_norm == "degree_mean":
+            denom.index_add_(0, dst, torch.ones_like(weight))
+        else:
+            denom.index_add_(0, dst, weight)
+        return out / denom.clamp_min(1e-12).unsqueeze(-1)
+
     def _encode_adapted_prompt_aware(
         self,
         x: torch.Tensor,
@@ -170,6 +243,10 @@ class PromptAwareGP2F(FaithfulGP2F):
                 "prompt_message_scale": x.new_tensor(float(self.prompt_message_scale)),
                 "prompt_message_norm": self.prompt_message_norm,
                 "pool_only_prompt_update": x.new_tensor(float(self.pool_only_prompt_update)),
+                "zero_init_prompt_messages": x.new_tensor(float(self.zero_init_prompt_messages)),
+                "receiver_version": self.receiver_version,
+                "prompt_fusion": self.prompt_fusion,
+                "prompt_receiver_gate_mean": self.prompt_gates[:, 1].mean(),
             }
             return self._encode_adapted(x, edge_index, edge_weight)
 
@@ -214,22 +291,40 @@ class PromptAwareGP2F(FaithfulGP2F):
             else:
                 clean_h_base = h_base
 
-            node_to_prompt = self._aggregate_prompt_message(
-                h=h,
-                edge_index=edge_index,
-                edge_weight=edge_weight,
-                edge_type=edge_type,
-                type_id=1,
-                transform=self.node_to_prompt_msgs[layer_idx],
-            )
-            prompt_to_node = self._aggregate_prompt_message(
-                h=h,
-                edge_index=edge_index,
-                edge_weight=edge_weight,
-                edge_type=edge_type,
-                type_id=2,
-                transform=self.prompt_to_node_msgs[layer_idx],
-            )
+            if self.receiver_version == "v2_conditioned":
+                node_to_prompt = self._aggregate_conditioned_prompt_message(
+                    h=h,
+                    edge_index=edge_index,
+                    edge_weight=edge_weight,
+                    edge_type=edge_type,
+                    type_id=1,
+                    transform=self.node_to_prompt_conditioned_msgs[layer_idx],
+                )
+                prompt_to_node = self._aggregate_conditioned_prompt_message(
+                    h=h,
+                    edge_index=edge_index,
+                    edge_weight=edge_weight,
+                    edge_type=edge_type,
+                    type_id=2,
+                    transform=self.prompt_to_node_conditioned_msgs[layer_idx],
+                )
+            else:
+                node_to_prompt = self._aggregate_prompt_message(
+                    h=h,
+                    edge_index=edge_index,
+                    edge_weight=edge_weight,
+                    edge_type=edge_type,
+                    type_id=1,
+                    transform=self.node_to_prompt_msgs[layer_idx],
+                )
+                prompt_to_node = self._aggregate_prompt_message(
+                    h=h,
+                    edge_index=edge_index,
+                    edge_weight=edge_weight,
+                    edge_type=edge_type,
+                    type_id=2,
+                    transform=self.prompt_to_node_msgs[layer_idx],
+                )
             if not self.use_node_to_prompt:
                 node_to_prompt = torch.zeros_like(node_to_prompt)
             if not self.use_prompt_to_node:
@@ -237,6 +332,8 @@ class PromptAwareGP2F(FaithfulGP2F):
             gated_node_to_prompt = gates[layer_idx, 0] * node_to_prompt
             gated_prompt_to_node = gates[layer_idx, 1] * prompt_to_node
             raw_prompt_update = gated_node_to_prompt + gated_prompt_to_node
+            if self.prompt_message_norm == "layernorm":
+                raw_prompt_update = self.prompt_update_norms[layer_idx](raw_prompt_update)
             prompt_update = float(self.prompt_message_scale) * raw_prompt_update
             prompted_h = h_base + prompt_update
             if update_mask is not None:
@@ -299,6 +396,10 @@ class PromptAwareGP2F(FaithfulGP2F):
             "prompt_message_scale": x.new_tensor(float(self.prompt_message_scale)),
             "prompt_message_norm": self.prompt_message_norm,
             "pool_only_prompt_update": x.new_tensor(float(self.pool_only_prompt_update)),
+            "zero_init_prompt_messages": x.new_tensor(float(self.zero_init_prompt_messages)),
+            "receiver_version": self.receiver_version,
+            "prompt_fusion": self.prompt_fusion,
+            "prompt_receiver_gate_mean": gates[:, 1].mean(),
         }
         return h
 
