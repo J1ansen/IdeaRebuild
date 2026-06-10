@@ -17,7 +17,7 @@ from models.prompt_graph_module import (
     prompt_usage_consistency_loss,
     prompt_view_entropy_loss,
 )
-from experiments.run_gp2f_prompt_graph import _acceptance_supervision_loss
+from experiments.run_gp2f_prompt_graph import _acceptance_supervision_loss, _benefit_supervision_loss
 
 
 def _config(**overrides: object) -> dict:
@@ -126,6 +126,21 @@ def test_prompt_edges_are_bidirectional() -> None:
 
     for src, dst in list(edge_set):
         assert (dst, src) in edge_set
+
+
+def test_receiver_only_prompt_edges_disable_node_to_prompt_edges() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(use_receiver_only_prompt=True))
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    prompt_edges = out["adapted_edge_index"][:, edge_index.size(1) :]
+    prompt_types = out["adapted_edge_type"][edge_index.size(1) :]
+
+    assert int((prompt_types == 1).sum().item()) == 0
+    assert int((prompt_types == 2).sum().item()) == prompt_types.numel()
+    assert torch.all(prompt_edges[0] >= z.size(0))
+    assert torch.all(prompt_edges[1] < z.size(0))
+    assert out["aux"]["edge_type_counts"] == [edge_index.size(1), 0, prompt_types.numel()]
 
 
 def test_pool_nodes_have_at_most_topk_prompt_connections_and_nonpool_has_none() -> None:
@@ -620,3 +635,65 @@ def test_residual_prompt_slots_are_not_class_targets() -> None:
     manual = F.cross_entropy(logits[train_mask[out["aux"]["pool_idx"]]][:, :2], y[train_mask])
 
     assert torch.allclose(loss, manual)
+
+
+def test_pattern_medoid_initialization_is_label_free_and_reports_coverage() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_multiview_routing=True, use_pattern_prompt_bank=True, rho=1.0),
+    )
+    before = module.structural_prompt_keys.detach().clone()
+
+    stats = module.initialize_pattern_keys_from_pool_medoids(
+        z=z,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+    )
+
+    assert stats["pattern_key_init_coverage"] == 1.0
+    assert len(stats["pattern_key_init_selected_nodes"]) == module.num_prompt_nodes
+    assert not torch.allclose(before, module.structural_prompt_keys.detach())
+    assert module.pattern_key_init_coverage == 1.0
+
+
+def test_benefit_gate_scales_edges_and_supervision_is_train_only() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_benefit_gate=True, benefit_gate_bias_init=-2.0, rho=1.0),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    benefit = out["aux"]["benefit_gate"]
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.5, 0.2],
+            [0.0, 2.0],
+            [0.1, 1.5],
+            [2.0, 0.0],
+            [0.0, 2.0],
+        ]
+    )
+    logits_on = logits_off.clone()
+    logits_on[train_mask, y[train_mask]] += torch.tensor([0.5, -0.5])
+    loss, stats = _benefit_supervision_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        margin=0.01,
+        balance_targets=True,
+    )
+
+    assert benefit.shape == out["aux"]["assignment_prob"].shape
+    assert 0.0 < float(benefit.mean().item()) < 1.0
+    assert torch.isfinite(loss)
+    assert stats["benefit_supervised_count"] == 2.0
+    assert stats["benefit_positive_count"] == 1.0
+    assert stats["benefit_negative_count"] == 1.0

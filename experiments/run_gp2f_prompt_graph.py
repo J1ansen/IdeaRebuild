@@ -50,6 +50,7 @@ PROMPT_GRAPH_VARIANTS = {
     "p2_prompt_aware",
     "p2_strength",
     "p2_multiview",
+    "p2_pattern_benefit",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -80,10 +81,13 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
     elif variant == "p2_no_prompt_to_node":
         prompt_aware["use_prompt_to_node"] = False
         prompt_aware.setdefault("use_node_to_prompt", True)
-    elif variant in {"p2_prompt_aware", "p2_strength", "p2_strength_random_pool", "p2_multiview"}:
+    elif variant in {"p2_prompt_aware", "p2_strength", "p2_strength_random_pool", "p2_multiview", "p2_pattern_benefit"}:
         prompt_aware.setdefault("use_node_to_prompt", True)
         prompt_aware.setdefault("use_prompt_to_node", True)
-    if variant in {"p2_strength", "p2_strength_random_pool", "p2_multiview"}:
+    if variant == "p2_pattern_benefit":
+        prompt_aware["use_node_to_prompt"] = False
+        prompt_aware["use_prompt_to_node"] = True
+    if variant in {"p2_strength", "p2_strength_random_pool", "p2_multiview", "p2_pattern_benefit"}:
         prompt_aware.setdefault("gate_init", 0.05)
         prompt_aware.setdefault("message_scale", 5.0)
         prompt_aware.setdefault("message_norm", "weighted_mean")
@@ -97,9 +101,20 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         prompt_graph.setdefault("lambda_class_route", 0.05)
         prompt_graph.setdefault("lambda_key_proto", 0.001)
         prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.02)
+    if variant == "p2_pattern_benefit":
+        prompt_graph["use_multiview_routing"] = True
+        prompt_graph["use_pattern_prompt_bank"] = True
+        prompt_graph["use_receiver_only_prompt"] = True
+        prompt_graph["use_benefit_gate"] = True
+        prompt_graph.setdefault("init_pattern_keys_from_pool_medoids", True)
+        prompt_graph.setdefault("benefit_gate_bias_init", -1.0)
+        prompt_graph.setdefault("lambda_prompt_benefit_supervision", 0.10)
+        prompt_graph.setdefault("benefit_supervision_warmup_epochs", 10)
+        prompt_graph.setdefault("benefit_delta_margin", 0.01)
+        prompt_graph.setdefault("benefit_supervision_balance_targets", True)
     if variant in {"p1_random_pool", "p2_strength_random_pool"}:
         prompt_graph["pool_strategy"] = "random"
-    elif variant in {"p1_graph", "p2_prompt_aware", "p2_strength", "p2_multiview", "p2_no_node_to_prompt", "p2_no_prompt_to_node"}:
+    elif variant in {"p1_graph", "p2_prompt_aware", "p2_strength", "p2_multiview", "p2_pattern_benefit", "p2_no_node_to_prompt", "p2_no_prompt_to_node"}:
         prompt_graph.setdefault("pool_strategy", "structural")
     return out
 
@@ -150,6 +165,40 @@ def _maybe_initialize_class_keys(
         labels=labels,
         normalize=bool(prompt_graph_cfg.get("class_key_init_normalize", True)),
         source=str(prompt_graph_cfg.get("class_key_init_source", "structural_query")),
+    )
+    input_aligner.train(input_was_training)
+    model.train(model_was_training)
+    prompt_graph_module.train(was_training)
+    return stats
+
+
+@torch.no_grad()
+def _maybe_initialize_pattern_keys(
+    *,
+    prompt_graph_module: PromptGraphModuleP1 | None,
+    input_aligner: InputAligner,
+    model: FaithfulGP2F,
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    train_mask: torch.Tensor,
+    prompt_graph_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    if prompt_graph_module is None or not bool(prompt_graph_cfg.get("init_pattern_keys_from_pool_medoids", False)):
+        return {"pattern_key_init_coverage": 0.0, "pattern_key_init_selected_nodes": []}
+    was_training = prompt_graph_module.training
+    input_was_training = input_aligner.training
+    model_was_training = model.training
+    input_aligner.eval()
+    model.eval()
+    prompt_graph_module.eval()
+    z = input_aligner(x)
+    h_pre = model.encode_frozen(z, edge_index)
+    stats = prompt_graph_module.initialize_pattern_keys_from_pool_medoids(
+        z=z,
+        h_pre=h_pre.detach(),
+        edge_index=edge_index,
+        train_mask=train_mask,
+        normalize=bool(prompt_graph_cfg.get("pattern_key_init_normalize", True)),
     )
     input_aligner.train(input_was_training)
     model.train(model_was_training)
@@ -607,9 +656,28 @@ def _prompt_graph_diagnostics(
         "connected_edge_count": int(aux.get("connected_edge_count", prompt_edge_count)),
         "use_multiview_routing": float(aux.get("use_multiview_routing", 0)),
         "use_class_aware_routing": float(aux.get("use_class_aware_routing", 0)),
+        "use_pattern_prompt_bank": float(aux.get("use_pattern_prompt_bank", 0)),
+        "use_receiver_only_prompt": float(aux.get("use_receiver_only_prompt", 0)),
+        "use_benefit_gate": float(aux.get("use_benefit_gate", 0)),
         "num_class_prompt_slots": float(aux.get("num_class_prompt_slots", 0)),
         "residual_prompt_count": float(aux.get("residual_prompt_count", 0)),
         "class_key_proto_init_coverage": float(aux.get("class_key_proto_init_coverage", 0.0)),
+        "pattern_key_init_coverage": float(aux.get("pattern_key_init_coverage", 0.0)),
+        "benefit_gate_mean": (
+            float(aux["benefit_gate_mean"].detach().item())
+            if isinstance(aux.get("benefit_gate_mean"), torch.Tensor)
+            else 1.0
+        ),
+        "benefit_gate_min": (
+            float(aux["benefit_gate_min"].detach().item())
+            if isinstance(aux.get("benefit_gate_min"), torch.Tensor)
+            else 1.0
+        ),
+        "benefit_gate_max": (
+            float(aux["benefit_gate_max"].detach().item())
+            if isinstance(aux.get("benefit_gate_max"), torch.Tensor)
+            else 1.0
+        ),
         "view_gate_entropy": (
             float(aux["view_gate_entropy"].detach().item())
             if isinstance(aux.get("view_gate_entropy"), torch.Tensor)
@@ -875,6 +943,99 @@ def _acceptance_supervision_loss(
     return loss, stats
 
 
+def _benefit_supervision_loss(
+    *,
+    prompt_out: dict[str, Any],
+    logits_on: torch.Tensor,
+    logits_off: torch.Tensor,
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    margin: float,
+    balance_targets: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    aux = prompt_out.get("aux", {})
+    pool_mask = prompt_out.get("pool_mask")
+    benefit_logits = aux.get("benefit_gate_logit")
+    edge_scale = prompt_out.get("edge_scale")
+    fallback = edge_scale.new_tensor(0.0) if isinstance(edge_scale, torch.Tensor) else torch.tensor(0.0)
+    empty_stats = {
+        "prompt_benefit_supervision": 0.0,
+        "benefit_supervised_count": 0.0,
+        "benefit_positive_count": 0.0,
+        "benefit_negative_count": 0.0,
+        "benefit_ignored_count": 0.0,
+        "mean_delta_ce_train_pool": 0.0,
+        "positive_delta_ratio_train_pool": 0.0,
+        "benefit_weight_delta_corr_train": 0.0,
+    }
+    if not (
+        isinstance(pool_mask, torch.Tensor)
+        and isinstance(benefit_logits, torch.Tensor)
+        and benefit_logits.numel() > 0
+    ):
+        return fallback, empty_stats
+    pool_idx = aux.get("pool_idx")
+    if not isinstance(pool_idx, torch.Tensor):
+        pool_idx = torch.where(pool_mask.bool())[0]
+    if pool_idx.numel() != benefit_logits.size(0):
+        raise ValueError("benefit_gate_logit rows must match pool index count")
+    train_pool = train_mask.to(device=pool_mask.device, dtype=torch.bool)[pool_idx]
+    if int(train_pool.sum().item()) == 0:
+        return fallback, empty_stats
+
+    pool_idx_train = pool_idx[train_pool]
+    y = labels.to(device=pool_mask.device)[pool_idx_train]
+    on = logits_on.detach()[pool_idx_train]
+    off = logits_off.detach()[pool_idx_train]
+    off_ce = F.cross_entropy(off, y, reduction="none")
+    on_ce = F.cross_entropy(on, y, reduction="none")
+    delta_ce = off_ce - on_ce
+    margin = max(float(margin), 0.0)
+    positive = delta_ce > margin
+    negative = delta_ce < -margin
+    valid = positive ^ negative
+    ignored = ~valid
+    train_count = max(1, int(train_pool.sum().item()))
+    stats = dict(empty_stats)
+    stats["mean_delta_ce_train_pool"] = float(delta_ce.mean().detach().item())
+    stats["positive_delta_ratio_train_pool"] = float(positive.float().mean().detach().item())
+    stats["benefit_ignored_count"] = float(ignored.sum().item())
+    if int(valid.sum().item()) == 0:
+        return fallback, stats
+
+    selected_logits = benefit_logits[train_pool][valid].reshape(-1)
+    targets = positive[valid].to(dtype=selected_logits.dtype).unsqueeze(-1).expand(-1, benefit_logits.size(1)).reshape(-1)
+    if balance_targets and bool((targets > 0.5).any()) and bool((targets < 0.5).any()):
+        pos_count = targets.sum().clamp_min(1.0)
+        neg_count = (1.0 - targets).sum().clamp_min(1.0)
+        pos_weight = neg_count / pos_count
+        loss = F.binary_cross_entropy_with_logits(selected_logits, targets, pos_weight=pos_weight)
+    else:
+        loss = F.binary_cross_entropy_with_logits(selected_logits, targets)
+
+    benefit_weight = torch.sigmoid(benefit_logits[train_pool]).mean(dim=-1)
+    valid_weight = benefit_weight[valid]
+    valid_delta = delta_ce[valid]
+    if valid_weight.numel() > 1 and float(valid_weight.std(unbiased=False).item()) > 1e-12:
+        centered_weight = valid_weight - valid_weight.mean()
+        centered_delta = valid_delta - valid_delta.mean()
+        corr = (centered_weight * centered_delta).mean() / (
+            centered_weight.pow(2).mean().sqrt() * centered_delta.pow(2).mean().sqrt()
+        ).clamp_min(1e-12)
+        stats["benefit_weight_delta_corr_train"] = float(corr.detach().item())
+    stats.update(
+        {
+            "prompt_benefit_supervision": float(loss.detach().item()),
+            "benefit_supervised_count": float(valid.sum().item()),
+            "benefit_positive_count": float(positive[valid].sum().item()),
+            "benefit_negative_count": float(negative[valid].sum().item()),
+            "benefit_ignored_count": float(ignored.sum().item()),
+            "positive_delta_ratio_train_pool": float(positive.sum().item() / train_count),
+        }
+    )
+    return loss, stats
+
+
 def _edge_scale_multiplier(epoch: int, prompt_graph_cfg: dict[str, Any]) -> float:
     warmup_epochs = int(prompt_graph_cfg.get("edge_scale_warmup_epochs", 0))
     start = float(prompt_graph_cfg.get("edge_scale_warmup_start", 1.0 if warmup_epochs <= 0 else 0.0))
@@ -1044,6 +1205,265 @@ def evaluate_prompt_graph(
     }
 
 
+def _empty_prompt_message_utility(scale: float, reason: str) -> dict[str, Any]:
+    return {
+        "diagnostic": "prompt_message_utility",
+        "message_scale": float(scale),
+        "model_state": "final_after_training",
+        "reason": reason,
+        "train_pool_count": 0,
+        "mean_delta_ce": 0.0,
+        "median_delta_ce": 0.0,
+        "positive_delta_ratio": 0.0,
+        "mean_ce_no_prompt": 0.0,
+        "mean_ce_prompt": 0.0,
+        "delta_ce_by_class": {},
+        "delta_ce_by_prompt_slot": {},
+        "delta_ce_by_acceptance_gate": {},
+        "delta_ce_by_structural_score": {},
+        "acceptance_delta_correlation": 0.0,
+        "structural_score_delta_correlation": 0.0,
+        "node_records": [],
+    }
+
+
+def _group_delta_stats(
+    *,
+    keys: torch.Tensor,
+    delta_ce: torch.Tensor,
+    positive: torch.Tensor,
+) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    if keys.numel() == 0:
+        return out
+    for key in torch.unique(keys.detach()).tolist():
+        key_int = int(key)
+        mask = keys == key_int
+        if not bool(mask.any()):
+            continue
+        out[str(key_int)] = {
+            "count": int(mask.sum().item()),
+            "mean_delta_ce": float(delta_ce[mask].mean().item()),
+            "positive_delta_ratio": float(positive[mask].float().mean().item()),
+        }
+    return out
+
+
+def _bin_delta_stats(
+    *,
+    values: torch.Tensor,
+    delta_ce: torch.Tensor,
+    positive: torch.Tensor,
+    prefix: str,
+) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    if values.numel() == 0:
+        return out
+    if values.numel() < 3 or float((values.max() - values.min()).abs().item()) < 1e-12:
+        mask = torch.ones_like(values, dtype=torch.bool)
+        out[f"{prefix}_all"] = {
+            "count": int(mask.sum().item()),
+            "value_min": float(values.min().item()),
+            "value_max": float(values.max().item()),
+            "value_mean": float(values.mean().item()),
+            "mean_delta_ce": float(delta_ce[mask].mean().item()),
+            "positive_delta_ratio": float(positive[mask].float().mean().item()),
+        }
+        return out
+    q1 = torch.quantile(values.float(), 1.0 / 3.0)
+    q2 = torch.quantile(values.float(), 2.0 / 3.0)
+    bins = {
+        f"{prefix}_low": values <= q1,
+        f"{prefix}_mid": (values > q1) & (values <= q2),
+        f"{prefix}_high": values > q2,
+    }
+    for name, mask in bins.items():
+        if not bool(mask.any()):
+            continue
+        out[name] = {
+            "count": int(mask.sum().item()),
+            "value_min": float(values[mask].min().item()),
+            "value_max": float(values[mask].max().item()),
+            "value_mean": float(values[mask].mean().item()),
+            "mean_delta_ce": float(delta_ce[mask].mean().item()),
+            "positive_delta_ratio": float(positive[mask].float().mean().item()),
+        }
+    return out
+
+
+def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    if x.numel() < 2 or y.numel() < 2:
+        return 0.0
+    x_centered = x.float() - x.float().mean()
+    y_centered = y.float() - y.float().mean()
+    denom = x_centered.norm() * y_centered.norm()
+    if float(denom.item()) <= 1e-12:
+        return 0.0
+    return float((x_centered * y_centered).sum().div(denom).item())
+
+
+@torch.no_grad()
+def diagnose_prompt_message_utility(
+    *,
+    model: FaithfulGP2F,
+    prompt_graph_module: PromptGraphModuleP1 | None,
+    input_aligner: InputAligner,
+    x: torch.Tensor,
+    edge_index: torch.Tensor,
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    message_scale: float,
+) -> dict[str, Any]:
+    """Measure whether prompt-on logits reduce CE on train-pool nodes.
+
+    This diagnostic intentionally uses a fixed positive message scale. It does
+    not let validation select scale=0 before measuring prompt utility.
+    """
+
+    if prompt_graph_module is None:
+        return _empty_prompt_message_utility(message_scale, "prompt_graph_module_disabled")
+    model.eval()
+    input_aligner.eval()
+    prompt_graph_module.eval()
+
+    old_scale: float | None = None
+    if isinstance(model, PromptAwareGP2F):
+        old_scale = float(model.prompt_message_scale)
+        model.prompt_message_scale = float(message_scale)
+
+    try:
+        z = input_aligner(x)
+        model_prompt, prompt_out = _forward_prompt_graph(
+            model=model,
+            prompt_graph_module=prompt_graph_module,
+            z=z,
+            edge_index=edge_index,
+            train_mask=train_mask,
+            edge_scale_multiplier=1.0,
+        )
+        model_no_prompt = _forward_no_prompt_with_h_pre(
+            model=model,
+            z=z,
+            edge_index=edge_index,
+            h_pre=model_prompt["h_pre_shared"],
+        )
+    finally:
+        if old_scale is not None:
+            model.prompt_message_scale = old_scale
+
+    pool_mask = prompt_out.get("pool_mask")
+    if not isinstance(pool_mask, torch.Tensor):
+        return _empty_prompt_message_utility(message_scale, "missing_pool_mask")
+    train_pool_mask = train_mask.to(device=pool_mask.device, dtype=torch.bool) & pool_mask.bool()
+    train_pool_idx = torch.where(train_pool_mask)[0]
+    if train_pool_idx.numel() == 0:
+        return _empty_prompt_message_utility(message_scale, "empty_train_pool")
+
+    y = labels.to(device=train_pool_idx.device)[train_pool_idx]
+    ce_no_prompt = F.cross_entropy(model_no_prompt["logits"][train_pool_idx], y, reduction="none")
+    ce_prompt = F.cross_entropy(model_prompt["logits"][train_pool_idx], y, reduction="none")
+    delta_ce = ce_no_prompt - ce_prompt
+    positive = delta_ce > 0.0
+
+    aux = prompt_out.get("aux", {})
+    pool_idx = aux.get("pool_idx")
+    pool_acceptance = aux.get("pool_acceptance_gate")
+    structural_score = aux.get("structural_score")
+    routing_full_prob = aux.get("routing_full_prob")
+    top_prompt_ids = aux.get("top_prompt_ids")
+
+    pool_position = torch.full((pool_mask.numel(),), -1, dtype=torch.long, device=pool_mask.device)
+    if isinstance(pool_idx, torch.Tensor) and pool_idx.numel() > 0:
+        pool_position[pool_idx] = torch.arange(pool_idx.numel(), dtype=torch.long, device=pool_idx.device)
+    train_pool_pos = pool_position[train_pool_idx]
+    valid_pool_pos = train_pool_pos >= 0
+
+    if isinstance(pool_acceptance, torch.Tensor) and pool_acceptance.numel() > 0 and bool(valid_pool_pos.all()):
+        acceptance = pool_acceptance[train_pool_pos]
+    else:
+        acceptance = delta_ce.new_ones(delta_ce.numel())
+    if isinstance(structural_score, torch.Tensor) and structural_score.numel() >= pool_mask.numel():
+        train_structural_score = structural_score[train_pool_idx]
+    else:
+        train_structural_score = delta_ce.new_zeros(delta_ce.numel())
+    if isinstance(top_prompt_ids, torch.Tensor) and top_prompt_ids.numel() > 0 and bool(valid_pool_pos.all()):
+        primary_prompt_slot = top_prompt_ids[train_pool_pos, 0].to(dtype=torch.long)
+    elif isinstance(routing_full_prob, torch.Tensor) and routing_full_prob.numel() > 0 and bool(valid_pool_pos.all()):
+        primary_prompt_slot = routing_full_prob[train_pool_pos].argmax(dim=-1).to(dtype=torch.long)
+    else:
+        primary_prompt_slot = torch.full_like(train_pool_idx, -1)
+
+    result = {
+        "diagnostic": "prompt_message_utility",
+        "message_scale": float(message_scale),
+        "model_state": "final_after_training",
+        "reason": "",
+        "train_pool_count": int(train_pool_idx.numel()),
+        "mean_delta_ce": float(delta_ce.mean().item()),
+        "median_delta_ce": float(delta_ce.median().item()),
+        "positive_delta_ratio": float(positive.float().mean().item()),
+        "mean_ce_no_prompt": float(ce_no_prompt.mean().item()),
+        "mean_ce_prompt": float(ce_prompt.mean().item()),
+        "delta_ce_by_class": _group_delta_stats(keys=y, delta_ce=delta_ce, positive=positive),
+        "delta_ce_by_prompt_slot": _group_delta_stats(
+            keys=primary_prompt_slot,
+            delta_ce=delta_ce,
+            positive=positive,
+        ),
+        "delta_ce_by_acceptance_gate": _bin_delta_stats(
+            values=acceptance,
+            delta_ce=delta_ce,
+            positive=positive,
+            prefix="acceptance",
+        ),
+        "delta_ce_by_structural_score": _bin_delta_stats(
+            values=train_structural_score,
+            delta_ce=delta_ce,
+            positive=positive,
+            prefix="structural_score",
+        ),
+        "acceptance_delta_correlation": _pearson_corr(acceptance, delta_ce),
+        "structural_score_delta_correlation": _pearson_corr(train_structural_score, delta_ce),
+        "node_records": [],
+    }
+    for row, node_id in enumerate(train_pool_idx.detach().cpu().tolist()):
+        result["node_records"].append(
+            {
+                "node_id": int(node_id),
+                "label": int(y[row].detach().cpu().item()),
+                "ce_no_prompt": float(ce_no_prompt[row].detach().cpu().item()),
+                "ce_prompt": float(ce_prompt[row].detach().cpu().item()),
+                "delta_ce": float(delta_ce[row].detach().cpu().item()),
+                "benefited": bool(positive[row].detach().cpu().item()),
+                "primary_prompt_slot": int(primary_prompt_slot[row].detach().cpu().item()),
+                "acceptance_gate": float(acceptance[row].detach().cpu().item()),
+                "structural_score": float(train_structural_score[row].detach().cpu().item()),
+            }
+        )
+    return result
+
+
+def _write_prompt_message_utility_csv(path: Path, utility: dict[str, Any]) -> None:
+    records = utility.get("node_records", [])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "node_id",
+        "label",
+        "ce_no_prompt",
+        "ce_prompt",
+        "delta_ce",
+        "benefited",
+        "primary_prompt_slot",
+        "acceptance_gate",
+        "structural_score",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow({key: record.get(key, "") for key in fieldnames})
+
+
 def run_single(
     config: dict[str, Any],
     *,
@@ -1140,6 +1560,15 @@ def run_single(
         train_mask=split.train_mask,
         prompt_graph_cfg=prompt_graph_cfg,
     )
+    pattern_key_init_stats = _maybe_initialize_pattern_keys(
+        prompt_graph_module=prompt_graph_module,
+        input_aligner=input_aligner,
+        model=model,
+        x=graph.x,
+        edge_index=graph.edge_index,
+        train_mask=split.train_mask,
+        prompt_graph_cfg=prompt_graph_cfg,
+    )
     freeze_base_model = bool(training_cfg.get("freeze_base_model", False))
     if freeze_base_model:
         _set_module_trainable(input_aligner, False)
@@ -1211,6 +1640,10 @@ def run_single(
     lambda_prompt_view_entropy = float(prompt_graph_cfg.get("lambda_prompt_view_entropy", 0.0))
     lambda_class_route = float(prompt_graph_cfg.get("lambda_class_route", 0.0))
     lambda_key_proto = float(prompt_graph_cfg.get("lambda_key_proto", 0.0))
+    lambda_prompt_benefit_supervision = float(prompt_graph_cfg.get("lambda_prompt_benefit_supervision", 0.0))
+    benefit_supervision_warmup_epochs = int(prompt_graph_cfg.get("benefit_supervision_warmup_epochs", 0))
+    benefit_delta_margin = float(prompt_graph_cfg.get("benefit_delta_margin", 0.0))
+    benefit_supervision_balance_targets = bool(prompt_graph_cfg.get("benefit_supervision_balance_targets", True))
     edge_scale_warmup_epochs = int(prompt_graph_cfg.get("edge_scale_warmup_epochs", 0))
     edge_scale_warmup_start = float(prompt_graph_cfg.get("edge_scale_warmup_start", 1.0 if edge_scale_warmup_epochs <= 0 else 0.0))
     best_checkpoint_path = run_dir / "best_model.pt"
@@ -1259,7 +1692,18 @@ def run_single(
             if prompt_graph_module is not None
             else z.new_tensor(0.0)
         )
-        if prompt_graph_module is not None and lambda_prompt_acceptance_supervision > 0.0:
+        needs_no_prompt_delta = (
+            prompt_graph_module is not None
+            and (
+                lambda_prompt_acceptance_supervision > 0.0
+                or (
+                    lambda_prompt_benefit_supervision > 0.0
+                    and epoch > benefit_supervision_warmup_epochs
+                )
+            )
+        )
+        no_prompt_out = None
+        if needs_no_prompt_delta:
             with torch.no_grad():
                 no_prompt_out = _forward_no_prompt_with_h_pre(
                     model=model,
@@ -1267,6 +1711,7 @@ def run_single(
                     edge_index=graph.edge_index,
                     h_pre=model_out["h_pre_shared"],
                 )
+        if prompt_graph_module is not None and lambda_prompt_acceptance_supervision > 0.0 and no_prompt_out is not None:
             prompt_acceptance_supervision, acceptance_supervision_stats = _acceptance_supervision_loss(
                 prompt_out=prompt_out,
                 logits_on=model_out["logits"],
@@ -1288,6 +1733,33 @@ def run_single(
                 "acceptance_ignored_count": 0.0,
                 "acceptance_target_mean": 0.0,
                 "acceptance_score_delta_mean": 0.0,
+            }
+        if (
+            prompt_graph_module is not None
+            and lambda_prompt_benefit_supervision > 0.0
+            and epoch > benefit_supervision_warmup_epochs
+            and no_prompt_out is not None
+        ):
+            prompt_benefit_supervision, benefit_supervision_stats = _benefit_supervision_loss(
+                prompt_out=prompt_out,
+                logits_on=model_out["logits"],
+                logits_off=no_prompt_out["logits"],
+                labels=graph.y,
+                train_mask=split.train_mask,
+                margin=benefit_delta_margin,
+                balance_targets=benefit_supervision_balance_targets,
+            )
+        else:
+            prompt_benefit_supervision = z.new_tensor(0.0)
+            benefit_supervision_stats = {
+                "prompt_benefit_supervision": 0.0,
+                "benefit_supervised_count": 0.0,
+                "benefit_positive_count": 0.0,
+                "benefit_negative_count": 0.0,
+                "benefit_ignored_count": 0.0,
+                "mean_delta_ce_train_pool": 0.0,
+                "positive_delta_ratio_train_pool": 0.0,
+                "benefit_weight_delta_corr_train": 0.0,
             }
         prompt_usage_consistency = (
             prompt_usage_consistency_loss(
@@ -1323,6 +1795,7 @@ def run_single(
             + lambda_prompt_view_entropy * prompt_view_entropy
             + lambda_class_route * class_route
             + lambda_key_proto * key_proto
+            + lambda_prompt_benefit_supervision * prompt_benefit_supervision
         )
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite loss at epoch {epoch}: {loss.item()}")
@@ -1350,6 +1823,7 @@ def run_single(
             "prompt_view_entropy": float(prompt_view_entropy.detach().item()),
             "class_route": float(class_route.detach().item()),
             "key_proto": float(key_proto.detach().item()),
+            "prompt_benefit_supervision": float(prompt_benefit_supervision.detach().item()),
             "lambda_edge_l1": lambda_edge_l1,
             "lambda_prompt_balance": lambda_prompt_balance,
             "lambda_prompt_role_diversity": lambda_prompt_role_diversity,
@@ -1360,11 +1834,13 @@ def run_single(
             "lambda_prompt_view_entropy": lambda_prompt_view_entropy,
             "lambda_class_route": lambda_class_route,
             "lambda_key_proto": lambda_key_proto,
+            "lambda_prompt_benefit_supervision": lambda_prompt_benefit_supervision,
             "edge_scale_multiplier": current_edge_scale_multiplier,
             "alpha": float(model_out["alpha"].detach().item()),
             **prompt_aware_log,
             **prompt_log,
             **acceptance_supervision_stats,
+            **benefit_supervision_stats,
         }
         loss_curve.append(log_item)
         prompt_curve.append({"epoch": float(epoch), **prompt_aware_log, **prompt_log})
@@ -1495,6 +1971,21 @@ def run_single(
         num_classes=loaded.num_classes,
         edge_scale_multiplier=1.0,
     )
+    prompt_message_utility: dict[str, Any] | None = None
+    if bool(training_cfg.get("diagnose_prompt_message_utility", False)):
+        diagnostic_scale = float(prompt_aware_cfg.get("message_scale", 0.0))
+        prompt_message_utility = diagnose_prompt_message_utility(
+            model=model,
+            prompt_graph_module=prompt_graph_module,
+            input_aligner=input_aligner,
+            x=graph.x,
+            edge_index=graph.edge_index,
+            labels=graph.y,
+            train_mask=split.train_mask,
+            message_scale=diagnostic_scale,
+        )
+        write_json(run_dir / "prompt_message_utility.json", prompt_message_utility)
+        _write_prompt_message_utility_csv(run_dir / "prompt_message_utility_nodes.csv", prompt_message_utility)
     result = {
         "dataset": loaded.name,
         "seed": seed,
@@ -1516,6 +2007,7 @@ def run_single(
         "best": {**best_metrics, **init_eq},
         "prompt_graph_parameter_count": count_trainable_parameters(prompt_graph_module),
         "class_key_initialization": class_key_init_stats,
+        "pattern_key_initialization": pattern_key_init_stats,
         "trainable_parameters": trainable_summary,
         "optimizer": optimizer_summary,
         "regularization": {
@@ -1537,6 +2029,10 @@ def run_single(
             "lambda_prompt_view_entropy": lambda_prompt_view_entropy,
             "lambda_class_route": lambda_class_route,
             "lambda_key_proto": lambda_key_proto,
+            "lambda_prompt_benefit_supervision": lambda_prompt_benefit_supervision,
+            "benefit_supervision_warmup_epochs": benefit_supervision_warmup_epochs,
+            "benefit_delta_margin": benefit_delta_margin,
+            "benefit_supervision_balance_targets": benefit_supervision_balance_targets,
             "edge_scale_warmup_epochs": edge_scale_warmup_epochs,
             "edge_scale_warmup_start": edge_scale_warmup_start,
         },
@@ -1555,6 +2051,10 @@ def run_single(
         "environment": _environment_info(),
         "run_dir": str(run_dir),
     }
+    if prompt_message_utility is not None:
+        result["prompt_message_utility"] = {
+            key: value for key, value in prompt_message_utility.items() if key != "node_records"
+        }
     write_json(run_dir / "metrics.json", result)
     write_json(run_dir / "loss_curve.json", {"loss_curve": loss_curve})
     write_json(run_dir / "prompt_curve.json", {"prompt_curve": prompt_curve})
@@ -1574,12 +2074,42 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     summary_dir = output_root / target_dataset / timestamp
     summary_dir.mkdir(parents=True, exist_ok=True)
     scale_grid = _message_scale_grid(config)
+    diagnostic_mode = bool(config.get("training", {}).get("diagnose_prompt_message_utility", False))
+    if diagnostic_mode:
+        if not scale_grid:
+            scale_grid = [0.1, 0.25, 0.5, 1.0]
+        scale_grid = [float(scale) for scale in scale_grid if float(scale) > 0.0]
+        if not scale_grid:
+            raise ValueError("diagnose_prompt_message_utility requires at least one positive message scale")
     use_scale_grid = variant.startswith("p2_") and len(scale_grid) > 1
+    if diagnostic_mode:
+        use_scale_grid = False
     scale_selection_metric = str(config.get("training", {}).get("message_scale_selection_metric", "val_acc"))
 
     results: list[dict[str, Any]] = []
     for idx, seed in enumerate(seeds):
-        if use_scale_grid:
+        if diagnostic_mode:
+            for scale in scale_grid:
+                seed_config = _deep_update(
+                    config,
+                    {
+                        "experiment": {"seed": seed},
+                        "prompt_aware": {"message_scale": float(scale), "message_scale_grid": [float(scale)]},
+                        "training": {"diagnose_prompt_message_utility": True},
+                    },
+                )
+                result = run_single(
+                    seed_config,
+                    repo_root=repo_root,
+                    run_index=idx,
+                    total_runs=len(seeds),
+                    run_group_dir=summary_dir / f"scale_{_scale_label(scale)}",
+                )
+                result["diagnostic_message_scale"] = float(scale)
+                result["selected_message_scale"] = float(scale)
+                result["message_scale_selection_metric"] = "diagnostic_fixed_scale"
+                results.append(result)
+        elif use_scale_grid:
             candidates: list[dict[str, Any]] = []
             for scale in scale_grid:
                 seed_config = _deep_update(
@@ -1636,9 +2166,45 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "message_scale_grid": scale_grid,
         "message_scale_selection_metric": scale_selection_metric if scale_grid else "",
         "message_scale_selection_enabled": use_scale_grid,
+        "diagnose_prompt_message_utility": diagnostic_mode,
         "runs": results,
         "environment": _environment_info(),
     }
+    if diagnostic_mode:
+        utility_by_scale: dict[str, dict[str, float]] = {}
+        for scale in scale_grid:
+            scale_results = [
+                result.get("prompt_message_utility", {})
+                for result in results
+                if float(result.get("diagnostic_message_scale", -1.0)) == float(scale)
+            ]
+            if not scale_results:
+                continue
+            utility_by_scale[str(float(scale))] = {
+                "runs": float(len(scale_results)),
+                "mean_delta_ce": float(
+                    sum(float(item.get("mean_delta_ce", 0.0)) for item in scale_results) / len(scale_results)
+                ),
+                "positive_delta_ratio": float(
+                    sum(float(item.get("positive_delta_ratio", 0.0)) for item in scale_results)
+                    / len(scale_results)
+                ),
+                "mean_ce_no_prompt": float(
+                    sum(float(item.get("mean_ce_no_prompt", 0.0)) for item in scale_results) / len(scale_results)
+                ),
+                "mean_ce_prompt": float(
+                    sum(float(item.get("mean_ce_prompt", 0.0)) for item in scale_results) / len(scale_results)
+                ),
+                "acceptance_delta_correlation": float(
+                    sum(float(item.get("acceptance_delta_correlation", 0.0)) for item in scale_results)
+                    / len(scale_results)
+                ),
+                "structural_score_delta_correlation": float(
+                    sum(float(item.get("structural_score_delta_correlation", 0.0)) for item in scale_results)
+                    / len(scale_results)
+                ),
+            }
+        summary["prompt_message_utility_by_scale"] = utility_by_scale
     write_json(summary_dir / "summary.json", summary)
     with (summary_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         fieldnames = [
@@ -1660,9 +2226,13 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "edge_scale_multiplier",
             "use_multiview_routing",
             "use_class_aware_routing",
+            "use_pattern_prompt_bank",
+            "use_receiver_only_prompt",
+            "use_benefit_gate",
             "num_class_prompt_slots",
             "residual_prompt_count",
             "class_key_proto_init_coverage",
+            "pattern_key_init_coverage",
             "semantic_view_weight",
             "structural_view_weight",
             "role_view_weight",
@@ -1686,6 +2256,17 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "ce_delta_negative_ratio_train",
             "prompt_helpful_acceptance_precision_train",
             "prompt_harmful_rejection_precision_train",
+            "prompt_benefit_supervision",
+            "benefit_supervised_count",
+            "benefit_positive_count",
+            "benefit_negative_count",
+            "benefit_ignored_count",
+            "mean_delta_ce_train_pool",
+            "positive_delta_ratio_train_pool",
+            "benefit_weight_delta_corr_train",
+            "benefit_gate_mean",
+            "benefit_gate_min",
+            "benefit_gate_max",
             "class_route",
             "key_proto",
             "class_router_hit_rate_train",
@@ -1724,6 +2305,13 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "init_logit_delta_full_edge_scale",
             "early_stopped",
             "stopped_epoch",
+            "diagnostic_message_scale",
+            "utility_mean_delta_ce",
+            "utility_positive_delta_ratio",
+            "utility_mean_ce_no_prompt",
+            "utility_mean_ce_prompt",
+            "utility_acceptance_delta_correlation",
+            "utility_structural_score_delta_correlation",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -1748,9 +2336,13 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "edge_scale_multiplier": result["best"].get("edge_scale_multiplier", 0.0),
                     "use_multiview_routing": result["best"].get("use_multiview_routing", 0.0),
                     "use_class_aware_routing": result["best"].get("use_class_aware_routing", 0.0),
+                    "use_pattern_prompt_bank": result["best"].get("use_pattern_prompt_bank", 0.0),
+                    "use_receiver_only_prompt": result["best"].get("use_receiver_only_prompt", 0.0),
+                    "use_benefit_gate": result["best"].get("use_benefit_gate", 0.0),
                     "num_class_prompt_slots": result["best"].get("num_class_prompt_slots", 0.0),
                     "residual_prompt_count": result["best"].get("residual_prompt_count", 0.0),
                     "class_key_proto_init_coverage": result["best"].get("class_key_proto_init_coverage", 0.0),
+                    "pattern_key_init_coverage": result["best"].get("pattern_key_init_coverage", 0.0),
                     "semantic_view_weight": result["best"].get("semantic_view_weight", 0.0),
                     "structural_view_weight": result["best"].get("structural_view_weight", 0.0),
                     "role_view_weight": result["best"].get("role_view_weight", 0.0),
@@ -1778,6 +2370,17 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "prompt_harmful_rejection_precision_train": result["best"].get(
                         "prompt_harmful_rejection_precision_train", 0.0
                     ),
+                    "prompt_benefit_supervision": result["best"].get("prompt_benefit_supervision", 0.0),
+                    "benefit_supervised_count": result["best"].get("benefit_supervised_count", 0.0),
+                    "benefit_positive_count": result["best"].get("benefit_positive_count", 0.0),
+                    "benefit_negative_count": result["best"].get("benefit_negative_count", 0.0),
+                    "benefit_ignored_count": result["best"].get("benefit_ignored_count", 0.0),
+                    "mean_delta_ce_train_pool": result["best"].get("mean_delta_ce_train_pool", 0.0),
+                    "positive_delta_ratio_train_pool": result["best"].get("positive_delta_ratio_train_pool", 0.0),
+                    "benefit_weight_delta_corr_train": result["best"].get("benefit_weight_delta_corr_train", 0.0),
+                    "benefit_gate_mean": result["best"].get("benefit_gate_mean", 1.0),
+                    "benefit_gate_min": result["best"].get("benefit_gate_min", 1.0),
+                    "benefit_gate_max": result["best"].get("benefit_gate_max", 1.0),
                     "class_route": result["best"].get("class_route", 0.0),
                     "key_proto": result["best"].get("key_proto", 0.0),
                     "class_router_hit_rate_train": result["best"].get("class_router_hit_rate_train", 0.0),
@@ -1816,6 +2419,19 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "init_logit_delta_full_edge_scale": result["best"].get("init_logit_delta_full_edge_scale", 0.0),
                     "early_stopped": result.get("early_stopped", False),
                     "stopped_epoch": result.get("stopped_epoch", 0),
+                    "diagnostic_message_scale": result.get("diagnostic_message_scale", ""),
+                    "utility_mean_delta_ce": result.get("prompt_message_utility", {}).get("mean_delta_ce", ""),
+                    "utility_positive_delta_ratio": result.get("prompt_message_utility", {}).get(
+                        "positive_delta_ratio", ""
+                    ),
+                    "utility_mean_ce_no_prompt": result.get("prompt_message_utility", {}).get("mean_ce_no_prompt", ""),
+                    "utility_mean_ce_prompt": result.get("prompt_message_utility", {}).get("mean_ce_prompt", ""),
+                    "utility_acceptance_delta_correlation": result.get("prompt_message_utility", {}).get(
+                        "acceptance_delta_correlation", ""
+                    ),
+                    "utility_structural_score_delta_correlation": result.get("prompt_message_utility", {}).get(
+                        "structural_score_delta_correlation", ""
+                    ),
                 }
             )
     print("=" * 72)
@@ -1864,6 +2480,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--receiver_version", type=str, choices=["v1_linear", "v2_conditioned"], default=None)
     parser.add_argument("--prompt_message_scale", type=float, default=None)
     parser.add_argument("--prompt_message_scale_grid", type=str, default=None)
+    parser.add_argument("--diagnose_prompt_message_utility", action="store_true")
+    parser.add_argument("--diagnostic_message_scales", type=str, default=None)
     parser.add_argument("--message_scale_selection_metric", type=str, default=None)
     parser.add_argument("--zero_init_prompt_messages", action="store_true")
     parser.add_argument("--disable_zero_init_prompt_messages", action="store_true")
@@ -1875,6 +2493,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_prompt_view_entropy", type=float, default=None)
     parser.add_argument("--lambda_class_route", type=float, default=None)
     parser.add_argument("--lambda_key_proto", type=float, default=None)
+    parser.add_argument("--lambda_prompt_benefit_supervision", type=float, default=None)
+    parser.add_argument("--benefit_supervision_warmup_epochs", type=int, default=None)
+    parser.add_argument("--benefit_delta_margin", type=float, default=None)
     parser.add_argument("--residual_prompt_count", type=int, default=None)
     parser.add_argument("--enable_class_aware_routing", action="store_true")
     parser.add_argument("--disable_class_aware_routing", action="store_true")
@@ -1995,6 +2616,14 @@ def main() -> None:
         overrides.setdefault("prompt_aware", {})["message_scale_grid"] = [
             float(piece.strip()) for piece in args.prompt_message_scale_grid.split(",") if piece.strip()
         ]
+    if args.diagnose_prompt_message_utility:
+        overrides.setdefault("training", {})["diagnose_prompt_message_utility"] = True
+        overrides.setdefault("prompt_aware", {})["message_scale_grid"] = [0.1, 0.25, 0.5, 1.0]
+    if args.diagnostic_message_scales is not None:
+        overrides.setdefault("training", {})["diagnose_prompt_message_utility"] = True
+        overrides.setdefault("prompt_aware", {})["message_scale_grid"] = [
+            float(piece.strip()) for piece in args.diagnostic_message_scales.split(",") if piece.strip()
+        ]
     if args.message_scale_selection_metric is not None:
         overrides.setdefault("training", {})["message_scale_selection_metric"] = args.message_scale_selection_metric
     if args.zero_init_prompt_messages:
@@ -2017,6 +2646,16 @@ def main() -> None:
         overrides.setdefault("prompt_graph", {})["lambda_class_route"] = float(args.lambda_class_route)
     if args.lambda_key_proto is not None:
         overrides.setdefault("prompt_graph", {})["lambda_key_proto"] = float(args.lambda_key_proto)
+    if args.lambda_prompt_benefit_supervision is not None:
+        overrides.setdefault("prompt_graph", {})["lambda_prompt_benefit_supervision"] = float(
+            args.lambda_prompt_benefit_supervision
+        )
+    if args.benefit_supervision_warmup_epochs is not None:
+        overrides.setdefault("prompt_graph", {})["benefit_supervision_warmup_epochs"] = int(
+            args.benefit_supervision_warmup_epochs
+        )
+    if args.benefit_delta_margin is not None:
+        overrides.setdefault("prompt_graph", {})["benefit_delta_margin"] = float(args.benefit_delta_margin)
     if args.residual_prompt_count is not None:
         overrides.setdefault("prompt_graph", {})["residual_prompt_count"] = int(args.residual_prompt_count)
     if args.enable_class_aware_routing:

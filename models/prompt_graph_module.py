@@ -113,8 +113,15 @@ class PromptGraphModuleP1(nn.Module):
         self.use_multiview_routing = bool(self.config.get("use_multiview_routing", False))
         self.view_gate_hidden_dim = int(self.config.get("view_gate_hidden_dim", self.query_hidden_dim))
         self.role_hidden_dim = int(self.config.get("role_hidden_dim", max(16, self.query_hidden_dim // 2)))
+        self.use_pattern_prompt_bank = bool(self.config.get("use_pattern_prompt_bank", False))
+        self.use_receiver_only_prompt = bool(self.config.get("use_receiver_only_prompt", False))
+        self.use_benefit_gate = bool(self.config.get("use_benefit_gate", False))
+        self.benefit_gate_hidden_dim = int(self.config.get("benefit_gate_hidden_dim", self.query_hidden_dim))
+        self.benefit_gate_bias_init = float(self.config.get("benefit_gate_bias_init", -1.0))
         self.class_key_init_coverage = 0.0
         self.class_key_init_missing_classes: list[int] = []
+        self.pattern_key_init_coverage = 0.0
+        self.pattern_key_init_selected_nodes: list[int] = []
 
         self.prompt_node_x = nn.Parameter(torch.empty(self.num_prompt_nodes, self.source_dim))
         nn.init.normal_(self.prompt_node_x, mean=0.0, std=self.prompt_init_std)
@@ -171,6 +178,14 @@ class PromptGraphModuleP1(nn.Module):
         )
         nn.init.zeros_(self.rejection_gate_mlp[-1].weight)
         nn.init.constant_(self.rejection_gate_mlp[-1].bias, self.rejection_gate_bias_init)
+        self.benefit_gate_mlp = nn.Sequential(
+            nn.Linear(3 * self.query_dim + 3, self.benefit_gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.benefit_gate_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.benefit_gate_mlp[-1].weight)
+        nn.init.constant_(self.benefit_gate_mlp[-1].bias, self.benefit_gate_bias_init)
         self.edge_scale_max = float(self.config.get("edge_scale_max", 0.2))
         edge_scale_init = float(self.config.get("edge_scale_init", 0.01))
         self.edge_scale_logit = nn.Parameter(_init_logit(edge_scale_init, self.edge_scale_max))
@@ -383,6 +398,74 @@ class PromptGraphModuleP1(nn.Module):
             "class_key_proto_init_missing_classes": missing,
         }
 
+    @torch.no_grad()
+    def initialize_pattern_keys_from_pool_medoids(
+        self,
+        *,
+        z: torch.Tensor,
+        h_pre: torch.Tensor,
+        edge_index: torch.Tensor,
+        train_mask: torch.Tensor,
+        normalize: bool = True,
+    ) -> dict[str, Any]:
+        """Initialize prompt keys from label-free pool pattern medoids.
+
+        Medoids are actual pool-node queries selected by deterministic farthest
+        traversal. This avoids smoothing multi-modal patterns into mean centers.
+        """
+
+        self.eval()
+        structural_score, aux = self.structural_scores(z=z, h_pre=h_pre, edge_index=edge_index)
+        pool_mask = self._pool_mask(structural_score, train_mask)
+        pool_idx = torch.where(pool_mask)[0]
+        if pool_idx.numel() == 0:
+            self.pattern_key_init_coverage = 0.0
+            self.pattern_key_init_selected_nodes = []
+            return {"pattern_key_init_coverage": 0.0, "pattern_key_init_selected_nodes": []}
+
+        _, routing_aux = self._routing_logits(aux, pool_idx, dtype=z.dtype, device=z.device)
+        structural_query = routing_aux["structural_query"]
+        query_for_select = F.normalize(structural_query, dim=-1, eps=1e-12)
+        selected_rows: list[int] = []
+        first = int(torch.argmax(structural_score[pool_idx]).item())
+        selected_rows.append(first)
+        min_dist = torch.cdist(query_for_select, query_for_select[first : first + 1], p=2).squeeze(1)
+        target_count = min(self.num_prompt_nodes, int(pool_idx.numel()))
+        while len(selected_rows) < target_count:
+            next_row = int(torch.argmax(min_dist).item())
+            if next_row in selected_rows:
+                break
+            selected_rows.append(next_row)
+            next_dist = torch.cdist(query_for_select, query_for_select[next_row : next_row + 1], p=2).squeeze(1)
+            min_dist = torch.minimum(min_dist, next_dist)
+
+        selected = torch.tensor(selected_rows, dtype=torch.long, device=z.device)
+        selected_nodes = pool_idx[selected]
+
+        def _copy_keys(parameter: torch.nn.Parameter, values: torch.Tensor) -> None:
+            count = min(parameter.size(0), values.size(0))
+            copied = values[:count]
+            if normalize:
+                copied = F.normalize(copied, dim=-1, eps=1e-12)
+            parameter[:count].copy_(copied.to(dtype=parameter.dtype, device=parameter.device))
+
+        if self.use_multiview_routing:
+            _copy_keys(self.semantic_prompt_keys, routing_aux["semantic_query"][selected])
+            _copy_keys(self.structural_prompt_keys, routing_aux["structural_query"][selected])
+            _copy_keys(self.role_prompt_keys, routing_aux["role_query"][selected])
+        else:
+            _copy_keys(self.prompt_keys, routing_aux["query"][selected])
+
+        count = min(self.prompt_node_x.size(0), selected_nodes.numel())
+        self.prompt_node_x[:count].copy_(z[selected_nodes[:count]].to(dtype=self.prompt_node_x.dtype))
+        coverage = float(count / max(1, self.num_prompt_nodes))
+        self.pattern_key_init_coverage = coverage
+        self.pattern_key_init_selected_nodes = [int(item) for item in selected_nodes.detach().cpu().tolist()]
+        return {
+            "pattern_key_init_coverage": coverage,
+            "pattern_key_init_selected_nodes": self.pattern_key_init_selected_nodes,
+        }
+
     def _rejection_gate_context(
         self,
         aux: dict[str, torch.Tensor],
@@ -429,6 +512,53 @@ class PromptGraphModuleP1(nn.Module):
         mask = torch.zeros_like(pool_acceptance)
         mask[top_idx] = 1.0
         return mask
+
+    def _benefit_gate(
+        self,
+        *,
+        routing_aux: dict[str, torch.Tensor],
+        top_prompt_ids: torch.Tensor,
+        assign_prob: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_benefit_gate:
+            ones = assign_prob.new_ones(assign_prob.shape)
+            logits_out = torch.full_like(assign_prob, 30.0)
+            return ones, logits_out
+        query = routing_aux["structural_query"]
+        if self.use_multiview_routing:
+            keys = self.structural_prompt_keys.to(dtype=query.dtype, device=query.device)
+        else:
+            keys = self.prompt_keys.to(dtype=query.dtype, device=query.device)
+        selected_keys = keys[top_prompt_ids]
+        query_expanded = query.unsqueeze(1).expand_as(selected_keys)
+        route_entropy = -(torch.softmax(logits, dim=-1) * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
+        if logits.size(1) > 1:
+            route_entropy = route_entropy / math.log(float(logits.size(1)))
+            top2 = torch.topk(logits, k=2, dim=-1).values
+            route_margin = top2[:, 0] - top2[:, 1]
+        else:
+            route_margin = torch.ones_like(route_entropy)
+        route_margin = _minmax_normalize(route_margin)
+        scalar_features = torch.stack(
+            [
+                assign_prob,
+                route_entropy.unsqueeze(-1).expand_as(assign_prob),
+                route_margin.unsqueeze(-1).expand_as(assign_prob),
+            ],
+            dim=-1,
+        )
+        gate_input = torch.cat(
+            [
+                query_expanded,
+                selected_keys,
+                query_expanded - selected_keys,
+                scalar_features,
+            ],
+            dim=-1,
+        )
+        benefit_logit = self.benefit_gate_mlp(gate_input).squeeze(-1)
+        return torch.sigmoid(benefit_logit), benefit_logit
 
     def _pool_mask(
         self,
@@ -535,6 +665,11 @@ class PromptGraphModuleP1(nn.Module):
             "pool_acceptance_mean": z.new_tensor(0.0),
             "pool_acceptance_min": z.new_tensor(0.0),
             "pool_acceptance_max": z.new_tensor(0.0),
+            "benefit_gate": z.new_zeros((0, self.topk_prompt_per_node)),
+            "benefit_gate_logit": z.new_zeros((0, self.topk_prompt_per_node)),
+            "benefit_gate_mean": z.new_tensor(0.0),
+            "benefit_gate_min": z.new_tensor(0.0),
+            "benefit_gate_max": z.new_tensor(0.0),
             "raw_edge_scale": self.edge_scale,
             "edge_scale_multiplier": edge_scale_multiplier,
             "capacity_routing_enabled": int(self.use_capacity_routing),
@@ -548,10 +683,15 @@ class PromptGraphModuleP1(nn.Module):
             "routing_full_prob": z.new_zeros((0, self.num_prompt_nodes)),
             "pool_idx": torch.empty(0, dtype=torch.long, device=z.device),
             "use_class_aware_routing": int(self.use_class_aware_routing),
+            "use_pattern_prompt_bank": int(self.use_pattern_prompt_bank),
+            "use_receiver_only_prompt": int(self.use_receiver_only_prompt),
+            "use_benefit_gate": int(self.use_benefit_gate),
             "num_class_prompt_slots": int(self.num_class_prompt_slots),
             "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else 0),
             "class_key_proto_init_coverage": float(self.class_key_init_coverage),
             "class_key_proto_init_missing_classes": list(self.class_key_init_missing_classes),
+            "pattern_key_init_coverage": float(self.pattern_key_init_coverage),
+            "pattern_key_init_selected_nodes": list(self.pattern_key_init_selected_nodes),
         }
         return {
             "adapted_x": adapted_x,
@@ -630,23 +770,35 @@ class PromptGraphModuleP1(nn.Module):
             effective_acceptance = hard_acceptance_mask.detach() + pool_acceptance - pool_acceptance.detach()
         else:
             effective_acceptance = hard_acceptance_mask
-        prompt_weights = effective_edge_scale * effective_acceptance.unsqueeze(-1) * assign_prob
+        benefit_weight, benefit_logit = self._benefit_gate(
+            routing_aux=routing_aux,
+            top_prompt_ids=top_prompt_ids,
+            assign_prob=assign_prob,
+            logits=logits,
+        )
+        prompt_weights = effective_edge_scale * effective_acceptance.unsqueeze(-1) * assign_prob * benefit_weight
 
         src_node = pool_idx.repeat_interleave(k)
         dst_prompt = (prompt_offset + top_prompt_ids.reshape(-1)).long()
         flat_weights = prompt_weights.reshape(-1)
         prompt_edges_forward = torch.stack([src_node, dst_prompt], dim=0)
         prompt_edges_backward = torch.stack([dst_prompt, src_node], dim=0)
-        prompt_edges = torch.cat([prompt_edges_forward, prompt_edges_backward], dim=1)
-        prompt_edge_weight = torch.cat([flat_weights, flat_weights], dim=0)
         original_edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=device)
-        forward_edge_type = torch.ones(prompt_edges_forward.size(1), dtype=torch.long, device=device)
-        backward_edge_type = torch.full(
-            (prompt_edges_backward.size(1),),
-            2,
-            dtype=torch.long,
-            device=device,
-        )
+        if self.use_receiver_only_prompt:
+            prompt_edges = prompt_edges_backward
+            prompt_edge_weight = flat_weights
+            forward_edge_type = torch.zeros(0, dtype=torch.long, device=device)
+            backward_edge_type = torch.full((prompt_edges_backward.size(1),), 2, dtype=torch.long, device=device)
+        else:
+            prompt_edges = torch.cat([prompt_edges_forward, prompt_edges_backward], dim=1)
+            prompt_edge_weight = torch.cat([flat_weights, flat_weights], dim=0)
+            forward_edge_type = torch.ones(prompt_edges_forward.size(1), dtype=torch.long, device=device)
+            backward_edge_type = torch.full(
+                (prompt_edges_backward.size(1),),
+                2,
+                dtype=torch.long,
+                device=device,
+            )
         adapted_edge_type = torch.cat([original_edge_type, forward_edge_type, backward_edge_type], dim=0)
 
         adapted_x = torch.cat([z, prompt_node_x], dim=0)
@@ -673,6 +825,11 @@ class PromptGraphModuleP1(nn.Module):
             "pool_acceptance_logit": pool_acceptance_logit,
             "pool_acceptance_gate": pool_acceptance,
             "effective_acceptance_gate": effective_acceptance,
+            "benefit_gate": benefit_weight,
+            "benefit_gate_logit": benefit_logit,
+            "benefit_gate_mean": benefit_weight.mean(),
+            "benefit_gate_min": benefit_weight.min(),
+            "benefit_gate_max": benefit_weight.max(),
             "hard_acceptance_mask": hard_acceptance_mask,
             "use_hard_acceptance": int(self.use_hard_acceptance),
             "hard_acceptance_ratio": pool_acceptance.new_tensor(float(self.hard_acceptance_ratio)),
@@ -700,10 +857,15 @@ class PromptGraphModuleP1(nn.Module):
                 / math.log(3.0)
             ),
             "use_class_aware_routing": int(self.use_class_aware_routing),
+            "use_pattern_prompt_bank": int(self.use_pattern_prompt_bank),
+            "use_receiver_only_prompt": int(self.use_receiver_only_prompt),
+            "use_benefit_gate": int(self.use_benefit_gate),
             "num_class_prompt_slots": int(self.num_class_prompt_slots),
             "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else 0),
             "class_key_proto_init_coverage": float(self.class_key_init_coverage),
             "class_key_proto_init_missing_classes": list(self.class_key_init_missing_classes),
+            "pattern_key_init_coverage": float(self.pattern_key_init_coverage),
+            "pattern_key_init_selected_nodes": list(self.pattern_key_init_selected_nodes),
         }
         return {
             "adapted_x": adapted_x,
