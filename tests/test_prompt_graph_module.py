@@ -17,7 +17,16 @@ from models.prompt_graph_module import (
     prompt_usage_consistency_loss,
     prompt_view_entropy_loss,
 )
-from experiments.run_gp2f_prompt_graph import _acceptance_supervision_loss, _benefit_supervision_loss
+from experiments.run_gp2f_prompt_graph import (
+    _acceptance_supervision_loss,
+    _benefit_supervision_loss,
+    _class_balanced_support_query_split,
+    _prompt_message_help_loss,
+    _prompt_slot_usage_stats,
+    _prompt_correction_losses,
+    _query_proto_alignment_loss,
+    _utility_receive_gate_loss,
+)
 
 
 def _config(**overrides: object) -> dict:
@@ -70,6 +79,84 @@ def _toy_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tenso
     y = torch.tensor([0, 0, 1, 1, 0, 1], dtype=torch.long)
     train_mask = torch.tensor([True, False, True, False, False, False])
     return z, h_pre, edge_index, y, train_mask
+
+
+def test_class_balanced_support_query_split_is_disjoint_and_train_only() -> None:
+    y = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2, 2])
+    train_mask = torch.tensor([True, True, True, True, True, True, True, True, False, False])
+    support, query, stats = _class_balanced_support_query_split(
+        y,
+        train_mask,
+        support_ratio=0.67,
+        min_query_per_class=1,
+        seed=7,
+    )
+
+    assert bool((support & query).any()) is False
+    assert bool((support | query)[~train_mask].any()) is False
+    assert int(query.sum().item()) == 3
+    assert int(support.sum().item()) == 5
+    for class_id in [0, 1, 2]:
+        class_train = train_mask & (y == class_id)
+        assert int((query & class_train).sum().item()) == 1
+    assert stats["support_count"] == 5
+    assert stats["query_count"] == 3
+
+
+def test_query_proto_alignment_uses_support_query_pool_only() -> None:
+    labels = torch.tensor([0, 0, 1, 1, 0, 1])
+    support_mask = torch.tensor([True, False, True, False, False, False])
+    query_mask = torch.tensor([False, True, False, True, False, False])
+    pool_mask = torch.tensor([True, True, True, True, False, False])
+    h_off = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.7, 0.3],
+            [0.0, 1.0],
+            [0.3, 0.7],
+            [1.0, 1.0],
+            [1.0, 1.0],
+        ]
+    )
+    h_on = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [0.0, 1.0],
+            [0.1, 0.9],
+            [5.0, -5.0],
+            [-5.0, 5.0],
+        ]
+    )
+
+    loss_a, stats_a = _query_proto_alignment_loss(
+        h_on=h_on,
+        h_off=h_off,
+        labels=labels,
+        support_mask=support_mask,
+        query_mask=query_mask,
+        pool_mask=pool_mask,
+        margin=0.0,
+    )
+    labels_changed = labels.clone()
+    labels_changed[4:] = torch.tensor([1, 0])
+    loss_b, stats_b = _query_proto_alignment_loss(
+        h_on=h_on,
+        h_off=h_off,
+        labels=labels_changed,
+        support_mask=support_mask,
+        query_mask=query_mask,
+        pool_mask=pool_mask,
+        margin=0.0,
+    )
+
+    assert torch.isfinite(loss_a)
+    assert float(loss_a.item()) <= 1e-7
+    assert torch.allclose(loss_a, loss_b)
+    assert stats_a["query_proto_supervised_count"] == 2.0
+    assert stats_a["query_proto_class_count"] == 2.0
+    assert stats_a["query_proto_mean_delta_dist"] > 0.0
+    assert stats_b["query_proto_mean_delta_dist"] == stats_a["query_proto_mean_delta_dist"]
 
 
 def _node_to_prompt_edges(out: dict, num_nodes: int, original_edges: int) -> torch.Tensor:
@@ -403,6 +490,21 @@ def test_prompt_role_diversity_loss_is_finite_and_has_gradients() -> None:
     assert module.prompt_keys.grad is not None
 
 
+def test_multiview_role_diversity_loss_has_gradients_for_all_view_keys() -> None:
+    module = PromptGraphModuleP1(4, 3, _config(use_multiview_routing=True))
+
+    loss = prompt_role_diversity_loss(module)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert module.semantic_prompt_keys.grad is not None
+    assert module.structural_prompt_keys.grad is not None
+    assert module.role_prompt_keys.grad is not None
+    assert module.semantic_prompt_keys.grad.abs().sum().item() > 0.0
+    assert module.structural_prompt_keys.grad.abs().sum().item() > 0.0
+    assert module.role_prompt_keys.grad.abs().sum().item() > 0.0
+
+
 def test_capacity_routing_spreads_tied_assignments_across_prompts() -> None:
     z, h_pre, edge_index, _, train_mask = _toy_inputs()
     module = PromptGraphModuleP1(
@@ -504,6 +606,97 @@ def test_train_only_usage_consistency_ignores_val_test_labels() -> None:
 
     assert torch.isfinite(original_loss)
     assert torch.allclose(original_loss, relabeled_loss)
+
+
+def test_prompt_slot_usage_stats_reports_dominant_and_active_count() -> None:
+    usage = torch.tensor([0.70, 0.10, 0.04, 0.05, 0.11])
+
+    stats = _prompt_slot_usage_stats(usage)
+    empty_stats = _prompt_slot_usage_stats(torch.empty(0))
+
+    assert stats["dominant_prompt_slot_ratio"] == torch.tensor(0.70).item()
+    assert stats["active_prompt_slot_count@0.05"] == 4.0
+    assert empty_stats["dominant_prompt_slot_ratio"] == 0.0
+    assert empty_stats["active_prompt_slot_count@0.05"] == 0.0
+
+
+def test_utility_receive_gate_softly_scales_prompt_edges() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(
+            use_utility_receive_gate=True,
+            utility_receive_gate_min=0.10,
+            utility_receive_gate_init=0.50,
+            rho=1.0,
+        ),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    aux = out["aux"]
+
+    assert aux["use_utility_receive_gate"] == 1
+    assert aux["utility_receive_gate"].numel() == aux["pool_idx"].numel()
+    assert aux["utility_receive_gate"].min().item() >= 0.10
+    assert aux["utility_receive_gate"].max().item() <= 1.0
+    assert torch.isfinite(aux["utility_receive_gate_logit"]).all()
+
+
+def test_utility_receive_gate_loss_is_train_only() -> None:
+    z, h_pre, edge_index, y, _ = _toy_inputs()
+    train_mask = torch.tensor([True, True, True, True, False, False])
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_utility_receive_gate=True, utility_receive_gate_min=0.10, rho=1.0),
+    )
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.8, 0.0],
+            [0.0, 2.0],
+            [0.0, 1.8],
+            [9.0, -9.0],
+            [-9.0, 9.0],
+        ]
+    )
+    logits_on = logits_off.clone()
+    logits_on[0, y[0]] += 0.5
+    logits_on[1, y[1]] -= 0.5
+    logits_on[2, y[2]] += 0.5
+    logits_on[3, y[3]] -= 0.5
+    relabeled = y.clone()
+    relabeled[4:] = 1 - relabeled[4:]
+
+    loss, stats = _utility_receive_gate_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        quantile=0.5,
+        eps=0.0,
+        class_balanced=True,
+    )
+    relabeled_loss, relabeled_stats = _utility_receive_gate_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=relabeled,
+        train_mask=train_mask,
+        quantile=0.5,
+        eps=0.0,
+        class_balanced=True,
+    )
+
+    assert torch.isfinite(loss)
+    assert stats["utility_gate_supervised_count"] == 4.0
+    assert stats["utility_gate_positive_count"] == 2.0
+    assert stats["utility_gate_negative_count"] == 2.0
+    assert torch.allclose(loss, relabeled_loss)
+    assert stats["utility_receive_gate_loss"] == relabeled_stats["utility_receive_gate_loss"]
 
 
 def test_class_aware_routing_expands_prompt_slots() -> None:
@@ -697,3 +890,218 @@ def test_benefit_gate_scales_edges_and_supervision_is_train_only() -> None:
     assert stats["benefit_supervised_count"] == 2.0
     assert stats["benefit_positive_count"] == 1.0
     assert stats["benefit_negative_count"] == 1.0
+
+
+def test_benefit_supervision_quantile_keeps_zero_delta_samples() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_benefit_gate=True, benefit_gate_bias_init=-2.0, rho=1.0),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.5, 0.2],
+            [0.0, 2.0],
+            [0.1, 1.5],
+            [2.0, 0.0],
+            [0.0, 2.0],
+        ]
+    )
+    logits_on = logits_off.clone()
+    loss, stats = _benefit_supervision_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        margin=0.01,
+        balance_targets=True,
+        label_strategy="quantile",
+        quantile=0.5,
+    )
+
+    assert torch.isfinite(loss)
+    assert stats["benefit_label_strategy_quantile"] == 1.0
+    assert stats["benefit_supervised_count"] == 2.0
+    assert stats["benefit_positive_count"] == 1.0
+    assert stats["benefit_negative_count"] == 1.0
+
+
+def test_benefit_supervision_hybrid_ignores_tiny_delta_samples() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_benefit_gate=True, benefit_gate_bias_init=-2.0, rho=1.0),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.5, 0.2],
+            [0.0, 2.0],
+            [0.1, 1.5],
+            [2.0, 0.0],
+            [0.0, 2.0],
+        ]
+    )
+    logits_on = logits_off.clone()
+    loss, stats = _benefit_supervision_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        margin=0.0,
+        balance_targets=True,
+        label_strategy="hybrid_quantile_margin",
+        quantile=0.5,
+        eps=1e-4,
+    )
+
+    assert torch.isfinite(loss)
+    assert stats["benefit_supervised_count"] == 0.0
+    assert stats["benefit_ignored_count"] == 2.0
+
+
+def test_prompt_correction_loss_supervises_only_positive_train_pool_nodes() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(use_benefit_gate=True, use_hard_receive_gate=True, hard_receive_ratio=1.0, rho=1.0),
+    )
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.5, 0.2],
+            [0.0, 2.0],
+            [0.1, 1.5],
+            [2.0, 0.0],
+            [0.0, 2.0],
+        ]
+    )
+    logits_on = logits_off.clone().requires_grad_(True)
+    train_idx = torch.where(train_mask)[0]
+    logits_on = logits_on.clone()
+    logits_on[train_idx[0], y[train_idx[0]]] += 0.6
+    logits_on[train_idx[1], y[train_idx[1]]] -= 0.6
+
+    correction, anti_harm, stats = _prompt_correction_losses(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        eps=1e-4,
+    )
+
+    assert torch.isfinite(correction)
+    assert torch.isfinite(anti_harm)
+    assert stats["prompt_correction_supervised_count"] == 1.0
+    assert stats["prompt_correction_harmful_count"] == 1.0
+    assert stats["prompt_correction_target_norm"] > 0.0
+    assert stats["prompt_delta_logit_norm"] > 0.0
+
+
+def test_prompt_correction_ignores_tiny_delta_samples() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(use_benefit_gate=True, rho=1.0))
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.5, 0.2],
+            [0.0, 2.0],
+            [0.1, 1.5],
+            [2.0, 0.0],
+            [0.0, 2.0],
+        ]
+    )
+    logits_on = logits_off.clone().requires_grad_(True)
+
+    correction, anti_harm, stats = _prompt_correction_losses(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        eps=1e-4,
+    )
+
+    assert correction.item() == 0.0
+    assert anti_harm.item() == 0.0
+    assert stats["prompt_correction_supervised_count"] == 0.0
+    assert stats["prompt_correction_harmful_count"] == 0.0
+
+
+def test_prompt_message_help_loss_is_train_pool_only_and_class_balanced() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(rho=1.0))
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [2.0, 0.0],
+            [10.0, -10.0],
+            [0.0, 2.0],
+            [-10.0, 10.0],
+            [10.0, -10.0],
+            [-10.0, 10.0],
+        ]
+    )
+    logits_on = logits_off.clone()
+    train_idx = torch.where(train_mask)[0]
+    logits_on[train_idx[0], y[train_idx[0]]] += 0.2
+    logits_on[train_idx[1], y[train_idx[1]]] -= 0.2
+    logits_on.requires_grad_()
+
+    loss, anti_harm, stats = _prompt_message_help_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        margin=0.01,
+        class_balanced=True,
+        anti_harm_floor=0.0,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(anti_harm)
+    assert stats["message_help_supervised_count"] == 2.0
+    assert stats["message_help_class_count"] == 2.0
+    assert stats["prompt_class_anti_harm_loss"] >= 0.0
+    assert set(stats["delta_ce_by_class_train_pool"].keys()) == {"0", "1"}
+    loss.backward()
+    assert logits_on.grad is not None
+    assert logits_on.grad[~train_mask].abs().sum().item() == 0.0
+
+
+def test_hard_receive_gate_limits_prompt_receivers() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(
+            rho=1.0,
+            use_benefit_gate=True,
+            use_hard_receive_gate=True,
+            hard_receive_ratio=0.5,
+            use_hard_acceptance=False,
+            use_receiver_only_prompt=True,
+        ),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    aux = out["aux"]
+
+    assert aux["use_hard_receive_gate"] == 1
+    assert aux["hard_receive_selected_ratio"].item() == 0.5
+    assert torch.count_nonzero(aux["hard_receive_mask"]).item() == 3
+    assert out["adapted_edge_type"].eq(1).sum().item() == 0

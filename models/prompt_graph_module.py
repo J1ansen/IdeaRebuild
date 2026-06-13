@@ -118,6 +118,18 @@ class PromptGraphModuleP1(nn.Module):
         self.use_benefit_gate = bool(self.config.get("use_benefit_gate", False))
         self.benefit_gate_hidden_dim = int(self.config.get("benefit_gate_hidden_dim", self.query_hidden_dim))
         self.benefit_gate_bias_init = float(self.config.get("benefit_gate_bias_init", -1.0))
+        self.use_utility_receive_gate = bool(self.config.get("use_utility_receive_gate", False))
+        self.utility_receive_gate_hidden_dim = int(
+            self.config.get("utility_receive_gate_hidden_dim", self.query_hidden_dim)
+        )
+        self.utility_receive_gate_min = float(self.config.get("utility_receive_gate_min", 0.10))
+        if not 0.0 <= self.utility_receive_gate_min < 1.0:
+            raise ValueError("utility_receive_gate_min must be in [0, 1)")
+        self.utility_receive_gate_init = float(self.config.get("utility_receive_gate_init", 0.50))
+        self.utility_receive_gate_init = min(max(self.utility_receive_gate_init, 1e-6), 1.0 - 1e-6)
+        self.use_hard_receive_gate = bool(self.config.get("use_hard_receive_gate", False))
+        self.hard_receive_ratio = float(self.config.get("hard_receive_ratio", 0.15))
+        self.hard_receive_straight_through = bool(self.config.get("hard_receive_straight_through", True))
         self.class_key_init_coverage = 0.0
         self.class_key_init_missing_classes: list[int] = []
         self.pattern_key_init_coverage = 0.0
@@ -186,6 +198,15 @@ class PromptGraphModuleP1(nn.Module):
         )
         nn.init.zeros_(self.benefit_gate_mlp[-1].weight)
         nn.init.constant_(self.benefit_gate_mlp[-1].bias, self.benefit_gate_bias_init)
+        utility_gate_input_dim = 5 * base_dim + 6 + 5
+        self.utility_receive_gate_mlp = nn.Sequential(
+            nn.Linear(utility_gate_input_dim, self.utility_receive_gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.utility_receive_gate_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.utility_receive_gate_mlp[-1].weight)
+        nn.init.constant_(self.utility_receive_gate_mlp[-1].bias, torch.logit(torch.tensor(self.utility_receive_gate_init)).item())
         self.edge_scale_max = float(self.config.get("edge_scale_max", 0.2))
         edge_scale_init = float(self.config.get("edge_scale_init", 0.01))
         self.edge_scale_logit = nn.Parameter(_init_logit(edge_scale_init, self.edge_scale_max))
@@ -513,6 +534,19 @@ class PromptGraphModuleP1(nn.Module):
         mask[top_idx] = 1.0
         return mask
 
+    def _hard_top_ratio_mask(self, score: torch.Tensor, ratio: float) -> torch.Tensor:
+        if score.numel() == 0:
+            return score
+        ratio = min(max(float(ratio), 0.0), 1.0)
+        if ratio <= 0.0:
+            return torch.zeros_like(score)
+        keep = int(math.ceil(ratio * int(score.numel())))
+        keep = min(max(keep, 1), int(score.numel()))
+        top_idx = torch.topk(score, k=keep, largest=True).indices
+        mask = torch.zeros_like(score)
+        mask[top_idx] = 1.0
+        return mask
+
     def _benefit_gate(
         self,
         *,
@@ -559,6 +593,46 @@ class PromptGraphModuleP1(nn.Module):
         )
         benefit_logit = self.benefit_gate_mlp(gate_input).squeeze(-1)
         return torch.sigmoid(benefit_logit), benefit_logit
+
+    def _utility_receive_gate(
+        self,
+        *,
+        aux: dict[str, torch.Tensor],
+        pool_idx: torch.Tensor,
+        logits: torch.Tensor,
+        full_prob: torch.Tensor,
+        benefit_node_score: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.use_utility_receive_gate:
+            ones = benefit_node_score.new_ones(benefit_node_score.shape)
+            logits_out = torch.full_like(benefit_node_score, 30.0)
+            return ones, logits_out, ones
+
+        top_prob = full_prob.max(dim=-1).values
+        entropy = -(full_prob * full_prob.clamp_min(1e-12).log()).sum(dim=-1)
+        if full_prob.size(1) > 1:
+            entropy = entropy / math.log(float(full_prob.size(1)))
+            top2 = torch.topk(logits, k=2, dim=-1).values
+            route_margin = top2[:, 0] - top2[:, 1]
+        else:
+            route_margin = torch.ones_like(top_prob)
+        structural_score = aux["structural_score"][pool_idx]
+        scalar_features = torch.stack(
+            [
+                top_prob,
+                entropy,
+                _minmax_normalize(route_margin),
+                _minmax_normalize(structural_score),
+                benefit_node_score,
+            ],
+            dim=-1,
+        )
+        gate_input = torch.cat([aux["query_context"][pool_idx], aux["role_context"][pool_idx], scalar_features], dim=-1)
+        receive_logit = self.utility_receive_gate_mlp(gate_input).squeeze(-1)
+        receive_raw = torch.sigmoid(receive_logit)
+        min_gate = float(self.utility_receive_gate_min)
+        receive_gate = min_gate + (1.0 - min_gate) * receive_raw
+        return receive_gate, receive_logit, receive_raw
 
     def _pool_mask(
         self,
@@ -670,6 +744,23 @@ class PromptGraphModuleP1(nn.Module):
             "benefit_gate_mean": z.new_tensor(0.0),
             "benefit_gate_min": z.new_tensor(0.0),
             "benefit_gate_max": z.new_tensor(0.0),
+            "utility_receive_gate": z.new_zeros(0),
+            "utility_receive_gate_logit": z.new_zeros(0),
+            "utility_receive_gate_raw": z.new_zeros(0),
+            "utility_receive_gate_mean": z.new_tensor(0.0),
+            "utility_receive_gate_min": z.new_tensor(0.0),
+            "utility_receive_gate_max": z.new_tensor(0.0),
+            "use_utility_receive_gate": int(self.use_utility_receive_gate),
+            "utility_receive_gate_floor": z.new_tensor(float(self.utility_receive_gate_min)),
+            "receive_gate_score": z.new_zeros(0),
+            "effective_receive_gate": z.new_zeros(0),
+            "hard_receive_mask": z.new_zeros(0),
+            "use_hard_receive_gate": int(self.use_hard_receive_gate),
+            "hard_receive_ratio": z.new_tensor(float(self.hard_receive_ratio)),
+            "hard_receive_selected_ratio": z.new_tensor(0.0),
+            "receive_gate_mean": z.new_tensor(0.0),
+            "receive_gate_min": z.new_tensor(0.0),
+            "receive_gate_max": z.new_tensor(0.0),
             "raw_edge_scale": self.edge_scale,
             "edge_scale_multiplier": edge_scale_multiplier,
             "capacity_routing_enabled": int(self.use_capacity_routing),
@@ -776,7 +867,32 @@ class PromptGraphModuleP1(nn.Module):
             assign_prob=assign_prob,
             logits=logits,
         )
-        prompt_weights = effective_edge_scale * effective_acceptance.unsqueeze(-1) * assign_prob * benefit_weight
+        benefit_node_score = (assign_prob * benefit_weight).sum(dim=-1)
+        utility_receive_gate, utility_receive_logit, utility_receive_raw = self._utility_receive_gate(
+            aux=aux,
+            pool_idx=pool_idx,
+            logits=logits,
+            full_prob=full_prob,
+            benefit_node_score=benefit_node_score,
+        )
+        receive_score = effective_acceptance * benefit_node_score * utility_receive_gate
+        if self.use_hard_receive_gate:
+            hard_receive_mask = self._hard_top_ratio_mask(receive_score, self.hard_receive_ratio)
+            if self.hard_receive_straight_through:
+                effective_receive = hard_receive_mask.detach() + receive_score - receive_score.detach()
+            else:
+                effective_receive = hard_receive_mask
+            prompt_weights = effective_edge_scale * effective_receive.unsqueeze(-1) * assign_prob * benefit_weight
+        else:
+            hard_receive_mask = receive_score
+            effective_receive = receive_score
+            prompt_weights = (
+                effective_edge_scale
+                * effective_acceptance.unsqueeze(-1)
+                * utility_receive_gate.unsqueeze(-1)
+                * assign_prob
+                * benefit_weight
+            )
 
         src_node = pool_idx.repeat_interleave(k)
         dst_prompt = (prompt_offset + top_prompt_ids.reshape(-1)).long()
@@ -830,6 +946,25 @@ class PromptGraphModuleP1(nn.Module):
             "benefit_gate_mean": benefit_weight.mean(),
             "benefit_gate_min": benefit_weight.min(),
             "benefit_gate_max": benefit_weight.max(),
+            "utility_receive_gate": utility_receive_gate,
+            "utility_receive_gate_logit": utility_receive_logit,
+            "utility_receive_gate_raw": utility_receive_raw,
+            "utility_receive_gate_mean": utility_receive_gate.mean(),
+            "utility_receive_gate_min": utility_receive_gate.min(),
+            "utility_receive_gate_max": utility_receive_gate.max(),
+            "use_utility_receive_gate": int(self.use_utility_receive_gate),
+            "utility_receive_gate_floor": receive_score.new_tensor(float(self.utility_receive_gate_min)),
+            "receive_gate_score": receive_score,
+            "effective_receive_gate": effective_receive,
+            "hard_receive_mask": hard_receive_mask,
+            "use_hard_receive_gate": int(self.use_hard_receive_gate),
+            "hard_receive_ratio": receive_score.new_tensor(float(self.hard_receive_ratio)),
+            "hard_receive_selected_ratio": (
+                hard_receive_mask.mean() if self.use_hard_receive_gate else receive_score.new_tensor(1.0)
+            ),
+            "receive_gate_mean": receive_score.mean(),
+            "receive_gate_min": receive_score.min(),
+            "receive_gate_max": receive_score.max(),
             "hard_acceptance_mask": hard_acceptance_mask,
             "use_hard_acceptance": int(self.use_hard_acceptance),
             "hard_acceptance_ratio": pool_acceptance.new_tensor(float(self.hard_acceptance_ratio)),

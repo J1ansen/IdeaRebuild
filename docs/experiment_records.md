@@ -2015,3 +2015,234 @@ Interpretation:
 - The fixed positive prompt message still hurts, so the remaining issue is not only missing gate supervision.
 - The learned signal is mostly negative, which supports the current validation behavior of selecting `message_scale=0.0`.
 - Next improvement should focus on prompt message quality and representation alignment, not simply accepting more pool nodes.
+
+## 2026-06-12: P5-lite receiver 5% heterophily control
+
+Goal:
+
+- Check whether the simplified P5-lite receiver can make prompt messages useful without the over-strong hard gate / benefit gate / anti-harm constraints used in full P5.
+- Compare against a same-protocol NoPrompt control on 5% Actor and chameleon.
+
+P5-lite command pattern:
+
+```bash
+.venv/bin/python -m experiments.run_gp2f_prompt_graph \
+  --config configs/gp2f_prompt_p5_lite_receiver.yaml \
+  --target_dataset Actor \
+  --prompt_variant p5_lite_receiver \
+  --shot_mode percent \
+  --shot_value 0.05 \
+  --epochs 80 \
+  --seeds 0,1,2 \
+  --diagnose_prompt_message_utility \
+  --diagnostic_message_scales 0.25,0.5,1.0 \
+  --output_dir outputs/diagnose_p5_lite_receiver_80ep
+```
+
+NoPrompt control command pattern:
+
+```bash
+.venv/bin/python -m experiments.run_gp2f_prompt_graph \
+  --config configs/gp2f_prompt_p5_lite_receiver.yaml \
+  --target_dataset Actor \
+  --prompt_variant noprompt \
+  --shot_mode percent \
+  --shot_value 0.05 \
+  --epochs 80 \
+  --seeds 0,1,2 \
+  --output_dir outputs/noprompt_5pct_80ep_control
+```
+
+Summary:
+
+| Dataset | Variant | Best Acc | Best Macro-F1 | Final Acc | Final Macro-F1 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Actor | NoPrompt | 26.23+-0.36 | 16.96+-7.67 | 26.52+-0.70 | 22.28+-2.68 |
+| Actor | P5-lite | 26.45+-0.57 | 18.38+-7.53 | 26.30+-0.44 | 22.35+-1.87 |
+| chameleon | NoPrompt | 33.95+-3.01 | 31.29+-1.89 | 32.90+-2.08 | 31.37+-2.44 |
+| chameleon | P5-lite | 33.55+-1.65 | 32.03+-1.77 | 33.35+-1.60 | 31.91+-1.77 |
+
+P5-lite train-pool message utility:
+
+| Dataset | Scale | mean_delta_ce | positive_delta_ratio | correction_norm |
+| --- | ---: | ---: | ---: | ---: |
+| Actor | 0.25 | 0.0262 | 0.8534 | 0.0301 |
+| Actor | 0.50 | 0.0454 | 0.8691 | 0.0436 |
+| Actor | 1.00 | 0.0613 | 0.9075 | 0.0426 |
+| chameleon | 0.25 | 0.0336 | 0.9656 | 0.0438 |
+| chameleon | 0.50 | 0.0466 | 0.9826 | 0.0438 |
+| chameleon | 1.00 | 0.0540 | 0.9913 | 0.0435 |
+
+Interpretation:
+
+- P5-lite fixes the full P5 degradation: removing hard receive / benefit / anti-harm constraints allows the message path to train.
+- Prompt message is no longer completely invalid. Train-pool `mean_delta_ce` becomes positive on both Actor and chameleon.
+- The test improvement over NoPrompt is still weak: Actor is essentially tied; chameleon has slightly better Macro-F1 and final Acc, but lower best Acc.
+- Multi-view routing is not yet working as intended. View weights remain close to uniform, and prompt usage collapses toward a dominant residual slot.
+- Next step should focus on routing diversity / slot specialization and validation-visible generalization, not simply increasing message scale or re-enabling hard gates.
+
+## 2026-06-12: P6 slot-specialized multi-view router
+
+Goal:
+
+- Keep the stable P5-lite receiver and add only lightweight slot specialization.
+- Test whether train-only usage consistency and role diversity can reduce prompt-slot collapse without reintroducing hard receive gates, benefit gates, or anti-harm constraints.
+- Continue the 5% heterophily protocol on Actor and chameleon.
+
+P6 command pattern:
+
+```bash
+.venv/bin/python -m experiments.run_gp2f_prompt_graph \
+  --config configs/gp2f_prompt_p6_slot_specialized.yaml \
+  --target_dataset Actor \
+  --prompt_variant p5_lite_receiver \
+  --shot_mode percent \
+  --shot_value 0.05 \
+  --epochs 80 \
+  --seeds 0,1,2 \
+  --diagnose_prompt_message_utility \
+  --diagnostic_message_scales 0.25,0.5,1.0 \
+  --output_dir outputs/diagnose_p6_slot_specialized_80ep
+```
+
+Summary:
+
+| Dataset | Variant | Best Acc | Best Macro-F1 | Final Acc | Final Macro-F1 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Actor | NoPrompt | 26.23+-0.36 | 16.96+-7.67 | 26.52+-0.70 | 22.28+-2.68 |
+| Actor | P5-lite | 26.45+-0.57 | 18.38+-7.53 | 26.30+-0.44 | 22.35+-1.87 |
+| Actor | P6 | 26.49+-0.60 | 18.39+-7.53 | 26.28+-0.41 | 22.38+-1.84 |
+| chameleon | NoPrompt | 33.95+-3.01 | 31.29+-1.89 | 32.90+-2.08 | 31.37+-2.44 |
+| chameleon | P5-lite | 33.55+-1.65 | 32.03+-1.77 | 33.35+-1.60 | 31.91+-1.77 |
+| chameleon | P6 | 33.62+-1.77 | 31.71+-1.61 | 33.02+-1.53 | 31.58+-1.72 |
+
+P6 diagnostics:
+
+| Dataset | dominant_prompt_slot_ratio | active_prompt_slot_count@0.05 | prompt_usage_full_entropy | residual_prompt_usage_ratio | class_balanced_mean_delta_ce | class_balanced_positive_delta_ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Actor | 0.4463+-0.2725 | 6.0000+-7.0711 | 0.7249+-0.2003 | 0.8125+-0.0894 | 0.0229+-0.0235 | 0.5485+-0.4039 |
+| chameleon | 0.6170+-0.1843 | 2.6667+-4.7140 | 0.5864+-0.1463 | 0.7951+-0.2110 | 0.0405+-0.0142 | 0.9625+-0.0377 |
+
+P6 train-pool message utility by scale:
+
+| Dataset | Scale | mean_delta_ce | positive_delta_ratio |
+| --- | ---: | ---: | ---: |
+| Actor | 0.25 | 0.0254 | 0.8560 |
+| Actor | 0.50 | 0.0454 | 0.8726 |
+| Actor | 1.00 | 0.0609 | 0.9206 |
+| chameleon | 0.25 | 0.0331 | 0.9684 |
+| chameleon | 0.50 | 0.0462 | 0.9770 |
+| chameleon | 1.00 | 0.0557 | 0.9856 |
+
+Interpretation:
+
+- P6 keeps prompt message utility positive on train-pool nodes. The message path is not dead.
+- Slot usage becomes somewhat more distributed than P5-lite, especially in `prompt_usage_full_entropy`, but the change is small and unstable.
+- The performance gain is essentially absent: Actor ties P5-lite, while chameleon is slightly worse than P5-lite on Macro-F1 and final metrics.
+- This suggests that lightweight usage consistency / role diversity alone does not solve generalization. It can make slot usage less collapsed, but it does not make routing decisions semantically reliable enough for validation/test nodes.
+- The next step should not be to simply increase the slot-specialization weights. Stronger usage losses may spread routing artificially and could reduce message utility. A better next diagnostic is to separate two questions: whether the pool contains nodes that benefit on validation-like structure, and whether the receiver can produce class/role-specific corrections that generalize beyond train-pool nodes.
+
+## 2026-06-13: P7 utility-aware receive gate and split utility diagnosis
+
+Goal:
+
+- Add a soft utility-aware receive gate without reintroducing hard receive / benefit / anti-harm constraints.
+- Use train-only `delta_CE` quantiles to weakly supervise which train-pool nodes should receive stronger prompt messages.
+- Extend `diagnose_prompt_message_utility` so it reports train / validation / test pool utility separately. This is a diagnosis-only metric; validation/test labels are not used for training.
+
+P7 command pattern:
+
+```bash
+.venv/bin/python -m experiments.run_gp2f_prompt_graph \
+  --config configs/gp2f_prompt_p7_utility_gate.yaml \
+  --target_dataset Actor \
+  --prompt_variant p5_lite_receiver \
+  --shot_mode percent \
+  --shot_value 0.05 \
+  --epochs 80 \
+  --seeds 0,1,2 \
+  --diagnose_prompt_message_utility \
+  --diagnostic_message_scales 0.25,0.5,1.0 \
+  --output_dir outputs/diagnose_p7_utility_gate_80ep
+```
+
+Summary:
+
+| Dataset | Variant | Best Acc | Best Macro-F1 | Final Acc | Final Macro-F1 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Actor | P6 | 26.49+-0.60 | 18.39+-7.53 | 26.28+-0.41 | 22.38+-1.84 |
+| Actor | P7 | 26.52+-0.55 | 18.34+-7.50 | 26.19+-0.45 | 22.31+-1.88 |
+| chameleon | P6 | 33.62+-1.77 | 31.71+-1.61 | 33.02+-1.53 | 31.58+-1.72 |
+| chameleon | P7 | 33.50+-1.66 | 31.97+-1.74 | 33.28+-1.60 | 31.83+-1.74 |
+
+P7 gate diagnostics:
+
+| Dataset | utility_receive_gate_mean | utility_gate_delta_corr_train | utility_mean_delta_ce_train_pool | utility_mean_delta_ce_val_pool | utility_mean_delta_ce_test_pool |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Actor | 0.7309+-0.1328 | 0.1487+-0.1287 | 0.0435+-0.0262 | -0.0535+-0.0381 | -0.0373+-0.0309 |
+| chameleon | 0.9541+-0.0304 | 0.2127+-0.0784 | 0.0439+-0.0091 | -0.0123+-0.0127 | -0.0248+-0.0091 |
+
+P7 utility by scale:
+
+| Dataset | Scale | train_pool mean_delta_ce | val_pool mean_delta_ce | test_pool mean_delta_ce | train_pool positive_ratio | val_pool positive_ratio | test_pool positive_ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Actor | 0.25 | 0.0242 | -0.0409 | -0.0330 | 0.8455 | 0.4455 | 0.5275 |
+| Actor | 0.50 | 0.0447 | -0.0541 | -0.0361 | 0.8613 | 0.4327 | 0.5170 |
+| Actor | 1.00 | 0.0616 | -0.0654 | -0.0428 | 0.9215 | 0.4397 | 0.5004 |
+| chameleon | 0.25 | 0.0324 | -0.0071 | -0.0174 | 0.9598 | 0.5507 | 0.5079 |
+| chameleon | 0.50 | 0.0461 | -0.0122 | -0.0261 | 0.9799 | 0.4849 | 0.4885 |
+| chameleon | 1.00 | 0.0531 | -0.0177 | -0.0308 | 0.9914 | 0.5066 | 0.4583 |
+
+Interpretation:
+
+- The utility-aware gate is implemented and trainable. Its correlation with train-pool `delta_CE` is positive but weak.
+- The new split diagnosis exposes the main bottleneck: prompt messages reduce CE on train-pool nodes but increase CE on validation/test pool nodes.
+- Performance is essentially tied with P6 and does not show a reliable improvement.
+- The next improvement should not strengthen the utility gate or increase message scale. The current issue is train-pool overfitting and poor prompt-message generalization.
+- The next direction should modify the message target or pool selection, for example by adding a validation-like support/query split inside the training nodes, using a stricter label-free pool filter, or constraining prompt corrections to be class/role-consistent across held-out train support nodes.
+
+## 2026-06-13: P8 support-query generalized prompt correction
+
+Goal:
+
+- Replace full-train message utility supervision with an internal support/query protocol.
+- Use support train nodes for prompt-side class/usage constraints and held-out train-query nodes for message utility.
+- Add query-prototype alignment so prompt correction must move query representations closer to support-class prototypes.
+
+Implementation:
+
+- Added class-balanced support/query split in the prompt graph runner.
+- Added query-only message-help loss via `lambda_prompt_message_help_query`.
+- Added query-only utility receive gate supervision via `lambda_utility_receive_gate_query`.
+- Added `query_proto_alignment_loss`.
+- Added `configs/gp2f_prompt_p8_query_generalized.yaml`.
+
+Smoke / unit tests:
+
+- `pytest tests/test_prompt_graph_module.py tests/test_prompt_aware_gp2f.py -q`: 62 passed.
+- Actor 5-epoch smoke completed without NaN or shape errors.
+
+Partial Actor seed-0 diagnostic:
+
+| Variant | Scale | Best Epoch | Best Val Acc | Best Test Acc | Best Test Macro-F1 | Final Test Acc | Final Test Macro-F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| P7 | selected 0.25 | - | - | 0.2658 | 0.2276 | 0.2581 | 0.2362 |
+| P8 | 0.25 | 18 | 0.2800 | 0.2428 | 0.2303 | 0.2254 | 0.2196 |
+| P8 | 0.50 | 72 | 0.2800 | 0.2315 | 0.2236 | 0.2391 | 0.2245 |
+| P8 | 1.00 | 21 | 0.2667 | 0.2525 | 0.2278 | 0.2371 | 0.2242 |
+
+P8 best-checkpoint query diagnostics:
+
+| Scale | query_mean_delta_ce | query_positive_ratio | query_proto_delta_dist | query_proto_positive_ratio | support_count | query_count |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.25 | 0.0231 | 0.9009 | -0.0010 | 0.3722 | 267 | 115 |
+| 0.50 | -0.0373 | 0.5461 | -0.0076 | 0.3499 | 267 | 115 |
+| 1.00 | 0.0543 | 0.9405 | -0.0036 | 0.3517 | 267 | 115 |
+
+Interpretation:
+
+- P8 implementation is functional, but it does not improve Actor seed 0.
+- Query message help can become positive, but query-prototype alignment is negative: prompt correction is not moving representations toward support-class prototypes.
+- Best test accuracy is lower than P7 seed 0 across all tested scales.
+- The long 3-seed Actor matrix was intentionally stopped after seed 0 because all three scales showed no improvement and the run was much slower than P7.
+- This means support/query supervision alone is not enough. The next fix should not simply raise P8 weights. The receiver is still learning local CE patches rather than class/role-consistent representation movement.
