@@ -38,6 +38,8 @@ from models.prompt_graph_module import (
     prompt_role_diversity_loss,
     prompt_usage_consistency_loss,
     prompt_view_entropy_loss,
+    prompt_view_prior_loss,
+    utility_receive_gate_budget_loss,
 )
 from models.prompt_module import count_trainable_parameters
 from utils.io import read_yaml, write_json, write_yaml
@@ -796,6 +798,33 @@ def _prompt_slot_usage_stats(
     }
 
 
+def _pattern_usage_by_structural_bin(prompt_out: dict[str, Any], bins: int = 3) -> list[list[float]]:
+    aux = prompt_out.get("aux", {})
+    full_prob = aux.get("routing_full_prob")
+    score = aux.get("structural_score")
+    pool_idx = aux.get("pool_idx")
+    if not (
+        isinstance(full_prob, torch.Tensor)
+        and isinstance(score, torch.Tensor)
+        and isinstance(pool_idx, torch.Tensor)
+        and full_prob.numel() > 0
+        and pool_idx.numel() == full_prob.size(0)
+    ):
+        return []
+    pool_score = score[pool_idx].detach()
+    if pool_score.numel() == 0:
+        return []
+    ranked = torch.argsort(pool_score)
+    chunks = torch.chunk(ranked, max(1, int(bins)))
+    out: list[list[float]] = []
+    for chunk in chunks:
+        if chunk.numel() == 0:
+            out.append([])
+        else:
+            out.append([float(value) for value in full_prob[chunk].mean(dim=0).detach().cpu().tolist()])
+    return out
+
+
 def _prompt_graph_diagnostics(
     prompt_out: dict[str, Any],
     *,
@@ -879,6 +908,8 @@ def _prompt_graph_diagnostics(
         "connected_edge_count": int(aux.get("connected_edge_count", prompt_edge_count)),
         "use_multiview_routing": float(aux.get("use_multiview_routing", 0)),
         "use_class_aware_routing": float(aux.get("use_class_aware_routing", 0)),
+        "use_attribute_view": float(aux.get("use_attribute_view", 0)),
+        "use_enhanced_role_view": float(aux.get("use_enhanced_role_view", 0)),
         "use_pattern_prompt_bank": float(aux.get("use_pattern_prompt_bank", 0)),
         "use_receiver_only_prompt": float(aux.get("use_receiver_only_prompt", 0)),
         "use_benefit_gate": float(aux.get("use_benefit_gate", 0)),
@@ -955,13 +986,17 @@ def _prompt_graph_diagnostics(
         ),
     }
     view_gate_mean = aux.get("view_gate_mean")
-    if isinstance(view_gate_mean, torch.Tensor) and view_gate_mean.numel() == 3:
+    if isinstance(view_gate_mean, torch.Tensor) and view_gate_mean.numel() in {3, 4}:
         view_values = [float(value) for value in view_gate_mean.detach().cpu().tolist()]
     else:
         view_values = [0.0, 1.0, 0.0]
     diagnostics["semantic_view_weight"] = view_values[0]
     diagnostics["structural_view_weight"] = view_values[1]
     diagnostics["role_view_weight"] = view_values[2]
+    diagnostics["attribute_view_weight"] = view_values[3] if len(view_values) > 3 else 0.0
+    for name in ["semantic_route_margin", "structural_route_margin", "role_route_margin", "attribute_route_margin"]:
+        value = aux.get(name)
+        diagnostics[name] = float(value.detach().item()) if isinstance(value, torch.Tensor) else 0.0
     if isinstance(prompt_usage, torch.Tensor):
         diagnostics["prompt_usage_distribution"] = [float(value) for value in prompt_usage.detach().cpu().tolist()]
     else:
@@ -972,6 +1007,8 @@ def _prompt_graph_diagnostics(
         diagnostics["prompt_usage_full_distribution"] = []
     slot_usage = prompt_usage_full if isinstance(prompt_usage_full, torch.Tensor) else prompt_usage
     diagnostics.update(_prompt_slot_usage_stats(slot_usage))
+    diagnostics["pattern_prompt_usage_entropy"] = diagnostics["prompt_usage_full_entropy"]
+    diagnostics["pattern_prompt_usage_by_structural_bin"] = _pattern_usage_by_structural_bin(prompt_out)
     if labels is not None and num_classes is not None:
         diagnostics["pool_label_distribution"] = _pool_label_distribution(pool_mask, labels, int(num_classes))
         diagnostics["prompt_usage_by_true_class"] = _prompt_usage_by_true_class(prompt_out, labels, int(num_classes))
@@ -1682,6 +1719,7 @@ def _utility_receive_gate_loss(
     quantile: float = 0.20,
     eps: float = 1e-4,
     class_balanced: bool = True,
+    label_strategy: str = "quantile",
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     aux = prompt_out.get("aux", {})
     pool_mask = prompt_out.get("pool_mask")
@@ -1701,6 +1739,7 @@ def _utility_receive_gate_loss(
         "utility_gate_quantile": float(quantile),
         "utility_gate_eps": float(eps),
         "utility_gate_class_balanced": float(class_balanced),
+        "utility_gate_label_strategy": label_strategy,
     }
     if not (
         isinstance(pool_mask, torch.Tensor)
@@ -1736,30 +1775,48 @@ def _utility_receive_gate_loss(
     for class_id in classes:
         class_mask = torch.ones_like(y, dtype=torch.bool) if int(class_id) == -1 else y == int(class_id)
         rows = torch.where(class_mask)[0]
-        if rows.numel() < 2 or fraction <= 0.0:
+        if rows.numel() < 1:
             continue
-        k = min(max(1, int(math.ceil(float(rows.numel()) * fraction))), int(rows.numel()) // 2)
-        if k <= 0:
-            continue
-        class_delta = delta_ce[rows]
-        sorted_delta, order = torch.sort(class_delta)
-        neg_rows = rows[order[:k]]
-        pos_rows = rows[order[-k:]]
-        pos_keep = delta_ce[pos_rows] > eps
-        neg_keep = delta_ce[neg_rows] < -eps
         selected = torch.zeros_like(y, dtype=torch.bool)
         target = torch.zeros_like(delta_ce)
-        if bool(pos_keep.any()):
-            selected[pos_rows[pos_keep]] = True
-            target[pos_rows[pos_keep]] = 1.0
-        if bool(neg_keep.any()):
-            selected[neg_rows[neg_keep]] = True
-            target[neg_rows[neg_keep]] = 0.0
+        class_delta = delta_ce[rows]
+        if label_strategy == "margin":
+            pos_rows = rows[class_delta > eps]
+            neg_rows = rows[class_delta < -eps]
+            if bool(pos_rows.numel() > 0):
+                selected[pos_rows] = True
+                target[pos_rows] = 1.0
+            if bool(neg_rows.numel() > 0):
+                selected[neg_rows] = True
+                target[neg_rows] = 0.0
+            if bool((class_delta > eps).any()):
+                positive_thresholds.append(class_delta[class_delta > eps].min().detach())
+            if bool((class_delta < -eps).any()):
+                negative_thresholds.append(class_delta[class_delta < -eps].max().detach())
+        elif label_strategy == "quantile":
+            if rows.numel() < 2 or fraction <= 0.0:
+                continue
+            k = min(max(1, int(math.ceil(float(rows.numel()) * fraction))), int(rows.numel()) // 2)
+            if k <= 0:
+                continue
+            sorted_delta, order = torch.sort(class_delta)
+            neg_rows = rows[order[:k]]
+            pos_rows = rows[order[-k:]]
+            pos_keep = delta_ce[pos_rows] > eps
+            neg_keep = delta_ce[neg_rows] < -eps
+            if bool(pos_keep.any()):
+                selected[pos_rows[pos_keep]] = True
+                target[pos_rows[pos_keep]] = 1.0
+            if bool(neg_keep.any()):
+                selected[neg_rows[neg_keep]] = True
+                target[neg_rows[neg_keep]] = 0.0
+            negative_thresholds.append(sorted_delta[k - 1].detach())
+            positive_thresholds.append(sorted_delta[-k].detach())
+        else:
+            raise ValueError("utility receive gate label_strategy must be 'quantile' or 'margin'")
         if bool(selected.any()):
             selected_masks.append(selected)
             target_values.append(target)
-            negative_thresholds.append(sorted_delta[k - 1].detach())
-            positive_thresholds.append(sorted_delta[-k].detach())
 
     if not selected_masks:
         return fallback, empty_stats
@@ -1788,6 +1845,7 @@ def _utility_receive_gate_loss(
         "utility_gate_quantile": float(quantile),
         "utility_gate_eps": float(eps),
         "utility_gate_class_balanced": float(class_balanced),
+        "utility_gate_label_strategy": label_strategy,
     }
     return loss, stats
 
@@ -2399,6 +2457,19 @@ def run_single(
             device=device,
             load_prompt=bool(training_cfg.get("load_prompt_from_base_checkpoint", False)),
         )
+    init_train_mask = split.train_mask
+    if bool(prompt_graph_cfg.get("support_only_prompt_graph", False)) and bool(
+        prompt_graph_cfg.get("support_query_split", {}).get(
+            "enabled", prompt_graph_cfg.get("support_query_split_enabled", False)
+        )
+    ):
+        init_train_mask, _, _ = _support_query_masks_for_epoch(
+            graph.y,
+            split.train_mask,
+            prompt_graph_cfg,
+            seed=seed,
+            epoch=0,
+        )
     class_key_init_stats = _maybe_initialize_class_keys(
         prompt_graph_module=prompt_graph_module,
         input_aligner=input_aligner,
@@ -2406,7 +2477,7 @@ def run_single(
         x=graph.x,
         edge_index=graph.edge_index,
         labels=graph.y,
-        train_mask=split.train_mask,
+        train_mask=init_train_mask,
         prompt_graph_cfg=prompt_graph_cfg,
     )
     pattern_key_init_stats = _maybe_initialize_pattern_keys(
@@ -2415,7 +2486,7 @@ def run_single(
         model=model,
         x=graph.x,
         edge_index=graph.edge_index,
-        train_mask=split.train_mask,
+        train_mask=init_train_mask,
         prompt_graph_cfg=prompt_graph_cfg,
     )
     freeze_base_model = bool(training_cfg.get("freeze_base_model", False))
@@ -2487,6 +2558,8 @@ def run_single(
     usage_consistency_margin = float(prompt_graph_cfg.get("usage_consistency_margin", 0.25))
     usage_consistency_negative_weight = float(prompt_graph_cfg.get("usage_consistency_negative_weight", 0.05))
     lambda_prompt_view_entropy = float(prompt_graph_cfg.get("lambda_prompt_view_entropy", 0.0))
+    lambda_view_prior = float(prompt_graph_cfg.get("lambda_view_prior", 0.0))
+    view_prior = prompt_graph_cfg.get("view_prior", None)
     lambda_class_route = float(prompt_graph_cfg.get("lambda_class_route", 0.0))
     lambda_key_proto = float(prompt_graph_cfg.get("lambda_key_proto", 0.0))
     lambda_prompt_benefit_supervision = float(prompt_graph_cfg.get("lambda_prompt_benefit_supervision", 0.0))
@@ -2520,6 +2593,9 @@ def run_single(
     prompt_class_anti_harm_floor = float(prompt_graph_cfg.get("prompt_class_anti_harm_floor", 0.0))
     lambda_utility_receive_gate = float(prompt_graph_cfg.get("lambda_utility_receive_gate", 0.0))
     lambda_utility_receive_gate_query = float(prompt_graph_cfg.get("lambda_utility_receive_gate_query", 0.0))
+    lambda_receive_gate_budget = float(prompt_graph_cfg.get("lambda_receive_gate_budget", 0.0))
+    receive_gate_budget_min = prompt_graph_cfg.get("receive_gate_budget_min")
+    receive_gate_budget_max = prompt_graph_cfg.get("receive_gate_budget_max")
     utility_receive_gate_warmup_epochs = int(prompt_graph_cfg.get("utility_receive_gate_warmup_epochs", 0))
     utility_receive_gate_query_warmup_epochs = int(
         prompt_graph_cfg.get("utility_receive_gate_query_warmup_epochs", utility_receive_gate_warmup_epochs)
@@ -2527,6 +2603,7 @@ def run_single(
     utility_receive_gate_quantile = float(prompt_graph_cfg.get("utility_receive_gate_quantile", 0.20))
     utility_receive_gate_eps = float(prompt_graph_cfg.get("utility_receive_gate_eps", 1e-4))
     utility_receive_gate_class_balanced = bool(prompt_graph_cfg.get("utility_receive_gate_class_balanced", True))
+    utility_receive_gate_label_strategy = str(prompt_graph_cfg.get("utility_receive_gate_label_strategy", "quantile"))
     lambda_query_proto_alignment = float(prompt_graph_cfg.get("lambda_query_proto_alignment", 0.0))
     query_proto_alignment_warmup_epochs = int(prompt_graph_cfg.get("query_proto_alignment_warmup_epochs", 0))
     query_proto_margin = float(prompt_graph_cfg.get("query_proto_margin", 0.005))
@@ -2536,6 +2613,7 @@ def run_single(
             "enabled", prompt_graph_cfg.get("support_query_split_enabled", False)
         )
     )
+    support_only_prompt_graph = bool(prompt_graph_cfg.get("support_only_prompt_graph", False))
     edge_scale_warmup_epochs = int(prompt_graph_cfg.get("edge_scale_warmup_epochs", 0))
     edge_scale_warmup_start = float(prompt_graph_cfg.get("edge_scale_warmup_start", 1.0 if edge_scale_warmup_epochs <= 0 else 0.0))
     best_checkpoint_path = run_dir / "best_model.pt"
@@ -2558,16 +2636,6 @@ def run_single(
             prompt_graph_module.train()
         optimizer.zero_grad()
 
-        z = input_aligner(graph.x)
-        current_edge_scale_multiplier = _edge_scale_multiplier(epoch, prompt_graph_cfg)
-        model_out, prompt_out = _forward_prompt_graph(
-            model=model,
-            prompt_graph_module=prompt_graph_module,
-            z=z,
-            edge_index=graph.edge_index,
-            train_mask=split.train_mask,
-            edge_scale_multiplier=current_edge_scale_multiplier,
-        )
         support_mask, query_mask, support_query_stats = _support_query_masks_for_epoch(
             graph.y,
             split.train_mask,
@@ -2577,6 +2645,19 @@ def run_single(
         )
         prompt_supervision_mask = support_mask if support_query_enabled else split.train_mask
         prompt_query_mask = query_mask if support_query_enabled else split.train_mask
+        prompt_graph_train_mask = (
+            prompt_supervision_mask if support_query_enabled and support_only_prompt_graph else split.train_mask
+        )
+        z = input_aligner(graph.x)
+        current_edge_scale_multiplier = _edge_scale_multiplier(epoch, prompt_graph_cfg)
+        model_out, prompt_out = _forward_prompt_graph(
+            model=model,
+            prompt_graph_module=prompt_graph_module,
+            z=z,
+            edge_index=graph.edge_index,
+            train_mask=prompt_graph_train_mask,
+            edge_scale_multiplier=current_edge_scale_multiplier,
+        )
         cls_loss = F.cross_entropy(model_out["logits"][split.train_mask], graph.y[split.train_mask])
         edge_l1 = prompt_edge_l1_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_balance = prompt_balance_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
@@ -2834,6 +2915,7 @@ def run_single(
                 quantile=utility_receive_gate_quantile,
                 eps=utility_receive_gate_eps,
                 class_balanced=utility_receive_gate_class_balanced,
+                label_strategy=utility_receive_gate_label_strategy,
             )
         else:
             utility_receive_gate_loss = z.new_tensor(0.0)
@@ -2850,6 +2932,7 @@ def run_single(
                 "utility_gate_quantile": utility_receive_gate_quantile,
                 "utility_gate_eps": utility_receive_gate_eps,
                 "utility_gate_class_balanced": float(utility_receive_gate_class_balanced),
+                "utility_gate_label_strategy": utility_receive_gate_label_strategy,
             }
         if (
             prompt_graph_module is not None
@@ -2866,6 +2949,7 @@ def run_single(
                 quantile=utility_receive_gate_quantile,
                 eps=utility_receive_gate_eps,
                 class_balanced=utility_receive_gate_class_balanced,
+                label_strategy=utility_receive_gate_label_strategy,
             )
             utility_receive_gate_query_stats = {
                 "utility_receive_gate_query_loss": utility_receive_gate_query_stats["utility_receive_gate_loss"],
@@ -2881,6 +2965,7 @@ def run_single(
                 "utility_gate_query_ignored_count": utility_receive_gate_query_stats["utility_gate_ignored_count"],
                 "utility_gate_query_target_mean": utility_receive_gate_query_stats["utility_gate_target_mean"],
                 "utility_gate_query_delta_corr": utility_receive_gate_query_stats["utility_gate_delta_corr_train"],
+                "utility_gate_query_label_strategy": utility_receive_gate_query_stats["utility_gate_label_strategy"],
             }
         else:
             utility_receive_gate_query_loss = z.new_tensor(0.0)
@@ -2892,6 +2977,7 @@ def run_single(
                 "utility_gate_query_ignored_count": 0.0,
                 "utility_gate_query_target_mean": 0.0,
                 "utility_gate_query_delta_corr": 0.0,
+                "utility_gate_query_label_strategy": utility_receive_gate_label_strategy,
             }
         if (
             prompt_graph_module is not None
@@ -2933,6 +3019,11 @@ def run_single(
             else z.new_tensor(0.0)
         )
         prompt_view_entropy = prompt_view_entropy_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
+        prompt_view_prior = (
+            prompt_view_prior_loss(prompt_out, view_prior)
+            if prompt_graph_module is not None and view_prior is not None
+            else z.new_tensor(0.0)
+        )
         class_route = (
             prompt_class_route_loss(prompt_out, graph.y, prompt_supervision_mask)
             if prompt_graph_module is not None
@@ -2940,6 +3031,15 @@ def run_single(
         )
         key_proto = (
             prompt_key_proto_loss(prompt_graph_module, prompt_out, graph.y, prompt_supervision_mask)
+            if prompt_graph_module is not None
+            else z.new_tensor(0.0)
+        )
+        receive_gate_budget = (
+            utility_receive_gate_budget_loss(
+                prompt_out,
+                min_receive=None if receive_gate_budget_min is None else float(receive_gate_budget_min),
+                max_receive=None if receive_gate_budget_max is None else float(receive_gate_budget_max),
+            )
             if prompt_graph_module is not None
             else z.new_tensor(0.0)
         )
@@ -2953,6 +3053,7 @@ def run_single(
             + lambda_prompt_acceptance_supervision * prompt_acceptance_supervision
             + lambda_prompt_usage_consistency * prompt_usage_consistency
             + lambda_prompt_view_entropy * prompt_view_entropy
+            + lambda_view_prior * prompt_view_prior
             + lambda_class_route * class_route
             + lambda_key_proto * key_proto
             + lambda_prompt_benefit_supervision * prompt_benefit_supervision
@@ -2963,6 +3064,7 @@ def run_single(
             + lambda_prompt_class_anti_harm * prompt_class_anti_harm
             + lambda_utility_receive_gate * utility_receive_gate_loss
             + lambda_utility_receive_gate_query * utility_receive_gate_query_loss
+            + lambda_receive_gate_budget * receive_gate_budget
             + lambda_query_proto_alignment * query_proto_alignment
         )
         if not torch.isfinite(loss):
@@ -2989,6 +3091,7 @@ def run_single(
             "prompt_acceptance_supervision": float(prompt_acceptance_supervision.detach().item()),
             "prompt_usage_consistency": float(prompt_usage_consistency.detach().item()),
             "prompt_view_entropy": float(prompt_view_entropy.detach().item()),
+            "prompt_view_prior": float(prompt_view_prior.detach().item()),
             "class_route": float(class_route.detach().item()),
             "key_proto": float(key_proto.detach().item()),
             "prompt_benefit_supervision": float(prompt_benefit_supervision.detach().item()),
@@ -2999,6 +3102,7 @@ def run_single(
             "prompt_class_anti_harm_loss": float(prompt_class_anti_harm.detach().item()),
             "utility_receive_gate_loss": float(utility_receive_gate_loss.detach().item()),
             "utility_receive_gate_query_loss": float(utility_receive_gate_query_loss.detach().item()),
+            "receive_gate_budget": float(receive_gate_budget.detach().item()),
             "query_proto_alignment_loss": float(query_proto_alignment.detach().item()),
             "lambda_edge_l1": lambda_edge_l1,
             "lambda_prompt_balance": lambda_prompt_balance,
@@ -3008,6 +3112,7 @@ def run_single(
             "lambda_prompt_acceptance_supervision": lambda_prompt_acceptance_supervision,
             "lambda_prompt_usage_consistency": lambda_prompt_usage_consistency,
             "lambda_prompt_view_entropy": lambda_prompt_view_entropy,
+            "lambda_view_prior": lambda_view_prior,
             "lambda_class_route": lambda_class_route,
             "lambda_key_proto": lambda_key_proto,
             "lambda_prompt_benefit_supervision": lambda_prompt_benefit_supervision,
@@ -3018,12 +3123,16 @@ def run_single(
             "lambda_prompt_class_anti_harm": lambda_prompt_class_anti_harm,
             "lambda_utility_receive_gate": lambda_utility_receive_gate,
             "lambda_utility_receive_gate_query": lambda_utility_receive_gate_query,
+            "lambda_receive_gate_budget": lambda_receive_gate_budget,
             "lambda_query_proto_alignment": lambda_query_proto_alignment,
             "utility_receive_gate_warmup_epochs": utility_receive_gate_warmup_epochs,
             "utility_receive_gate_query_warmup_epochs": utility_receive_gate_query_warmup_epochs,
             "utility_receive_gate_quantile": utility_receive_gate_quantile,
             "utility_receive_gate_eps": utility_receive_gate_eps,
             "utility_receive_gate_class_balanced": float(utility_receive_gate_class_balanced),
+            "utility_receive_gate_label_strategy": utility_receive_gate_label_strategy,
+            "receive_gate_budget_min": 0.0 if receive_gate_budget_min is None else float(receive_gate_budget_min),
+            "receive_gate_budget_max": 0.0 if receive_gate_budget_max is None else float(receive_gate_budget_max),
             "prompt_correction_warmup_epochs": prompt_correction_warmup_epochs,
             "prompt_correction_eps": prompt_correction_eps,
             "prompt_correction_target": prompt_correction_target,
@@ -3033,6 +3142,7 @@ def run_single(
             "prompt_message_help_class_balanced": float(prompt_message_help_class_balanced),
             "prompt_class_anti_harm_floor": prompt_class_anti_harm_floor,
             "support_query_enabled": float(support_query_stats.get("enabled", False)),
+            "support_only_prompt_graph": float(support_only_prompt_graph),
             "support_count": float(support_query_stats.get("support_count", 0)),
             "query_count": float(support_query_stats.get("query_count", 0)),
             "train_support_ratio": float(support_query_stats.get("train_support_ratio", 1.0)),
@@ -3104,6 +3214,7 @@ def run_single(
                     "prompt_benefit_supervision": float(prompt_benefit_supervision.detach().item()),
                     "prompt_usage_consistency": float(prompt_usage_consistency.detach().item()),
                     "prompt_view_entropy": float(prompt_view_entropy.detach().item()),
+                    "prompt_view_prior": float(prompt_view_prior.detach().item()),
                     "class_route": float(class_route.detach().item()),
                     "key_proto": float(key_proto.detach().item()),
                     "prompt_correction_loss": float(prompt_correction_loss.detach().item()),
@@ -3113,8 +3224,10 @@ def run_single(
                     "prompt_class_anti_harm_loss": float(prompt_class_anti_harm.detach().item()),
                     "utility_receive_gate_loss": float(utility_receive_gate_loss.detach().item()),
                     "utility_receive_gate_query_loss": float(utility_receive_gate_query_loss.detach().item()),
+                    "receive_gate_budget": float(receive_gate_budget.detach().item()),
                     "query_proto_alignment_loss": float(query_proto_alignment.detach().item()),
                     "support_query_enabled": float(support_query_stats.get("enabled", False)),
+                    "support_only_prompt_graph": float(support_only_prompt_graph),
                     "support_count": float(support_query_stats.get("support_count", 0)),
                     "query_count": float(support_query_stats.get("query_count", 0)),
                     "train_support_ratio": float(support_query_stats.get("train_support_ratio", 1.0)),
@@ -3425,6 +3538,61 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "runs": results,
         "environment": _environment_info(),
     }
+    diagnostic_summary_keys = [
+        "pool_ratio",
+        "train_pool_ratio",
+        "edge_scale",
+        "prompt_edge_count",
+        "use_multiview_routing",
+        "use_class_aware_routing",
+        "use_attribute_view",
+        "use_enhanced_role_view",
+        "use_pattern_prompt_bank",
+        "semantic_view_weight",
+        "structural_view_weight",
+        "role_view_weight",
+        "attribute_view_weight",
+        "view_gate_entropy",
+        "semantic_route_margin",
+        "structural_route_margin",
+        "role_route_margin",
+        "attribute_route_margin",
+        "receive_gate_mean",
+        "utility_receive_gate_mean",
+        "receive_gate_budget",
+        "prompt_usage_entropy",
+        "prompt_usage_full_entropy",
+        "pattern_prompt_usage_entropy",
+        "dominant_prompt_slot_ratio",
+        "active_prompt_slot_count@0.05",
+        "residual_prompt_usage_ratio",
+        "prompt_message_scale",
+        "prompt_msg_norm",
+        "prompt_to_original_update_norm",
+        "correction_norm",
+        "prompt_update_clip_ratio",
+        "prompt_message_help_loss",
+        "class_balanced_mean_delta_ce",
+        "class_balanced_positive_delta_ratio",
+        "query_class_balanced_mean_delta_ce",
+        "query_class_balanced_positive_delta_ratio",
+        "utility_receive_gate_loss",
+        "utility_receive_gate_query_loss",
+        "support_query_enabled",
+        "support_only_prompt_graph",
+        "support_count",
+        "query_count",
+        "pattern_key_init_coverage",
+    ]
+    for key in diagnostic_summary_keys:
+        values = [
+            float(result["best"][key])
+            for result in results
+            if isinstance(result.get("best"), dict)
+            and isinstance(result["best"].get(key), (int, float))
+        ]
+        if values:
+            summary[f"{key}_mean_std"] = _format_mean_std(values, scale=1.0)
     if diagnostic_mode:
         utility_by_scale: dict[str, dict[str, float]] = {}
         for scale in scale_grid:
@@ -3505,6 +3673,8 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "edge_scale_multiplier",
             "use_multiview_routing",
             "use_class_aware_routing",
+            "use_attribute_view",
+            "use_enhanced_role_view",
             "use_pattern_prompt_bank",
             "use_receiver_only_prompt",
             "use_benefit_gate",
@@ -3515,7 +3685,13 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "semantic_view_weight",
             "structural_view_weight",
             "role_view_weight",
+            "attribute_view_weight",
             "view_gate_entropy",
+            "semantic_route_margin",
+            "structural_route_margin",
+            "role_route_margin",
+            "attribute_route_margin",
+            "prompt_view_prior",
             "mean_prompt_edge_weight",
             "pool_acceptance_mean",
             "pool_acceptance_min",
@@ -3572,6 +3748,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "prompt_class_anti_harm_floor",
             "utility_receive_gate_loss",
             "utility_receive_gate_query_loss",
+            "receive_gate_budget",
             "utility_gate_supervised_count",
             "utility_gate_query_supervised_count",
             "utility_gate_positive_count",
@@ -3584,12 +3761,15 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "utility_gate_query_target_mean",
             "utility_gate_delta_corr_train",
             "utility_gate_query_delta_corr",
+            "utility_gate_label_strategy",
+            "utility_gate_query_label_strategy",
             "query_proto_alignment_loss",
             "query_proto_supervised_count",
             "query_proto_class_count",
             "query_proto_mean_delta_dist",
             "query_proto_positive_ratio",
             "support_query_enabled",
+            "support_only_prompt_graph",
             "support_count",
             "query_count",
             "train_support_ratio",
@@ -3618,6 +3798,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "different_class_route_separation",
             "prompt_usage_entropy",
             "prompt_usage_full_entropy",
+            "pattern_prompt_usage_entropy",
             "dominant_prompt_slot_ratio",
             "active_prompt_slot_count@0.05",
             "prompt_msg_norm",
@@ -3694,6 +3875,8 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "edge_scale_multiplier": result["best"].get("edge_scale_multiplier", 0.0),
                     "use_multiview_routing": result["best"].get("use_multiview_routing", 0.0),
                     "use_class_aware_routing": result["best"].get("use_class_aware_routing", 0.0),
+                    "use_attribute_view": result["best"].get("use_attribute_view", 0.0),
+                    "use_enhanced_role_view": result["best"].get("use_enhanced_role_view", 0.0),
                     "use_pattern_prompt_bank": result["best"].get("use_pattern_prompt_bank", 0.0),
                     "use_receiver_only_prompt": result["best"].get("use_receiver_only_prompt", 0.0),
                     "use_benefit_gate": result["best"].get("use_benefit_gate", 0.0),
@@ -3704,7 +3887,13 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "semantic_view_weight": result["best"].get("semantic_view_weight", 0.0),
                     "structural_view_weight": result["best"].get("structural_view_weight", 0.0),
                     "role_view_weight": result["best"].get("role_view_weight", 0.0),
+                    "attribute_view_weight": result["best"].get("attribute_view_weight", 0.0),
                     "view_gate_entropy": result["best"].get("view_gate_entropy", 0.0),
+                    "semantic_route_margin": result["best"].get("semantic_route_margin", 0.0),
+                    "structural_route_margin": result["best"].get("structural_route_margin", 0.0),
+                    "role_route_margin": result["best"].get("role_route_margin", 0.0),
+                    "attribute_route_margin": result["best"].get("attribute_route_margin", 0.0),
+                    "prompt_view_prior": result["best"].get("prompt_view_prior", 0.0),
                     "mean_prompt_edge_weight": result["best"].get("mean_prompt_edge_weight", 0.0),
                     "pool_acceptance_mean": result["best"].get("pool_acceptance_mean", 1.0),
                     "pool_acceptance_min": result["best"].get("pool_acceptance_min", 1.0),
@@ -3773,6 +3962,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "prompt_class_anti_harm_floor": result["best"].get("prompt_class_anti_harm_floor", 0.0),
                     "utility_receive_gate_loss": result["best"].get("utility_receive_gate_loss", 0.0),
                     "utility_receive_gate_query_loss": result["best"].get("utility_receive_gate_query_loss", 0.0),
+                    "receive_gate_budget": result["best"].get("receive_gate_budget", 0.0),
                     "utility_gate_supervised_count": result["best"].get("utility_gate_supervised_count", 0.0),
                     "utility_gate_query_supervised_count": result["best"].get(
                         "utility_gate_query_supervised_count", 0.0
@@ -3793,12 +3983,15 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "utility_gate_query_target_mean": result["best"].get("utility_gate_query_target_mean", 0.0),
                     "utility_gate_delta_corr_train": result["best"].get("utility_gate_delta_corr_train", 0.0),
                     "utility_gate_query_delta_corr": result["best"].get("utility_gate_query_delta_corr", 0.0),
+                    "utility_gate_label_strategy": result["best"].get("utility_gate_label_strategy", ""),
+                    "utility_gate_query_label_strategy": result["best"].get("utility_gate_query_label_strategy", ""),
                     "query_proto_alignment_loss": result["best"].get("query_proto_alignment_loss", 0.0),
                     "query_proto_supervised_count": result["best"].get("query_proto_supervised_count", 0.0),
                     "query_proto_class_count": result["best"].get("query_proto_class_count", 0.0),
                     "query_proto_mean_delta_dist": result["best"].get("query_proto_mean_delta_dist", 0.0),
                     "query_proto_positive_ratio": result["best"].get("query_proto_positive_ratio", 0.0),
                     "support_query_enabled": result["best"].get("support_query_enabled", 0.0),
+                    "support_only_prompt_graph": result["best"].get("support_only_prompt_graph", 0.0),
                     "support_count": result["best"].get("support_count", 0.0),
                     "query_count": result["best"].get("query_count", 0.0),
                     "train_support_ratio": result["best"].get("train_support_ratio", 1.0),
@@ -3827,6 +4020,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "different_class_route_separation": result["best"].get("different_class_route_separation", 0.0),
                     "prompt_usage_entropy": result["best"].get("prompt_usage_entropy", 0.0),
                     "prompt_usage_full_entropy": result["best"].get("prompt_usage_full_entropy", 0.0),
+                    "pattern_prompt_usage_entropy": result["best"].get("pattern_prompt_usage_entropy", 0.0),
                     "dominant_prompt_slot_ratio": result["best"].get("dominant_prompt_slot_ratio", 0.0),
                     "active_prompt_slot_count@0.05": result["best"].get("active_prompt_slot_count@0.05", 0.0),
                     "prompt_msg_norm": result["best"].get("prompt_msg_norm", 0.0),

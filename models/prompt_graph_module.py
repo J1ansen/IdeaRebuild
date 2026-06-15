@@ -51,6 +51,13 @@ def _normalized_entropy(values: torch.Tensor) -> torch.Tensor:
     return entropy
 
 
+def _mean_route_margin(logits: torch.Tensor) -> torch.Tensor:
+    if logits.ndim != 2 or logits.numel() == 0 or logits.size(1) < 2:
+        return logits.new_tensor(0.0)
+    top2 = torch.topk(logits, k=2, dim=-1).values
+    return (top2[:, 0] - top2[:, 1]).mean()
+
+
 class PromptGraphModuleP1(nn.Module):
     """Build a prompt-augmented graph for the adapted GP2F branch.
 
@@ -111,7 +118,11 @@ class PromptGraphModuleP1(nn.Module):
             self.config.get("hard_acceptance_straight_through", True)
         )
         self.use_multiview_routing = bool(self.config.get("use_multiview_routing", False))
+        self.use_attribute_view = bool(self.config.get("use_attribute_view", False))
+        self.use_enhanced_role_view = bool(self.config.get("use_enhanced_role_view", False))
+        self.view_count = 4 if self.use_attribute_view else 3
         self.view_gate_hidden_dim = int(self.config.get("view_gate_hidden_dim", self.query_hidden_dim))
+        self.role_context_dim = 8 if self.use_enhanced_role_view else 6
         self.role_hidden_dim = int(self.config.get("role_hidden_dim", max(16, self.query_hidden_dim // 2)))
         self.use_pattern_prompt_bank = bool(self.config.get("use_pattern_prompt_bank", False))
         self.use_receiver_only_prompt = bool(self.config.get("use_receiver_only_prompt", False))
@@ -166,20 +177,26 @@ class PromptGraphModuleP1(nn.Module):
             nn.Linear(self.query_hidden_dim, self.query_dim),
         )
         self.role_query_mlp = nn.Sequential(
-            nn.Linear(6, self.role_hidden_dim),
+            nn.Linear(self.role_context_dim, self.role_hidden_dim),
             nn.ReLU(),
             nn.Dropout(self.query_dropout),
             nn.Linear(self.role_hidden_dim, self.query_dim),
         )
-        self.view_gate_mlp = nn.Sequential(
-            nn.Linear(5 * base_dim + 6, self.view_gate_hidden_dim),
+        self.attribute_query_mlp = nn.Sequential(
+            nn.Linear(self.source_dim, self.query_hidden_dim),
             nn.ReLU(),
             nn.Dropout(self.query_dropout),
-            nn.Linear(self.view_gate_hidden_dim, 3),
+            nn.Linear(self.query_hidden_dim, self.query_dim),
+        )
+        self.view_gate_mlp = nn.Sequential(
+            nn.Linear(5 * base_dim + self.role_context_dim, self.view_gate_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.view_gate_hidden_dim, self.view_count),
         )
         rejection_gate_input_dim = 5 * base_dim
         if self.rejection_gate_use_role_context:
-            rejection_gate_input_dim += 6
+            rejection_gate_input_dim += self.role_context_dim
         if self.rejection_gate_use_routing_features:
             rejection_gate_input_dim += 4
         self.rejection_gate_mlp = nn.Sequential(
@@ -198,7 +215,7 @@ class PromptGraphModuleP1(nn.Module):
         )
         nn.init.zeros_(self.benefit_gate_mlp[-1].weight)
         nn.init.constant_(self.benefit_gate_mlp[-1].bias, self.benefit_gate_bias_init)
-        utility_gate_input_dim = 5 * base_dim + 6 + 5
+        utility_gate_input_dim = 5 * base_dim + self.role_context_dim + 5
         self.utility_receive_gate_mlp = nn.Sequential(
             nn.Linear(utility_gate_input_dim, self.utility_receive_gate_hidden_dim),
             nn.ReLU(),
@@ -252,19 +269,31 @@ class PromptGraphModuleP1(nn.Module):
         degree = torch.zeros(base.size(0), dtype=base.dtype, device=base.device)
         if edge_index.numel() > 0:
             degree.index_add_(0, edge_index[1], torch.ones(edge_index.size(1), dtype=base.dtype, device=base.device))
-        role_context = torch.stack(
-            [
+        base_m1_norm = (base - m1).norm(dim=-1)
+        m1_m2_norm = (m1 - m2).norm(dim=-1)
+        role_features = [
+            _minmax_normalize(degree),
+            sim_1.clamp_min(0.0),
+            sim_2.clamp_min(0.0),
+            var_norm,
+            base_m1_norm,
+            m1_m2_norm,
+        ]
+        if self.use_enhanced_role_view:
+            role_features = [
                 _minmax_normalize(degree),
+                _minmax_normalize(torch.log1p(degree)),
                 sim_1.clamp_min(0.0),
                 sim_2.clamp_min(0.0),
+                base_m1_norm,
+                m1_m2_norm,
                 var_norm,
-                (base - m1).norm(dim=-1),
-                (m1 - m2).norm(dim=-1),
-            ],
-            dim=-1,
-        )
+                score,
+            ]
+        role_context = torch.stack(role_features, dim=-1)
         return score, {
             "base": base,
+            "attribute_base": z.detach(),
             "m1": m1,
             "m2": m2,
             "neighbor_variance": var,
@@ -293,7 +322,7 @@ class PromptGraphModuleP1(nn.Module):
                 keys_for_logits = prompt_keys
             logits = query_for_logits @ keys_for_logits.t()
             logits = logits / max(self.tau, 1e-6)
-            view_gate = torch.zeros((pool_idx.numel(), 3), dtype=dtype, device=device)
+            view_gate = torch.zeros((pool_idx.numel(), self.view_count), dtype=dtype, device=device)
             if view_gate.numel() > 0:
                 view_gate[:, 1] = 1.0
             return logits, {
@@ -301,15 +330,19 @@ class PromptGraphModuleP1(nn.Module):
                 "semantic_query": query,
                 "structural_query": query,
                 "role_query": query,
+                "attribute_query": query,
                 "semantic_logits": logits,
                 "structural_logits": logits,
                 "role_logits": logits,
+                "attribute_logits": logits,
                 "view_gate": view_gate,
             }
 
         semantic_query = self.semantic_query_mlp(aux["base"][pool_idx])
         structural_query = self.structural_query_mlp(aux["query_context"][pool_idx])
         role_query = self.role_query_mlp(aux["role_context"][pool_idx])
+        attribute_query = self.attribute_query_mlp(aux["attribute_base"][pool_idx])
+        attribute_keys = self.attribute_query_mlp(self.prompt_node_x.to(dtype=dtype, device=device))
         semantic_keys = self.semantic_prompt_keys.to(dtype=dtype, device=device)
         structural_keys = self.structural_prompt_keys.to(dtype=dtype, device=device)
         role_keys = self.role_prompt_keys.to(dtype=dtype, device=device)
@@ -317,22 +350,30 @@ class PromptGraphModuleP1(nn.Module):
             semantic_query_for_logits = F.normalize(semantic_query, dim=-1, eps=1e-12)
             structural_query_for_logits = F.normalize(structural_query, dim=-1, eps=1e-12)
             role_query_for_logits = F.normalize(role_query, dim=-1, eps=1e-12)
+            attribute_query_for_logits = F.normalize(attribute_query, dim=-1, eps=1e-12)
             semantic_keys_for_logits = F.normalize(semantic_keys, dim=-1, eps=1e-12)
             structural_keys_for_logits = F.normalize(structural_keys, dim=-1, eps=1e-12)
             role_keys_for_logits = F.normalize(role_keys, dim=-1, eps=1e-12)
+            attribute_keys_for_logits = F.normalize(attribute_keys, dim=-1, eps=1e-12)
         else:
             semantic_query_for_logits = semantic_query
             structural_query_for_logits = structural_query
             role_query_for_logits = role_query
+            attribute_query_for_logits = attribute_query
             semantic_keys_for_logits = semantic_keys
             structural_keys_for_logits = structural_keys
             role_keys_for_logits = role_keys
+            attribute_keys_for_logits = attribute_keys
         semantic_logits = semantic_query_for_logits @ semantic_keys_for_logits.t()
         structural_logits = structural_query_for_logits @ structural_keys_for_logits.t()
         role_logits = role_query_for_logits @ role_keys_for_logits.t()
+        attribute_logits = attribute_query_for_logits @ attribute_keys_for_logits.t()
         view_context = torch.cat([aux["query_context"][pool_idx], aux["role_context"][pool_idx]], dim=-1)
         view_gate = torch.softmax(self.view_gate_mlp(view_context), dim=-1)
-        stacked_logits = torch.stack([semantic_logits, structural_logits, role_logits], dim=1)
+        views = [semantic_logits, structural_logits, role_logits]
+        if self.use_attribute_view:
+            views.append(attribute_logits)
+        stacked_logits = torch.stack(views, dim=1)
         logits = (view_gate.unsqueeze(-1) * stacked_logits).sum(dim=1)
         logits = logits / max(self.tau, 1e-6)
         return logits, {
@@ -340,9 +381,11 @@ class PromptGraphModuleP1(nn.Module):
             "semantic_query": semantic_query,
             "structural_query": structural_query,
             "role_query": role_query,
+            "attribute_query": attribute_query,
             "semantic_logits": semantic_logits / max(self.tau, 1e-6),
             "structural_logits": structural_logits / max(self.tau, 1e-6),
             "role_logits": role_logits / max(self.tau, 1e-6),
+            "attribute_logits": attribute_logits / max(self.tau, 1e-6),
             "view_gate": view_gate,
         }
 
@@ -769,16 +812,26 @@ class PromptGraphModuleP1(nn.Module):
             "connected_edge_count": 0,
             "edge_type_counts": [int(edge_index.size(1)), 0, 0],
             "use_multiview_routing": int(self.use_multiview_routing),
-            "view_gate_mean": z.new_tensor([0.0, 1.0, 0.0]),
+            "view_gate_mean": torch.tensor(
+                [0.0, 1.0, 0.0, 0.0] if self.use_attribute_view else [0.0, 1.0, 0.0],
+                dtype=z.dtype,
+                device=z.device,
+            ),
             "view_gate_entropy": z.new_tensor(0.0),
+            "semantic_route_margin": z.new_tensor(0.0),
+            "structural_route_margin": z.new_tensor(0.0),
+            "role_route_margin": z.new_tensor(0.0),
+            "attribute_route_margin": z.new_tensor(0.0),
             "routing_full_prob": z.new_zeros((0, self.num_prompt_nodes)),
             "pool_idx": torch.empty(0, dtype=torch.long, device=z.device),
             "use_class_aware_routing": int(self.use_class_aware_routing),
+            "use_attribute_view": int(self.use_attribute_view),
+            "use_enhanced_role_view": int(self.use_enhanced_role_view),
             "use_pattern_prompt_bank": int(self.use_pattern_prompt_bank),
             "use_receiver_only_prompt": int(self.use_receiver_only_prompt),
             "use_benefit_gate": int(self.use_benefit_gate),
             "num_class_prompt_slots": int(self.num_class_prompt_slots),
-            "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else 0),
+            "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else self.num_prompt_nodes),
             "class_key_proto_init_coverage": float(self.class_key_init_coverage),
             "class_key_proto_init_missing_classes": list(self.class_key_init_missing_classes),
             "pattern_key_init_coverage": float(self.pattern_key_init_coverage),
@@ -986,17 +1039,23 @@ class PromptGraphModuleP1(nn.Module):
                 int(backward_edge_type.numel()),
             ],
             "use_multiview_routing": int(self.use_multiview_routing),
+            "use_attribute_view": int(self.use_attribute_view),
+            "use_enhanced_role_view": int(self.use_enhanced_role_view),
             "view_gate_mean": routing_aux["view_gate"].mean(dim=0),
             "view_gate_entropy": (
                 -(routing_aux["view_gate"] * routing_aux["view_gate"].clamp_min(1e-12).log()).sum(dim=-1).mean()
-                / math.log(3.0)
+                / math.log(float(routing_aux["view_gate"].size(1)))
             ),
+            "semantic_route_margin": _mean_route_margin(routing_aux["semantic_logits"]),
+            "structural_route_margin": _mean_route_margin(routing_aux["structural_logits"]),
+            "role_route_margin": _mean_route_margin(routing_aux["role_logits"]),
+            "attribute_route_margin": _mean_route_margin(routing_aux["attribute_logits"]),
             "use_class_aware_routing": int(self.use_class_aware_routing),
             "use_pattern_prompt_bank": int(self.use_pattern_prompt_bank),
             "use_receiver_only_prompt": int(self.use_receiver_only_prompt),
             "use_benefit_gate": int(self.use_benefit_gate),
             "num_class_prompt_slots": int(self.num_class_prompt_slots),
-            "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else 0),
+            "residual_prompt_count": int(self.residual_prompt_count if self.use_class_aware_routing else self.num_prompt_nodes),
             "class_key_proto_init_coverage": float(self.class_key_init_coverage),
             "class_key_proto_init_missing_classes": list(self.class_key_init_missing_classes),
             "pattern_key_init_coverage": float(self.pattern_key_init_coverage),
@@ -1261,3 +1320,47 @@ def prompt_view_entropy_loss(prompt_out: dict[str, Any]) -> torch.Tensor:
     if isinstance(edge_scale, torch.Tensor):
         return edge_scale.new_tensor(0.0)
     return torch.tensor(0.0)
+
+
+def prompt_view_prior_loss(prompt_out: dict[str, Any], prior: list[float] | tuple[float, ...]) -> torch.Tensor:
+    """Match the average view gate to a configured soft prior."""
+
+    aux = prompt_out.get("aux", {})
+    view_gate = aux.get("view_gate")
+    edge_scale = prompt_out.get("edge_scale")
+    if not (isinstance(view_gate, torch.Tensor) and view_gate.numel() > 0):
+        if isinstance(edge_scale, torch.Tensor):
+            return edge_scale.new_tensor(0.0)
+        return torch.tensor(0.0)
+    target = view_gate.new_tensor(list(prior), dtype=view_gate.dtype)
+    if target.numel() != view_gate.size(1):
+        raise ValueError("view_prior length must match the number of routing views")
+    target = target.clamp_min(0.0)
+    target = target / target.sum().clamp_min(1e-12)
+    return F.mse_loss(view_gate.mean(dim=0), target)
+
+
+def utility_receive_gate_budget_loss(
+    prompt_out: dict[str, Any],
+    *,
+    min_receive: float | None = None,
+    max_receive: float | None = None,
+) -> torch.Tensor:
+    """Soft budget over the node-level effective receive gate."""
+
+    aux = prompt_out.get("aux", {})
+    gates = aux.get("effective_receive_gate", aux.get("receive_gate_score"))
+    edge_scale = prompt_out.get("edge_scale")
+    if not (isinstance(gates, torch.Tensor) and gates.numel() > 0):
+        if isinstance(edge_scale, torch.Tensor):
+            return edge_scale.new_tensor(0.0)
+        return torch.tensor(0.0)
+    mean_gate = gates.mean()
+    losses: list[torch.Tensor] = []
+    if min_receive is not None:
+        losses.append(F.relu(float(min_receive) - mean_gate).pow(2))
+    if max_receive is not None:
+        losses.append(F.relu(mean_gate - float(max_receive)).pow(2))
+    if not losses:
+        return mean_gate.new_tensor(0.0)
+    return torch.stack(losses).sum()
