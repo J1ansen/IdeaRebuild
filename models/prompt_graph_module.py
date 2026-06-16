@@ -96,8 +96,11 @@ class PromptGraphModuleP1(nn.Module):
             raise ValueError("topk_prompt_per_node must be positive")
         self.structural_base = str(self.config.get("structural_base", "z_detached"))
         self.pool_strategy = str(self.config.get("pool_strategy", "structural"))
-        if self.pool_strategy not in {"structural", "random"}:
+        if self.pool_strategy not in {"structural", "random", "utility_structural"}:
             raise ValueError(f"Unsupported pool_strategy={self.pool_strategy!r}")
+        self.utility_pool_structural_weight = float(self.config.get("utility_pool_structural_weight", 0.35))
+        self.utility_pool_uncertainty_weight = float(self.config.get("utility_pool_uncertainty_weight", 0.35))
+        self.utility_pool_disagreement_weight = float(self.config.get("utility_pool_disagreement_weight", 0.30))
         self.random_seed = int(self.config.get("random_seed", 0))
         self.tau = float(self.config.get("tau", 0.5))
         self.normalize_query_key = bool(self.config.get("normalize_query_key", True))
@@ -141,6 +144,10 @@ class PromptGraphModuleP1(nn.Module):
         self.use_hard_receive_gate = bool(self.config.get("use_hard_receive_gate", False))
         self.hard_receive_ratio = float(self.config.get("hard_receive_ratio", 0.15))
         self.hard_receive_straight_through = bool(self.config.get("hard_receive_straight_through", True))
+        self.use_edge_utility = bool(self.config.get("use_edge_utility", False))
+        self.edge_utility_hidden_dim = int(self.config.get("edge_utility_hidden_dim", self.query_hidden_dim))
+        self.edge_utility_init = float(self.config.get("edge_utility_init", 0.50))
+        self.edge_utility_init = min(max(self.edge_utility_init, 1e-6), 1.0 - 1e-6)
         self.class_key_init_coverage = 0.0
         self.class_key_init_missing_classes: list[int] = []
         self.pattern_key_init_coverage = 0.0
@@ -224,6 +231,15 @@ class PromptGraphModuleP1(nn.Module):
         )
         nn.init.zeros_(self.utility_receive_gate_mlp[-1].weight)
         nn.init.constant_(self.utility_receive_gate_mlp[-1].bias, torch.logit(torch.tensor(self.utility_receive_gate_init)).item())
+        edge_utility_input_dim = 3 * self.query_dim + 4 + self.view_count
+        self.edge_utility_mlp = nn.Sequential(
+            nn.Linear(edge_utility_input_dim, self.edge_utility_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.query_dropout),
+            nn.Linear(self.edge_utility_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.edge_utility_mlp[-1].weight)
+        nn.init.constant_(self.edge_utility_mlp[-1].bias, torch.logit(torch.tensor(self.edge_utility_init)).item())
         self.edge_scale_max = float(self.config.get("edge_scale_max", 0.2))
         edge_scale_init = float(self.config.get("edge_scale_init", 0.01))
         self.edge_scale_logit = nn.Parameter(_init_logit(edge_scale_init, self.edge_scale_max))
@@ -301,6 +317,45 @@ class PromptGraphModuleP1(nn.Module):
             "structural_score": score,
             "query_context": context,
             "role_context": role_context,
+        }
+
+    def _utility_pool_score(
+        self,
+        *,
+        structural_score: torch.Tensor,
+        h_pre: torch.Tensor,
+        no_prompt_logits: torch.Tensor | None = None,
+        h_adp_no_prompt: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        structural_component = _minmax_normalize(structural_score.detach()).to(dtype=structural_score.dtype)
+        uncertainty = torch.zeros_like(structural_component)
+        disagreement = torch.zeros_like(structural_component)
+
+        if no_prompt_logits is not None:
+            logits = no_prompt_logits.detach().to(device=structural_score.device, dtype=structural_score.dtype)
+            prob = torch.softmax(logits, dim=-1)
+            entropy = -(prob * prob.clamp_min(1e-12).log()).sum(dim=-1)
+            if logits.size(-1) > 1:
+                entropy = entropy / math.log(float(logits.size(-1)))
+            uncertainty = entropy.clamp_min(0.0)
+
+        if h_adp_no_prompt is not None and h_pre is not None:
+            h_left = h_pre.detach().to(device=structural_score.device, dtype=structural_score.dtype)
+            h_right = h_adp_no_prompt.detach().to(device=structural_score.device, dtype=structural_score.dtype)
+            if h_left.shape == h_right.shape:
+                disagreement = (1.0 - _safe_cosine(h_left, h_right)).clamp_min(0.0)
+                disagreement = _minmax_normalize(disagreement)
+
+        score = (
+            float(self.utility_pool_structural_weight) * structural_component
+            + float(self.utility_pool_uncertainty_weight) * uncertainty
+            + float(self.utility_pool_disagreement_weight) * disagreement
+        )
+        return score, {
+            "pool_score": score,
+            "pool_structural_component": structural_component,
+            "pool_uncertainty_component": uncertainty,
+            "pool_disagreement_component": disagreement,
         }
 
     def _routing_logits(
@@ -637,6 +692,67 @@ class PromptGraphModuleP1(nn.Module):
         benefit_logit = self.benefit_gate_mlp(gate_input).squeeze(-1)
         return torch.sigmoid(benefit_logit), benefit_logit
 
+    def _edge_utility(
+        self,
+        *,
+        aux: dict[str, torch.Tensor],
+        routing_aux: dict[str, torch.Tensor],
+        pool_idx: torch.Tensor,
+        top_prompt_ids: torch.Tensor,
+        assign_prob: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_edge_utility:
+            ones = assign_prob.new_ones(assign_prob.shape)
+            logits_out = torch.full_like(assign_prob, 30.0)
+            return ones, logits_out
+
+        query = routing_aux["structural_query"]
+        if self.use_multiview_routing:
+            keys = self.structural_prompt_keys.to(dtype=query.dtype, device=query.device)
+        else:
+            keys = self.prompt_keys.to(dtype=query.dtype, device=query.device)
+        selected_keys = keys[top_prompt_ids]
+        query_expanded = query.unsqueeze(1).expand_as(selected_keys)
+
+        full_prob = torch.softmax(logits, dim=-1)
+        route_entropy = -(full_prob * full_prob.clamp_min(1e-12).log()).sum(dim=-1)
+        if logits.size(1) > 1:
+            route_entropy = route_entropy / math.log(float(logits.size(1)))
+            top2 = torch.topk(logits, k=2, dim=-1).values
+            route_margin = top2[:, 0] - top2[:, 1]
+        else:
+            route_margin = torch.ones_like(route_entropy)
+        route_margin = _minmax_normalize(route_margin)
+        pool_score = aux.get("pool_score", aux.get("structural_score"))[pool_idx]
+        pool_score = _minmax_normalize(pool_score)
+
+        scalar_features = torch.stack(
+            [
+                assign_prob,
+                route_entropy.unsqueeze(-1).expand_as(assign_prob),
+                route_margin.unsqueeze(-1).expand_as(assign_prob),
+                pool_score.unsqueeze(-1).expand_as(assign_prob),
+            ],
+            dim=-1,
+        )
+        view_gate = routing_aux.get("view_gate")
+        if not isinstance(view_gate, torch.Tensor) or view_gate.numel() == 0:
+            view_gate = assign_prob.new_zeros((assign_prob.size(0), self.view_count))
+        view_features = view_gate.unsqueeze(1).expand(-1, assign_prob.size(1), -1)
+        gate_input = torch.cat(
+            [
+                query_expanded,
+                selected_keys,
+                query_expanded - selected_keys,
+                scalar_features,
+                view_features,
+            ],
+            dim=-1,
+        )
+        edge_logit = self.edge_utility_mlp(gate_input).squeeze(-1)
+        return torch.sigmoid(edge_logit), edge_logit
+
     def _utility_receive_gate(
         self,
         *,
@@ -766,6 +882,7 @@ class PromptGraphModuleP1(nn.Module):
         prompt_node_x = self.prompt_node_x.to(dtype=z.dtype, device=z.device)
         adapted_x = torch.cat([z, prompt_node_x], dim=0)
         usage = z.new_zeros(self.num_prompt_nodes)
+        num_nodes = int(z.size(0))
         aux = {
             **aux,
             "prompt_edge_weight": z.new_zeros(0),
@@ -787,6 +904,12 @@ class PromptGraphModuleP1(nn.Module):
             "benefit_gate_mean": z.new_tensor(0.0),
             "benefit_gate_min": z.new_tensor(0.0),
             "benefit_gate_max": z.new_tensor(0.0),
+            "edge_utility": z.new_zeros((0, self.topk_prompt_per_node)),
+            "edge_utility_logit": z.new_zeros((0, self.topk_prompt_per_node)),
+            "edge_utility_mean": z.new_tensor(0.0),
+            "edge_utility_min": z.new_tensor(0.0),
+            "edge_utility_max": z.new_tensor(0.0),
+            "use_edge_utility": int(self.use_edge_utility),
             "utility_receive_gate": z.new_zeros(0),
             "utility_receive_gate_logit": z.new_zeros(0),
             "utility_receive_gate_raw": z.new_zeros(0),
@@ -806,6 +929,14 @@ class PromptGraphModuleP1(nn.Module):
             "receive_gate_max": z.new_tensor(0.0),
             "raw_edge_scale": self.edge_scale,
             "edge_scale_multiplier": edge_scale_multiplier,
+            "pool_score": aux.get("pool_score", aux.get("structural_score", z.new_zeros(num_nodes))),
+            "pool_structural_component": aux.get("pool_structural_component", aux.get("structural_score", z.new_zeros(num_nodes))),
+            "pool_uncertainty_component": aux.get("pool_uncertainty_component", z.new_zeros(num_nodes)),
+            "pool_disagreement_component": aux.get("pool_disagreement_component", z.new_zeros(num_nodes)),
+            "pool_strategy_id": {"structural": 0, "random": 1, "utility_structural": 2}.get(self.pool_strategy, -1),
+            "pool_selected_ratio": z.new_tensor(float(pool_mask.float().mean().item()) if pool_mask.numel() > 0 else 0.0),
+            "pool_score_mean": z.new_tensor(0.0),
+            "pool_score_selected_mean": z.new_tensor(0.0),
             "capacity_routing_enabled": int(self.use_capacity_routing),
             "prompt_capacity": 0,
             "capacity_overflow_count": 0,
@@ -857,6 +988,8 @@ class PromptGraphModuleP1(nn.Module):
         edge_index: torch.Tensor,
         train_mask: torch.Tensor,
         edge_scale_multiplier: float | torch.Tensor = 1.0,
+        no_prompt_logits: torch.Tensor | None = None,
+        h_adp_no_prompt: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         if edge_index.ndim != 2 or edge_index.size(0) != 2:
             raise ValueError("edge_index must have shape [2, num_edges]")
@@ -873,7 +1006,22 @@ class PromptGraphModuleP1(nn.Module):
         effective_edge_scale = self.edge_scale * multiplier
 
         structural_score, aux = self.structural_scores(z=z, h_pre=h_pre, edge_index=edge_index)
-        pool_mask = self._pool_mask(structural_score, train_mask)
+        if self.pool_strategy == "utility_structural":
+            pool_score, pool_aux = self._utility_pool_score(
+                structural_score=structural_score,
+                h_pre=h_pre,
+                no_prompt_logits=no_prompt_logits,
+                h_adp_no_prompt=h_adp_no_prompt,
+            )
+        else:
+            pool_score, pool_aux = structural_score, {
+                "pool_score": structural_score,
+                "pool_structural_component": _minmax_normalize(structural_score.detach()).to(dtype=dtype),
+                "pool_uncertainty_component": torch.zeros_like(structural_score),
+                "pool_disagreement_component": torch.zeros_like(structural_score),
+            }
+        aux = {**aux, **pool_aux}
+        pool_mask = self._pool_mask(pool_score, train_mask)
         pool_idx = torch.where(pool_mask)[0]
         original_edge_weight = torch.ones(edge_index.size(1), dtype=dtype, device=device)
         if pool_idx.numel() == 0:
@@ -892,7 +1040,7 @@ class PromptGraphModuleP1(nn.Module):
         k = min(self.topk_prompt_per_node, self.num_prompt_nodes)
         top_values, top_prompt_ids, capacity_info = self._capacity_aware_topk(
             logits,
-            priority=structural_score[pool_idx].detach(),
+            priority=pool_score[pool_idx].detach(),
             k=k,
         )
         assign_prob = torch.softmax(top_values, dim=-1)
@@ -916,6 +1064,14 @@ class PromptGraphModuleP1(nn.Module):
             effective_acceptance = hard_acceptance_mask
         benefit_weight, benefit_logit = self._benefit_gate(
             routing_aux=routing_aux,
+            top_prompt_ids=top_prompt_ids,
+            assign_prob=assign_prob,
+            logits=logits,
+        )
+        edge_utility, edge_utility_logit = self._edge_utility(
+            aux=aux,
+            routing_aux=routing_aux,
+            pool_idx=pool_idx,
             top_prompt_ids=top_prompt_ids,
             assign_prob=assign_prob,
             logits=logits,
@@ -946,6 +1102,7 @@ class PromptGraphModuleP1(nn.Module):
                 * assign_prob
                 * benefit_weight
             )
+        prompt_weights = prompt_weights * edge_utility
 
         src_node = pool_idx.repeat_interleave(k)
         dst_prompt = (prompt_offset + top_prompt_ids.reshape(-1)).long()
@@ -999,6 +1156,12 @@ class PromptGraphModuleP1(nn.Module):
             "benefit_gate_mean": benefit_weight.mean(),
             "benefit_gate_min": benefit_weight.min(),
             "benefit_gate_max": benefit_weight.max(),
+            "edge_utility": edge_utility,
+            "edge_utility_logit": edge_utility_logit,
+            "edge_utility_mean": edge_utility.mean(),
+            "edge_utility_min": edge_utility.min(),
+            "edge_utility_max": edge_utility.max(),
+            "use_edge_utility": int(self.use_edge_utility),
             "utility_receive_gate": utility_receive_gate,
             "utility_receive_gate_logit": utility_receive_logit,
             "utility_receive_gate_raw": utility_receive_raw,
@@ -1031,6 +1194,14 @@ class PromptGraphModuleP1(nn.Module):
             "prompt_usage_full_entropy": usage_full_entropy,
             "raw_edge_scale": self.edge_scale,
             "edge_scale_multiplier": multiplier,
+            "pool_score": pool_score,
+            "pool_structural_component": aux["pool_structural_component"],
+            "pool_uncertainty_component": aux["pool_uncertainty_component"],
+            "pool_disagreement_component": aux["pool_disagreement_component"],
+            "pool_strategy_id": {"structural": 0, "random": 1, "utility_structural": 2}.get(self.pool_strategy, -1),
+            "pool_selected_ratio": pool_mask.float().mean(),
+            "pool_score_mean": pool_score.mean(),
+            "pool_score_selected_mean": pool_score[pool_idx].mean(),
             **capacity_info,
             "connected_edge_count": int(prompt_edges.size(1)),
             "edge_type_counts": [

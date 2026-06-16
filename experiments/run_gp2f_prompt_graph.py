@@ -27,7 +27,12 @@ from experiments.run_gp2f_baseline import (
     _split_counts,
     set_seed,
 )
-from models import FaithfulGP2F, PromptAwareGP2F, PromptGraphModuleP1, load_pretrained_gcn
+from models import FaithfulGP2F, HeterophilyAwarePromptAdapter, PromptAwareGP2F, PromptGraphModuleP1, load_pretrained_gcn
+from models.hetero_prompt_adapter import (
+    prompt_adapter_gate_budget_loss,
+    prompt_adapter_message_help_loss,
+    prompt_adapter_update_norm_loss,
+)
 from models.prompt_graph_module import (
     prompt_acceptance_budget_loss,
     prompt_acceptance_loss,
@@ -56,6 +61,10 @@ PROMPT_GRAPH_VARIANTS = {
     "p2_pattern_benefit",
     "p5_multi_expert",
     "p5_lite_receiver",
+    "p13_utility_correction",
+    "p14_freeze_prompt_adapter",
+    "p15_hetero_prompt_adapter",
+    "p16_support_prompt_adapter",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -74,12 +83,87 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
     out = copy.deepcopy(config)
     out.setdefault("experiment", {})["prompt_variant"] = variant
     prompt_graph = out.setdefault("prompt_graph", {})
-    if variant == "noprompt":
+    adapter_variants = {"p14_freeze_prompt_adapter", "p15_hetero_prompt_adapter", "p16_support_prompt_adapter"}
+    if variant == "noprompt" or variant in adapter_variants:
         prompt_graph["enabled"] = False
     else:
         prompt_graph["enabled"] = True
     prompt_aware = out.setdefault("prompt_aware", {})
-    prompt_aware["enabled"] = variant.startswith("p2_") or variant.startswith("p5_")
+    prompt_aware["enabled"] = variant.startswith("p2_") or variant.startswith("p5_") or variant.startswith("p13_")
+    prompt_adapter = out.setdefault("prompt_adapter", {})
+    if variant in adapter_variants:
+        prompt_adapter["enabled"] = True
+        prompt_aware["enabled"] = False
+        prompt_graph["enabled"] = False
+        prompt_graph.setdefault("support_query_split", {"enabled": True, "support_ratio": 0.55, "min_query_per_class": 2, "resample_each_epoch": True})
+        prompt_graph.setdefault("support_only_prompt_graph", False)
+        prompt_graph.setdefault("lambda_edge_l1", 0.0)
+        prompt_graph.setdefault("lambda_prompt_balance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_role_diversity", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_budget", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.0)
+        prompt_graph.setdefault("lambda_prompt_view_entropy", 0.0)
+        prompt_graph.setdefault("lambda_view_prior", 0.0)
+        prompt_graph.setdefault("lambda_class_route", 0.0)
+        prompt_graph.setdefault("lambda_key_proto", 0.0)
+        prompt_graph.setdefault("lambda_prompt_benefit_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_correction", 0.0)
+        prompt_graph.setdefault("lambda_prompt_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_prompt_message_help", 0.0)
+        prompt_graph.setdefault("lambda_prompt_message_help_query", 0.0)
+        prompt_graph.setdefault("lambda_prompt_class_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_utility_receive_gate", 0.0)
+        prompt_graph.setdefault("lambda_utility_receive_gate_query", 0.0)
+        prompt_graph.setdefault("lambda_receive_gate_budget", 0.0)
+        prompt_graph.setdefault("lambda_query_proto_alignment", 0.0)
+        prompt_graph.setdefault("lambda_edge_utility_supervision", 0.0)
+        prompt_graph.setdefault("lambda_correction_alignment", 0.0)
+        prompt_graph.setdefault("lambda_correction_anti_harm", 0.0)
+        prompt_adapter.setdefault("context_base", "z_detached")
+        prompt_adapter.setdefault("use_ego", True)
+        prompt_adapter.setdefault("use_low_frequency", True)
+        prompt_adapter.setdefault("use_two_step", True)
+        prompt_adapter.setdefault("use_high_frequency", True)
+        prompt_adapter.setdefault("use_role_features", True)
+        prompt_adapter.setdefault("hidden_dim", 128)
+        prompt_adapter.setdefault("dropout", 0.2)
+        prompt_adapter.setdefault("zero_init_delta", True)
+        prompt_adapter.setdefault("gate_init", 0.05)
+        prompt_adapter.setdefault("max_update_norm", 0.05)
+        prompt_adapter.setdefault("gate_budget", 0.35)
+        prompt_adapter.setdefault("message_scale", 1.0)
+        training = out.setdefault("training", {})
+        training.setdefault("lambda_prompt_adapter_update_norm", 0.01)
+        training.setdefault("lambda_prompt_adapter_gate_budget", 0.01)
+        training.setdefault("lambda_prompt_adapter_message_help", 0.0)
+        training.setdefault("prompt_adapter_message_help_margin", 0.0)
+        training.setdefault("prompt_adapter_message_help_class_balanced", True)
+        training.setdefault("prompt_adapter_update_mask", "all")
+        training.setdefault("prompt_adapter_loss_mask", "query")
+        if variant == "p14_freeze_prompt_adapter":
+            training["freeze_base_model"] = True
+            training["train_prompt_adapter"] = True
+        elif variant == "p16_support_prompt_adapter":
+            training.setdefault("freeze_base_model", False)
+            training["train_prompt_adapter"] = True
+            if float(training.get("lambda_prompt_adapter_message_help", 0.0)) <= 0.0:
+                training["lambda_prompt_adapter_message_help"] = 0.10
+            if float(training.get("prompt_adapter_message_help_margin", 0.0)) <= 0.0:
+                training["prompt_adapter_message_help_margin"] = 0.005
+            prompt_adapter.setdefault("use_support_context", True)
+            prompt_adapter.setdefault("support_tau", 0.5)
+            prompt_adapter.setdefault("use_support_class_similarity", True)
+            prompt_adapter.setdefault("use_support_proto_residual", True)
+            prompt_adapter.setdefault("use_support_high_residual", True)
+            prompt_adapter.setdefault("gate_init", 0.10)
+            prompt_adapter.setdefault("max_update_norm", 0.08)
+        else:
+            training.setdefault("freeze_base_model", False)
+            training["train_prompt_adapter"] = True
+    else:
+        prompt_adapter["enabled"] = False
     if variant == "p2_no_node_to_prompt":
         prompt_aware["use_node_to_prompt"] = False
         prompt_aware.setdefault("use_prompt_to_node", True)
@@ -94,6 +178,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         "p2_pattern_benefit",
         "p5_multi_expert",
         "p5_lite_receiver",
+        "p13_utility_correction",
     }:
         prompt_aware.setdefault("use_node_to_prompt", True)
         prompt_aware.setdefault("use_prompt_to_node", True)
@@ -180,6 +265,53 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         prompt_graph.setdefault("prompt_message_help_margin", 0.005)
         prompt_graph.setdefault("prompt_message_help_warmup_epochs", 5)
         prompt_graph.setdefault("prompt_message_help_class_balanced", True)
+    if variant == "p13_utility_correction":
+        prompt_aware.setdefault("receiver_version", "v6_classifier_directional")
+        prompt_aware.setdefault("prompt_fusion", "classifier_directional_residual")
+        prompt_aware.setdefault("zero_init_prompt_messages", False)
+        prompt_aware.setdefault("prompt_message_norm", "weighted_mean")
+        prompt_aware.setdefault("use_bounded_prompt_update", True)
+        prompt_aware.setdefault("max_prompt_update_norm", 0.04)
+        prompt_aware.setdefault("use_node_to_prompt", False)
+        prompt_aware.setdefault("use_prompt_to_node", True)
+        prompt_graph.setdefault("use_multiview_routing", True)
+        prompt_graph.setdefault("use_attribute_view", True)
+        prompt_graph.setdefault("use_enhanced_role_view", True)
+        prompt_graph.setdefault("use_class_aware_routing", False)
+        prompt_graph.setdefault("use_pattern_prompt_bank", True)
+        prompt_graph.setdefault("init_class_keys_from_train_proto", False)
+        prompt_graph.setdefault("init_pattern_keys_from_pool_medoids", True)
+        prompt_graph.setdefault("use_benefit_gate", False)
+        prompt_graph.setdefault("use_hard_receive_gate", False)
+        prompt_graph.setdefault("use_hard_acceptance", False)
+        prompt_graph.setdefault("lambda_prompt_balance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_role_diversity", 0.001)
+        prompt_graph.setdefault("lambda_prompt_acceptance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_budget", 0.0)
+        prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.0)
+        prompt_graph.setdefault("lambda_prompt_view_entropy", 0.0)
+        prompt_graph.setdefault("lambda_class_route", 0.0)
+        prompt_graph.setdefault("lambda_key_proto", 0.0)
+        prompt_graph.setdefault("lambda_prompt_benefit_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_correction", 0.0)
+        prompt_graph.setdefault("lambda_prompt_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_prompt_class_anti_harm", 0.0)
+        prompt_graph.setdefault("pool_strategy", "utility_structural")
+        prompt_graph.setdefault("use_edge_utility", True)
+        prompt_graph.setdefault("edge_utility_init", 0.50)
+        prompt_graph.setdefault("utility_pool_structural_weight", 0.35)
+        prompt_graph.setdefault("utility_pool_uncertainty_weight", 0.35)
+        prompt_graph.setdefault("utility_pool_disagreement_weight", 0.30)
+        prompt_graph.setdefault("lambda_edge_utility_supervision", 0.05)
+        prompt_graph.setdefault("edge_utility_margin", 0.0)
+        prompt_graph.setdefault("edge_utility_warmup_epochs", 5)
+        prompt_graph.setdefault("lambda_correction_alignment", 0.05)
+        prompt_graph.setdefault("lambda_correction_anti_harm", 0.05)
+        prompt_graph.setdefault("correction_alignment_margin", 0.0)
+        prompt_graph.setdefault("correction_alignment_warmup_epochs", 5)
+        prompt_aware.setdefault("message_scale", 0.10)
+        prompt_aware.setdefault("message_scale_grid", [0.0, 0.05, 0.10, 0.25])
     if variant == "p2_pattern_benefit":
         prompt_graph["use_multiview_routing"] = True
         prompt_graph["use_pattern_prompt_bank"] = True
@@ -216,6 +348,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         "p2_pattern_benefit",
         "p5_multi_expert",
         "p5_lite_receiver",
+        "p13_utility_correction",
         "p2_no_node_to_prompt",
         "p2_no_prompt_to_node",
     }:
@@ -333,6 +466,21 @@ def _build_prompt_graph_module(
     resolved_cfg = dict(prompt_graph_cfg)
     resolved_cfg.setdefault("num_classes", int(num_classes))
     return PromptGraphModuleP1(source_dim, hidden_dim, resolved_cfg).to(device)
+
+
+def _build_prompt_adapter_module(
+    *,
+    source_dim: int,
+    hidden_dim: int,
+    num_classes: int,
+    prompt_adapter_cfg: dict[str, Any],
+    device: torch.device,
+) -> HeterophilyAwarePromptAdapter | None:
+    if not bool(prompt_adapter_cfg.get("enabled", False)):
+        return None
+    resolved_cfg = dict(prompt_adapter_cfg)
+    resolved_cfg.setdefault("num_classes", int(num_classes))
+    return HeterophilyAwarePromptAdapter(source_dim, hidden_dim, resolved_cfg).to(device)
 
 
 @torch.no_grad()
@@ -493,6 +641,7 @@ def _trainable_parameter_summary(
     input_aligner: InputAligner,
     model: FaithfulGP2F,
     prompt_graph_module: torch.nn.Module | None,
+    prompt_adapter_module: torch.nn.Module | None = None,
 ) -> dict[str, Any]:
     groups: dict[str, list[str]] = {}
     counts: dict[str, int] = {}
@@ -500,6 +649,7 @@ def _trainable_parameter_summary(
         ("input_aligner", input_aligner),
         ("model", model),
         ("prompt_graph_module", prompt_graph_module),
+        ("prompt_adapter_module", prompt_adapter_module),
     ]
     for group_name, module in modules:
         names: list[str] = []
@@ -525,6 +675,7 @@ def _optimizer_groups(
     input_aligner: InputAligner,
     model: FaithfulGP2F,
     prompt_graph_module: torch.nn.Module | None,
+    prompt_adapter_module: torch.nn.Module | None = None,
     training_cfg: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[torch.nn.Parameter], dict[str, float]]:
     base_lr = float(training_cfg.get("lr", 0.001))
@@ -549,7 +700,7 @@ def _optimizer_groups(
         if parameter.requires_grad and id(parameter) not in prompt_aware_param_ids
     ]
     base_params = _trainable_parameters(input_aligner) + model_base_params
-    prompt_params = prompt_aware_params + _trainable_parameters(prompt_graph_module)
+    prompt_params = prompt_aware_params + _trainable_parameters(prompt_graph_module) + _trainable_parameters(prompt_adapter_module)
     groups: list[dict[str, Any]] = []
     if base_params:
         groups.append({"params": base_params, "lr": base_lr, "weight_decay": base_weight_decay, "name": "base"})
@@ -562,6 +713,7 @@ def _optimizer_groups(
         "base_weight_decay": base_weight_decay if base_params else 0.0,
         "prompt_weight_decay": prompt_weight_decay if prompt_params else 0.0,
         "prompt_aware_parameter_count": sum(int(parameter.numel()) for parameter in prompt_aware_params),
+        "prompt_adapter_parameter_count": sum(int(parameter.numel()) for parameter in _trainable_parameters(prompt_adapter_module)),
     }
 
 
@@ -591,6 +743,7 @@ def _load_base_checkpoint(
     model: FaithfulGP2F,
     input_aligner: InputAligner,
     prompt_graph_module: torch.nn.Module | None,
+    prompt_adapter_module: torch.nn.Module | None = None,
     device: torch.device,
     load_prompt: bool = False,
 ) -> None:
@@ -599,6 +752,8 @@ def _load_base_checkpoint(
     input_aligner.load_state_dict(checkpoint["input_aligner"])
     if load_prompt and prompt_graph_module is not None and checkpoint.get("prompt_graph_module") is not None:
         prompt_graph_module.load_state_dict(checkpoint["prompt_graph_module"])
+    if load_prompt and prompt_adapter_module is not None and checkpoint.get("prompt_adapter_module") is not None:
+        prompt_adapter_module.load_state_dict(checkpoint["prompt_adapter_module"])
 
 
 def _save_checkpoint(
@@ -607,6 +762,7 @@ def _save_checkpoint(
     model: FaithfulGP2F,
     input_aligner: InputAligner,
     prompt_graph_module: torch.nn.Module | None,
+    prompt_adapter_module: torch.nn.Module | None = None,
     epoch: int,
     metrics: dict[str, float],
 ) -> None:
@@ -616,6 +772,7 @@ def _save_checkpoint(
             "model": model.state_dict(),
             "input_aligner": input_aligner.state_dict(),
             "prompt_graph_module": prompt_graph_module.state_dict() if prompt_graph_module is not None else None,
+            "prompt_adapter_module": prompt_adapter_module.state_dict() if prompt_adapter_module is not None else None,
             "epoch": int(epoch),
             "metrics": metrics,
         },
@@ -932,6 +1089,48 @@ def _prompt_graph_diagnostics(
             if isinstance(aux.get("benefit_gate_max"), torch.Tensor)
             else 1.0
         ),
+        "use_edge_utility": float(aux.get("use_edge_utility", 0)),
+        "edge_utility_mean": (
+            float(aux["edge_utility_mean"].detach().item())
+            if isinstance(aux.get("edge_utility_mean"), torch.Tensor)
+            else 1.0
+        ),
+        "edge_utility_min": (
+            float(aux["edge_utility_min"].detach().item())
+            if isinstance(aux.get("edge_utility_min"), torch.Tensor)
+            else 1.0
+        ),
+        "edge_utility_max": (
+            float(aux["edge_utility_max"].detach().item())
+            if isinstance(aux.get("edge_utility_max"), torch.Tensor)
+            else 1.0
+        ),
+        "pool_strategy_id": float(aux.get("pool_strategy_id", 0)),
+        "pool_selected_ratio": (
+            float(aux["pool_selected_ratio"].detach().item())
+            if isinstance(aux.get("pool_selected_ratio"), torch.Tensor)
+            else 0.0
+        ),
+        "pool_score_mean": (
+            float(aux["pool_score_mean"].detach().item())
+            if isinstance(aux.get("pool_score_mean"), torch.Tensor)
+            else 0.0
+        ),
+        "pool_score_selected_mean": (
+            float(aux["pool_score_selected_mean"].detach().item())
+            if isinstance(aux.get("pool_score_selected_mean"), torch.Tensor)
+            else 0.0
+        ),
+        "pool_uncertainty_mean": (
+            float(aux["pool_uncertainty_component"].detach().mean().item())
+            if isinstance(aux.get("pool_uncertainty_component"), torch.Tensor)
+            else 0.0
+        ),
+        "pool_disagreement_mean": (
+            float(aux["pool_disagreement_component"].detach().mean().item())
+            if isinstance(aux.get("pool_disagreement_component"), torch.Tensor)
+            else 0.0
+        ),
         "use_utility_receive_gate": float(aux.get("use_utility_receive_gate", 0)),
         "utility_receive_gate_mean": (
             float(aux["utility_receive_gate_mean"].detach().item())
@@ -1096,8 +1295,12 @@ def _forward_prompt_graph(
     edge_index: torch.Tensor,
     train_mask: torch.Tensor,
     edge_scale_multiplier: float | torch.Tensor = 1.0,
+    h_pre: torch.Tensor | None = None,
+    no_prompt_logits: torch.Tensor | None = None,
+    h_adp_no_prompt: torch.Tensor | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    h_pre = model.encode_frozen(z, edge_index)
+    if h_pre is None:
+        h_pre = model.encode_frozen(z, edge_index)
     if prompt_graph_module is None:
         prompt_out = _default_prompt_graph_out(z, edge_index)
     else:
@@ -1107,6 +1310,8 @@ def _forward_prompt_graph(
             edge_index=edge_index,
             train_mask=train_mask,
             edge_scale_multiplier=edge_scale_multiplier,
+            no_prompt_logits=no_prompt_logits,
+            h_adp_no_prompt=h_adp_no_prompt,
         )
     forward_kwargs: dict[str, Any] = {
         "h_pre": h_pre,
@@ -1142,6 +1347,168 @@ def _forward_no_prompt_with_h_pre(
         forward_kwargs["adapted_edge_type"] = prompt_out.get("adapted_edge_type")
         forward_kwargs["prompt_update_mask"] = prompt_out.get("pool_mask")
     return model.forward_with_h_pre(z, edge_index, **forward_kwargs)
+
+
+def _needs_no_prompt_pool_evidence(prompt_graph_module: PromptGraphModuleP1 | None) -> bool:
+    return prompt_graph_module is not None and getattr(prompt_graph_module, "pool_strategy", "") == "utility_structural"
+
+
+def _forward_prompt_adapter(
+    *,
+    model: FaithfulGP2F,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter,
+    z: torch.Tensor,
+    edge_index: torch.Tensor,
+    update_mask: torch.Tensor | None = None,
+    support_mask: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor], dict[str, Any]]:
+    h_pre = model.encode_frozen(z, edge_index)
+    no_prompt_out = _forward_no_prompt_with_h_pre(
+        model=model,
+        z=z,
+        edge_index=edge_index,
+        h_pre=h_pre,
+    )
+    adapter_out = prompt_adapter_module(
+        z=z,
+        edge_index=edge_index,
+        h_adp=no_prompt_out["h_adp"],
+        update_mask=update_mask,
+        support_mask=support_mask,
+        labels=labels,
+    )
+    h_adp = adapter_out["h_adp"]
+    alpha = model.alpha
+    h_mix = alpha * h_pre + (1.0 - alpha) * h_adp
+    logits = model.classifier(h_mix)
+    model_out = {
+        "logits": logits,
+        "h_pre": h_pre,
+        "h_adp": h_adp,
+        "h_mix": h_mix,
+        "alpha": alpha,
+        "h_adp_full": h_adp,
+        "h_pre_shared": h_pre,
+        "prompt_adapter": adapter_out,
+        "no_prompt_logits": no_prompt_out["logits"],
+        "h_adp_no_prompt": no_prompt_out["h_adp"],
+        "h_mix_no_prompt": no_prompt_out["h_mix"],
+    }
+    return model_out, adapter_out, no_prompt_out
+
+
+def _adapter_mask(
+    strategy: str,
+    *,
+    train_mask: torch.Tensor,
+    support_mask: torch.Tensor,
+    query_mask: torch.Tensor,
+) -> torch.Tensor:
+    strategy = str(strategy)
+    if strategy == "all":
+        return torch.ones_like(train_mask, dtype=torch.bool)
+    if strategy == "train":
+        return train_mask.bool()
+    if strategy == "support":
+        return support_mask.bool()
+    if strategy == "query":
+        return query_mask.bool()
+    if strategy == "none":
+        return torch.zeros_like(train_mask, dtype=torch.bool)
+    raise ValueError(f"Unsupported prompt_adapter mask strategy: {strategy}")
+
+
+def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> dict[str, Any]:
+    if adapter_out is None:
+        return {
+            "prompt_adapter_enabled": 0.0,
+            "prompt_adapter_update_norm": 0.0,
+            "prompt_adapter_update_max_norm": 0.0,
+            "prompt_adapter_raw_delta_norm": 0.0,
+            "prompt_adapter_delta_norm": 0.0,
+            "prompt_adapter_gate_mean": 0.0,
+            "prompt_adapter_gate_min": 0.0,
+            "prompt_adapter_gate_max": 0.0,
+            "prompt_adapter_update_mask_ratio": 0.0,
+            "prompt_adapter_clip_ratio": 0.0,
+            "high_frequency_norm": 0.0,
+            "low_frequency_norm": 0.0,
+            "support_context_enabled": 0.0,
+            "support_context_available": 0.0,
+            "support_context_coverage": 0.0,
+            "support_context_count": 0.0,
+            "support_similarity_margin": 0.0,
+            "support_similarity_entropy": 0.0,
+        }
+
+    def scalar(name: str) -> float:
+        value = adapter_out.get(name)
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().mean().item())
+        return 0.0
+
+    return {
+        "prompt_adapter_enabled": 1.0,
+        "prompt_adapter_update_norm": scalar("prompt_update_norm"),
+        "prompt_adapter_update_max_norm": scalar("prompt_update_max_norm"),
+        "prompt_adapter_raw_delta_norm": scalar("prompt_raw_delta_norm"),
+        "prompt_adapter_delta_norm": scalar("prompt_delta_norm"),
+        "prompt_adapter_gate_mean": scalar("prompt_gate_mean"),
+        "prompt_adapter_gate_min": scalar("prompt_gate_min"),
+        "prompt_adapter_gate_max": scalar("prompt_gate_max"),
+        "prompt_adapter_update_mask_ratio": scalar("prompt_update_mask_ratio"),
+        "prompt_adapter_clip_ratio": scalar("prompt_update_clip_ratio"),
+        "high_frequency_norm": scalar("high_frequency_norm"),
+        "low_frequency_norm": scalar("low_frequency_norm"),
+        "support_context_enabled": scalar("support_context_enabled"),
+        "support_context_available": scalar("support_context_available"),
+        "support_context_coverage": scalar("support_context_coverage"),
+        "support_context_count": scalar("support_context_count"),
+        "support_similarity_margin": scalar("support_similarity_margin"),
+        "support_similarity_entropy": scalar("support_similarity_entropy"),
+    }
+
+
+def _prompt_adapter_delta_stats(
+    *,
+    logits_prompt: torch.Tensor,
+    logits_no_prompt: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    prefix: str,
+) -> dict[str, Any]:
+    mask = mask.to(device=logits_prompt.device, dtype=torch.bool)
+    idx = torch.where(mask)[0]
+    if idx.numel() == 0:
+        return {
+            f"{prefix}_mean_delta_ce": 0.0,
+            f"{prefix}_positive_delta_ratio": 0.0,
+            f"{prefix}_mean_ce_no_prompt": 0.0,
+            f"{prefix}_mean_ce_prompt": 0.0,
+            f"{prefix}_count": 0.0,
+            f"{prefix}_delta_ce_by_class": {},
+        }
+    y = labels.to(device=logits_prompt.device)[idx]
+    ce_no = F.cross_entropy(logits_no_prompt.detach()[idx], y, reduction="none")
+    ce_prompt = F.cross_entropy(logits_prompt.detach()[idx], y, reduction="none")
+    delta = ce_no - ce_prompt
+    by_class: dict[str, dict[str, float]] = {}
+    for class_id in torch.unique(y.detach()).tolist():
+        class_mask = y == int(class_id)
+        by_class[str(int(class_id))] = {
+            "count": float(class_mask.sum().item()),
+            "mean_delta_ce": float(delta[class_mask].mean().item()),
+            "positive_delta_ratio": float((delta[class_mask] > 0.0).float().mean().item()),
+        }
+    return {
+        f"{prefix}_mean_delta_ce": float(delta.mean().item()),
+        f"{prefix}_positive_delta_ratio": float((delta > 0.0).float().mean().item()),
+        f"{prefix}_mean_ce_no_prompt": float(ce_no.mean().item()),
+        f"{prefix}_mean_ce_prompt": float(ce_prompt.mean().item()),
+        f"{prefix}_count": float(idx.numel()),
+        f"{prefix}_delta_ce_by_class": by_class,
+    }
 
 
 def _forward_prompt_graph_with_message_scale(
@@ -1626,6 +1993,160 @@ def _prompt_message_help_loss(
     return loss, anti_harm_loss, stats
 
 
+def _edge_utility_supervision_loss(
+    *,
+    prompt_out: dict[str, Any],
+    logits_on: torch.Tensor,
+    logits_off: torch.Tensor,
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    margin: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    aux = prompt_out.get("aux", {})
+    edge_logits = aux.get("edge_utility_logit")
+    pool_idx = aux.get("pool_idx")
+    edge_scale = prompt_out.get("edge_scale")
+    fallback = edge_scale.new_tensor(0.0) if isinstance(edge_scale, torch.Tensor) else logits_on.new_tensor(0.0)
+    empty = {
+        "edge_utility_supervision_loss": 0.0,
+        "edge_utility_supervised_count": 0.0,
+        "edge_utility_positive_count": 0.0,
+        "edge_utility_negative_count": 0.0,
+        "edge_utility_ignored_count": 0.0,
+        "edge_utility_target_mean": 0.0,
+        "edge_utility_delta_ce_mean": 0.0,
+        "edge_utility_delta_ce_positive_ratio": 0.0,
+        "edge_utility_delta_corr_train": 0.0,
+    }
+    if not (isinstance(edge_logits, torch.Tensor) and isinstance(pool_idx, torch.Tensor)):
+        return fallback, empty
+    if edge_logits.numel() == 0 or pool_idx.numel() == 0:
+        return fallback, empty
+
+    train_pool = train_mask.to(device=pool_idx.device, dtype=torch.bool)[pool_idx]
+    if int(train_pool.sum().item()) == 0:
+        return fallback, empty
+
+    pool_train_idx = pool_idx[train_pool]
+    y = labels.to(device=logits_on.device)[pool_train_idx]
+    ce_off = F.cross_entropy(logits_off.detach()[pool_train_idx], y, reduction="none")
+    ce_on = F.cross_entropy(logits_on.detach()[pool_train_idx], y, reduction="none")
+    delta_ce = ce_off - ce_on
+    positive = delta_ce > float(margin)
+    negative = delta_ce < -float(margin)
+    valid = positive | negative
+    ignored = ~valid
+    stats = {
+        **empty,
+        "edge_utility_ignored_count": float(ignored.sum().item()),
+        "edge_utility_delta_ce_mean": float(delta_ce.detach().mean().item()),
+        "edge_utility_delta_ce_positive_ratio": float((delta_ce > 0.0).float().mean().detach().item()),
+    }
+    if int(valid.sum().item()) == 0:
+        return fallback, stats
+
+    selected_logits = edge_logits[train_pool][valid].reshape(-1)
+    targets = positive[valid].to(dtype=selected_logits.dtype).unsqueeze(-1).expand(-1, edge_logits.size(1)).reshape(-1)
+    if bool((targets > 0.5).any()) and bool((targets < 0.5).any()):
+        pos_count = targets.sum().clamp_min(1.0)
+        neg_count = (1.0 - targets).sum().clamp_min(1.0)
+        loss = F.binary_cross_entropy_with_logits(selected_logits, targets, pos_weight=neg_count / pos_count)
+    else:
+        loss = F.binary_cross_entropy_with_logits(selected_logits, targets)
+
+    edge_utility = torch.sigmoid(edge_logits[train_pool]).mean(dim=-1)
+    valid_utility = edge_utility[valid]
+    valid_delta = delta_ce[valid]
+    corr = logits_on.new_tensor(0.0)
+    if valid_utility.numel() > 1 and float(valid_utility.std(unbiased=False).detach().item()) > 1e-12:
+        centered_u = valid_utility - valid_utility.mean()
+        centered_delta = valid_delta - valid_delta.mean()
+        corr = (centered_u * centered_delta).mean() / (
+            centered_u.pow(2).mean().sqrt() * centered_delta.pow(2).mean().sqrt()
+        ).clamp_min(1e-12)
+
+    stats.update(
+        {
+            "edge_utility_supervision_loss": float(loss.detach().item()),
+            "edge_utility_supervised_count": float(valid.sum().item()),
+            "edge_utility_positive_count": float(positive[valid].sum().item()),
+            "edge_utility_negative_count": float(negative[valid].sum().item()),
+            "edge_utility_ignored_count": float(ignored.sum().item()),
+            "edge_utility_target_mean": float(targets.detach().mean().item()),
+            "edge_utility_delta_corr_train": float(corr.detach().item()),
+        }
+    )
+    return loss, stats
+
+
+def _correction_alignment_losses(
+    *,
+    model: FaithfulGP2F,
+    prompt_out: dict[str, Any],
+    h_on: torch.Tensor,
+    h_off: torch.Tensor,
+    logits_on: torch.Tensor,
+    logits_off: torch.Tensor,
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    margin: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    pool_mask = prompt_out.get("pool_mask")
+    edge_scale = prompt_out.get("edge_scale")
+    fallback = edge_scale.new_tensor(0.0) if isinstance(edge_scale, torch.Tensor) else h_on.new_tensor(0.0)
+    empty = {
+        "correction_alignment_loss": 0.0,
+        "correction_alignment_anti_harm_loss": 0.0,
+        "correction_alignment_node_count": 0.0,
+        "correction_alignment_harmful_count": 0.0,
+        "correction_alignment_cosine_mean": 0.0,
+        "correction_alignment_delta_h_norm": 0.0,
+        "correction_alignment_delta_ce_mean": 0.0,
+    }
+    if not isinstance(pool_mask, torch.Tensor):
+        return fallback, fallback, empty
+    eligible = train_mask.to(device=pool_mask.device, dtype=torch.bool) & pool_mask.bool()
+    idx = torch.where(eligible)[0]
+    if idx.numel() == 0:
+        return fallback, fallback, empty
+    classifier = getattr(model, "classifier", None)
+    if classifier is None or not hasattr(classifier, "weight"):
+        return fallback, fallback, empty
+
+    y = labels.to(device=h_on.device)[idx]
+    ce_off = F.cross_entropy(logits_off.detach()[idx], y, reduction="none")
+    ce_on = F.cross_entropy(logits_on.detach()[idx], y, reduction="none")
+    delta_ce = ce_off - ce_on
+    helpful = delta_ce > float(margin)
+    harmful = delta_ce < -float(margin)
+    delta_h = h_on[idx] - h_off.detach()[idx]
+    delta_norm = delta_h.norm(dim=-1)
+    class_direction = classifier.weight.detach().to(device=h_on.device, dtype=h_on.dtype)[y]
+    cosine = F.cosine_similarity(delta_h, class_direction, dim=-1, eps=1e-12)
+
+    if int(helpful.sum().item()) > 0:
+        alignment_loss = (1.0 - cosine[helpful]).mean()
+        cosine_mean = cosine[helpful].detach().mean()
+    else:
+        alignment_loss = fallback
+        cosine_mean = fallback
+    if int(harmful.sum().item()) > 0:
+        anti_harm_loss = delta_norm[harmful].mean()
+    else:
+        anti_harm_loss = fallback
+
+    stats = {
+        "correction_alignment_loss": float(alignment_loss.detach().item()),
+        "correction_alignment_anti_harm_loss": float(anti_harm_loss.detach().item()),
+        "correction_alignment_node_count": float(helpful.sum().item()),
+        "correction_alignment_harmful_count": float(harmful.sum().item()),
+        "correction_alignment_cosine_mean": float(cosine_mean.detach().item()),
+        "correction_alignment_delta_h_norm": float(delta_norm.detach().mean().item()),
+        "correction_alignment_delta_ce_mean": float(delta_ce.detach().mean().item()),
+    }
+    return alignment_loss, anti_harm_loss, stats
+
+
 def _query_proto_alignment_loss(
     *,
     h_on: torch.Tensor,
@@ -1934,13 +2455,47 @@ def _init_equivalence(
     x: torch.Tensor,
     edge_index: torch.Tensor,
     train_mask: torch.Tensor,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter | None = None,
 ) -> dict[str, float]:
     model.eval()
     input_aligner.eval()
     if prompt_graph_module is not None:
         prompt_graph_module.eval()
+    if prompt_adapter_module is not None:
+        prompt_adapter_module.eval()
     z = input_aligner(x)
+    if prompt_adapter_module is not None:
+        h_pre = model.encode_frozen(z, edge_index)
+        baseline = _forward_no_prompt_with_h_pre(
+            model=model,
+            z=z,
+            edge_index=edge_index,
+            h_pre=h_pre,
+        )
+        prompted, adapter_out, _ = _forward_prompt_adapter(
+            model=model,
+            prompt_adapter_module=prompt_adapter_module,
+            z=z,
+            edge_index=edge_index,
+            update_mask=torch.ones_like(train_mask, dtype=torch.bool),
+        )
+        return {
+            "init_original_x_delta": 0.0,
+            "init_logit_delta": float((prompted["logits"] - baseline["logits"]).abs().max().item()),
+            "init_logit_delta_full_edge_scale": float((prompted["logits"] - baseline["logits"]).abs().max().item()),
+            "init_prompt_adapter_update_norm": float(adapter_out["prompt_update_norm"].detach().item()),
+        }
     baseline = model(z, edge_index, return_aux=True)
+    h_pre = None
+    no_prompt_out = None
+    if _needs_no_prompt_pool_evidence(prompt_graph_module):
+        h_pre = model.encode_frozen(z, edge_index)
+        no_prompt_out = _forward_no_prompt_with_h_pre(
+            model=model,
+            z=z,
+            edge_index=edge_index,
+            h_pre=h_pre,
+        )
     prompted_zero, prompt_out_zero = _forward_prompt_graph(
         model=model,
         prompt_graph_module=prompt_graph_module,
@@ -1948,6 +2503,9 @@ def _init_equivalence(
         edge_index=edge_index,
         train_mask=train_mask,
         edge_scale_multiplier=0.0,
+        h_pre=h_pre,
+        no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
+        h_adp_no_prompt=None if no_prompt_out is None else no_prompt_out["h_adp"],
     )
     prompted_full, _ = _forward_prompt_graph(
         model=model,
@@ -1956,6 +2514,9 @@ def _init_equivalence(
         edge_index=edge_index,
         train_mask=train_mask,
         edge_scale_multiplier=1.0,
+        h_pre=h_pre,
+        no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
+        h_adp_no_prompt=None if no_prompt_out is None else no_prompt_out["h_adp"],
     )
     return {
         "init_original_x_delta": float((prompt_out_zero["adapted_x"][: z.size(0)] - z).abs().max().item()),
@@ -1978,12 +2539,87 @@ def evaluate_prompt_graph(
     test_mask: torch.Tensor,
     num_classes: int,
     edge_scale_multiplier: float = 1.0,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter | None = None,
 ) -> dict[str, Any]:
     model.eval()
     input_aligner.eval()
     if prompt_graph_module is not None:
         prompt_graph_module.eval()
     z = input_aligner(x)
+    if prompt_adapter_module is not None:
+        prompt_adapter_module.eval()
+        update_mask = torch.ones_like(train_mask, dtype=torch.bool)
+        model_out, adapter_out, no_prompt_out = _forward_prompt_adapter(
+            model=model,
+            prompt_adapter_module=prompt_adapter_module,
+            z=z,
+            edge_index=edge_index,
+            update_mask=update_mask,
+            support_mask=train_mask,
+            labels=labels,
+        )
+        logits = model_out["logits"]
+        branch_cosine = torch.nn.functional.cosine_similarity(model_out["h_pre"], model_out["h_adp"], dim=-1).mean()
+        train = split_metrics(logits, labels, train_mask, num_classes=num_classes)
+        val = split_metrics(logits, labels, val_mask, num_classes=num_classes)
+        test = split_metrics(logits, labels, test_mask, num_classes=num_classes)
+        adapter_diag = _prompt_adapter_diagnostics(adapter_out)
+        adapter_diag.update(
+            _prompt_adapter_delta_stats(
+                logits_prompt=logits,
+                logits_no_prompt=no_prompt_out["logits"],
+                labels=labels,
+                mask=train_mask,
+                prefix="adapter_train",
+            )
+        )
+        adapter_diag.update(
+            _prompt_adapter_delta_stats(
+                logits_prompt=logits,
+                logits_no_prompt=no_prompt_out["logits"],
+                labels=labels,
+                mask=val_mask,
+                prefix="adapter_val",
+            )
+        )
+        adapter_diag.update(
+            _prompt_adapter_delta_stats(
+                logits_prompt=logits,
+                logits_no_prompt=no_prompt_out["logits"],
+                labels=labels,
+                mask=test_mask,
+                prefix="adapter_test",
+            )
+        )
+        return {
+            "train_acc": train["acc"],
+            "train_macro_f1": train["macro_f1"],
+            "val_acc": val["acc"],
+            "val_macro_f1": val["macro_f1"],
+            "test_acc": test["acc"],
+            "test_macro_f1": test["macro_f1"],
+            "alpha": float(model_out["alpha"].detach().item()),
+            "branch_cosine": float(branch_cosine.detach().item()),
+            "pool_ratio": 1.0,
+            "train_pool_ratio": 1.0,
+            "prompt_node_count": 0,
+            "prompt_edge_count": 0,
+            "edge_scale": 0.0,
+            "raw_edge_scale": 0.0,
+            "edge_scale_multiplier": 0.0,
+            "mean_prompt_edge_weight": 0.0,
+            **adapter_diag,
+        }
+    h_pre = None
+    no_prompt_out = None
+    if _needs_no_prompt_pool_evidence(prompt_graph_module):
+        h_pre = model.encode_frozen(z, edge_index)
+        no_prompt_out = _forward_no_prompt_with_h_pre(
+            model=model,
+            z=z,
+            edge_index=edge_index,
+            h_pre=h_pre,
+        )
     model_out, prompt_out = _forward_prompt_graph(
         model=model,
         prompt_graph_module=prompt_graph_module,
@@ -1991,6 +2627,9 @@ def evaluate_prompt_graph(
         edge_index=edge_index,
         train_mask=train_mask,
         edge_scale_multiplier=edge_scale_multiplier,
+        h_pre=h_pre,
+        no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
+        h_adp_no_prompt=None if no_prompt_out is None else no_prompt_out["h_adp"],
     )
     logits = model_out["logits"]
     branch_cosine = torch.nn.functional.cosine_similarity(model_out["h_pre"], model_out["h_adp"], dim=-1).mean()
@@ -2205,6 +2844,16 @@ def diagnose_prompt_message_utility(
 
     try:
         z = input_aligner(x)
+        h_pre = None
+        model_no_prompt = None
+        if _needs_no_prompt_pool_evidence(prompt_graph_module):
+            h_pre = model.encode_frozen(z, edge_index)
+            model_no_prompt = _forward_no_prompt_with_h_pre(
+                model=model,
+                z=z,
+                edge_index=edge_index,
+                h_pre=h_pre,
+            )
         model_prompt, prompt_out = _forward_prompt_graph(
             model=model,
             prompt_graph_module=prompt_graph_module,
@@ -2212,13 +2861,17 @@ def diagnose_prompt_message_utility(
             edge_index=edge_index,
             train_mask=train_mask,
             edge_scale_multiplier=1.0,
+            h_pre=h_pre,
+            no_prompt_logits=None if model_no_prompt is None else model_no_prompt["logits"],
+            h_adp_no_prompt=None if model_no_prompt is None else model_no_prompt["h_adp"],
         )
-        model_no_prompt = _forward_no_prompt_with_h_pre(
-            model=model,
-            z=z,
-            edge_index=edge_index,
-            h_pre=model_prompt["h_pre_shared"],
-        )
+        if model_no_prompt is None:
+            model_no_prompt = _forward_no_prompt_with_h_pre(
+                model=model,
+                z=z,
+                edge_index=edge_index,
+                h_pre=model_prompt["h_pre_shared"],
+            )
     finally:
         if old_scale is not None:
             model.prompt_message_scale = old_scale
@@ -2382,6 +3035,7 @@ def run_single(
     model_cfg = config.get("model", {})
     prompt_graph_cfg = config.get("prompt_graph", {})
     prompt_aware_cfg = config.get("prompt_aware", {})
+    prompt_adapter_cfg = config.get("prompt_adapter", {})
     training_cfg = config.get("training", {})
 
     seed = int(experiment_cfg.get("seed", 0))
@@ -2446,14 +3100,27 @@ def run_single(
         prompt_graph_cfg=prompt_graph_cfg,
         device=device,
     )
+    prompt_adapter_module = _build_prompt_adapter_module(
+        source_dim=source_dim,
+        hidden_dim=hidden_dim,
+        num_classes=loaded.num_classes,
+        prompt_adapter_cfg=prompt_adapter_cfg,
+        device=device,
+    )
 
     base_checkpoint_path = _resolve_base_checkpoint(training_cfg, repo_root=repo_root, seed=seed)
+    if variant == "p14_freeze_prompt_adapter" and base_checkpoint_path is None:
+        print(
+            "Warning: p14_freeze_prompt_adapter is running without a base checkpoint; "
+            "the frozen classifier is randomly initialized, so this run is only a code-path smoke test."
+        )
     if base_checkpoint_path is not None:
         _load_base_checkpoint(
             base_checkpoint_path,
             model=model,
             input_aligner=input_aligner,
             prompt_graph_module=prompt_graph_module,
+            prompt_adapter_module=prompt_adapter_module,
             device=device,
             load_prompt=bool(training_cfg.get("load_prompt_from_base_checkpoint", False)),
         )
@@ -2500,16 +3167,20 @@ def run_single(
         )
     if prompt_graph_module is not None:
         _set_module_trainable(prompt_graph_module, bool(training_cfg.get("train_prompt_graph_module", True)))
+    if prompt_adapter_module is not None:
+        _set_module_trainable(prompt_adapter_module, bool(training_cfg.get("train_prompt_adapter", True)))
 
     trainable_summary = _trainable_parameter_summary(
         input_aligner=input_aligner,
         model=model,
         prompt_graph_module=prompt_graph_module,
+        prompt_adapter_module=prompt_adapter_module,
     )
     optimizer_groups, trainable_params, optimizer_summary = _optimizer_groups(
         input_aligner=input_aligner,
         model=model,
         prompt_graph_module=prompt_graph_module,
+        prompt_adapter_module=prompt_adapter_module,
         training_cfg=training_cfg,
     )
     if not trainable_params:
@@ -2531,6 +3202,7 @@ def run_single(
         x=graph.x,
         edge_index=graph.edge_index,
         train_mask=split.train_mask,
+        prompt_adapter_module=prompt_adapter_module,
     )
 
     epochs = int(training_cfg.get("epochs", 200))
@@ -2608,6 +3280,23 @@ def run_single(
     query_proto_alignment_warmup_epochs = int(prompt_graph_cfg.get("query_proto_alignment_warmup_epochs", 0))
     query_proto_margin = float(prompt_graph_cfg.get("query_proto_margin", 0.005))
     query_proto_class_balanced = bool(prompt_graph_cfg.get("query_proto_class_balanced", True))
+    lambda_edge_utility_supervision = float(prompt_graph_cfg.get("lambda_edge_utility_supervision", 0.0))
+    edge_utility_margin = float(prompt_graph_cfg.get("edge_utility_margin", 0.0))
+    edge_utility_warmup_epochs = int(prompt_graph_cfg.get("edge_utility_warmup_epochs", 0))
+    lambda_correction_alignment = float(prompt_graph_cfg.get("lambda_correction_alignment", 0.0))
+    lambda_correction_anti_harm = float(prompt_graph_cfg.get("lambda_correction_anti_harm", 0.0))
+    correction_alignment_margin = float(prompt_graph_cfg.get("correction_alignment_margin", 0.0))
+    correction_alignment_warmup_epochs = int(prompt_graph_cfg.get("correction_alignment_warmup_epochs", 0))
+    lambda_prompt_adapter_update_norm = float(training_cfg.get("lambda_prompt_adapter_update_norm", 0.0))
+    lambda_prompt_adapter_gate_budget = float(training_cfg.get("lambda_prompt_adapter_gate_budget", 0.0))
+    lambda_prompt_adapter_message_help = float(training_cfg.get("lambda_prompt_adapter_message_help", 0.0))
+    prompt_adapter_message_help_margin = float(training_cfg.get("prompt_adapter_message_help_margin", 0.0))
+    prompt_adapter_message_help_class_balanced = bool(
+        training_cfg.get("prompt_adapter_message_help_class_balanced", True)
+    )
+    prompt_adapter_update_mask_strategy = str(training_cfg.get("prompt_adapter_update_mask", "all"))
+    prompt_adapter_loss_mask_strategy = str(training_cfg.get("prompt_adapter_loss_mask", "query"))
+    prompt_adapter_gate_budget = float(prompt_adapter_cfg.get("gate_budget", 0.35))
     support_query_enabled = bool(
         prompt_graph_cfg.get("support_query_split", {}).get(
             "enabled", prompt_graph_cfg.get("support_query_split_enabled", False)
@@ -2634,6 +3323,8 @@ def run_single(
         input_aligner.train()
         if prompt_graph_module is not None:
             prompt_graph_module.train()
+        if prompt_adapter_module is not None:
+            prompt_adapter_module.train()
         optimizer.zero_grad()
 
         support_mask, query_mask, support_query_stats = _support_query_masks_for_epoch(
@@ -2650,15 +3341,94 @@ def run_single(
         )
         z = input_aligner(graph.x)
         current_edge_scale_multiplier = _edge_scale_multiplier(epoch, prompt_graph_cfg)
-        model_out, prompt_out = _forward_prompt_graph(
-            model=model,
-            prompt_graph_module=prompt_graph_module,
-            z=z,
-            edge_index=graph.edge_index,
-            train_mask=prompt_graph_train_mask,
-            edge_scale_multiplier=current_edge_scale_multiplier,
-        )
-        cls_loss = F.cross_entropy(model_out["logits"][split.train_mask], graph.y[split.train_mask])
+        adapter_out: dict[str, torch.Tensor] | None = None
+        adapter_train_stats: dict[str, Any] = {}
+        prompt_adapter_update_norm = z.new_tensor(0.0)
+        prompt_adapter_budget = z.new_tensor(0.0)
+        prompt_adapter_message_help = z.new_tensor(0.0)
+        prompt_adapter_message_help_stats = {
+            "prompt_adapter_message_help_loss": 0.0,
+            "prompt_adapter_message_help_mean_delta_ce": 0.0,
+            "prompt_adapter_message_help_positive_ratio": 0.0,
+            "prompt_adapter_message_help_count": 0.0,
+        }
+        no_prompt_out: dict[str, Any] | None = None
+        if prompt_adapter_module is not None:
+            adapter_update_mask = _adapter_mask(
+                prompt_adapter_update_mask_strategy,
+                train_mask=split.train_mask,
+                support_mask=support_mask,
+                query_mask=prompt_query_mask,
+            )
+            adapter_loss_mask = _adapter_mask(
+                prompt_adapter_loss_mask_strategy,
+                train_mask=split.train_mask,
+                support_mask=support_mask,
+                query_mask=prompt_query_mask,
+            )
+            if int(adapter_loss_mask.sum().item()) == 0:
+                adapter_loss_mask = split.train_mask.bool()
+            model_out, adapter_out, no_prompt_out = _forward_prompt_adapter(
+                model=model,
+                prompt_adapter_module=prompt_adapter_module,
+                z=z,
+                edge_index=graph.edge_index,
+                update_mask=adapter_update_mask,
+                support_mask=support_mask,
+                labels=graph.y,
+            )
+            prompt_out = _default_prompt_graph_out(z, graph.edge_index)
+            cls_loss = F.cross_entropy(model_out["logits"][adapter_loss_mask], graph.y[adapter_loss_mask])
+            prompt_adapter_update_norm = prompt_adapter_update_norm_loss(adapter_out, adapter_update_mask)
+            prompt_adapter_budget = prompt_adapter_gate_budget_loss(
+                adapter_out,
+                max_gate=prompt_adapter_gate_budget,
+                mask=adapter_update_mask,
+            )
+            if lambda_prompt_adapter_message_help > 0.0:
+                prompt_adapter_message_help, prompt_adapter_message_help_stats = prompt_adapter_message_help_loss(
+                    logits_prompt=model_out["logits"],
+                    logits_no_prompt=no_prompt_out["logits"],
+                    labels=graph.y,
+                    mask=adapter_loss_mask,
+                    margin=prompt_adapter_message_help_margin,
+                    class_balanced=prompt_adapter_message_help_class_balanced,
+                )
+            adapter_train_stats = _prompt_adapter_diagnostics(adapter_out)
+            adapter_train_stats.update(
+                _prompt_adapter_delta_stats(
+                    logits_prompt=model_out["logits"],
+                    logits_no_prompt=no_prompt_out["logits"],
+                    labels=graph.y,
+                    mask=adapter_loss_mask,
+                    prefix="adapter_query",
+                )
+            )
+        else:
+            pool_needs_no_prompt = _needs_no_prompt_pool_evidence(prompt_graph_module)
+            h_pre_for_prompt: torch.Tensor | None = None
+            no_prompt_out = None
+            if pool_needs_no_prompt:
+                h_pre_for_prompt = model.encode_frozen(z, graph.edge_index)
+                with torch.no_grad():
+                    no_prompt_out = _forward_no_prompt_with_h_pre(
+                        model=model,
+                        z=z,
+                        edge_index=graph.edge_index,
+                        h_pre=h_pre_for_prompt,
+                    )
+            model_out, prompt_out = _forward_prompt_graph(
+                model=model,
+                prompt_graph_module=prompt_graph_module,
+                z=z,
+                edge_index=graph.edge_index,
+                train_mask=prompt_graph_train_mask,
+                edge_scale_multiplier=current_edge_scale_multiplier,
+                h_pre=h_pre_for_prompt,
+                no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
+                h_adp_no_prompt=None if no_prompt_out is None else no_prompt_out["h_adp"],
+            )
+            cls_loss = F.cross_entropy(model_out["logits"][split.train_mask], graph.y[split.train_mask])
         edge_l1 = prompt_edge_l1_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_balance = prompt_balance_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_role_diversity = (
@@ -2706,10 +3476,17 @@ def run_single(
                     lambda_query_proto_alignment > 0.0
                     and epoch > query_proto_alignment_warmup_epochs
                 )
+                or (
+                    lambda_edge_utility_supervision > 0.0
+                    and epoch > edge_utility_warmup_epochs
+                )
+                or (
+                    (lambda_correction_alignment > 0.0 or lambda_correction_anti_harm > 0.0)
+                    and epoch > correction_alignment_warmup_epochs
+                )
             )
         )
-        no_prompt_out = None
-        if needs_no_prompt_delta:
+        if needs_no_prompt_delta and no_prompt_out is None:
             with torch.no_grad():
                 no_prompt_out = _forward_no_prompt_with_h_pre(
                     model=model,
@@ -3007,6 +3784,64 @@ def run_single(
                 "query_proto_class_balanced": float(query_proto_class_balanced),
                 "query_proto_by_class": {},
             }
+        if (
+            prompt_graph_module is not None
+            and lambda_edge_utility_supervision > 0.0
+            and epoch > edge_utility_warmup_epochs
+            and no_prompt_out is not None
+        ):
+            edge_utility_supervision, edge_utility_stats = _edge_utility_supervision_loss(
+                prompt_out=prompt_out,
+                logits_on=model_out["logits"],
+                logits_off=no_prompt_out["logits"],
+                labels=graph.y,
+                train_mask=prompt_supervision_mask,
+                margin=edge_utility_margin,
+            )
+        else:
+            edge_utility_supervision = z.new_tensor(0.0)
+            edge_utility_stats = {
+                "edge_utility_supervision_loss": 0.0,
+                "edge_utility_supervised_count": 0.0,
+                "edge_utility_positive_count": 0.0,
+                "edge_utility_negative_count": 0.0,
+                "edge_utility_ignored_count": 0.0,
+                "edge_utility_target_mean": 0.0,
+                "edge_utility_delta_ce_mean": 0.0,
+                "edge_utility_delta_ce_positive_ratio": 0.0,
+                "edge_utility_delta_corr_train": 0.0,
+            }
+        if (
+            prompt_graph_module is not None
+            and (lambda_correction_alignment > 0.0 or lambda_correction_anti_harm > 0.0)
+            and epoch > correction_alignment_warmup_epochs
+            and no_prompt_out is not None
+        ):
+            correction_alignment, correction_alignment_anti_harm, correction_alignment_stats = (
+                _correction_alignment_losses(
+                    model=model,
+                    prompt_out=prompt_out,
+                    h_on=model_out["h_adp"],
+                    h_off=no_prompt_out["h_adp"],
+                    logits_on=model_out["logits"],
+                    logits_off=no_prompt_out["logits"],
+                    labels=graph.y,
+                    train_mask=prompt_supervision_mask,
+                    margin=correction_alignment_margin,
+                )
+            )
+        else:
+            correction_alignment = z.new_tensor(0.0)
+            correction_alignment_anti_harm = z.new_tensor(0.0)
+            correction_alignment_stats = {
+                "correction_alignment_loss": 0.0,
+                "correction_alignment_anti_harm_loss": 0.0,
+                "correction_alignment_node_count": 0.0,
+                "correction_alignment_harmful_count": 0.0,
+                "correction_alignment_cosine_mean": 0.0,
+                "correction_alignment_delta_h_norm": 0.0,
+                "correction_alignment_delta_ce_mean": 0.0,
+            }
         prompt_usage_consistency = (
             prompt_usage_consistency_loss(
                 prompt_out,
@@ -3066,6 +3901,12 @@ def run_single(
             + lambda_utility_receive_gate_query * utility_receive_gate_query_loss
             + lambda_receive_gate_budget * receive_gate_budget
             + lambda_query_proto_alignment * query_proto_alignment
+            + lambda_edge_utility_supervision * edge_utility_supervision
+            + lambda_correction_alignment * correction_alignment
+            + lambda_correction_anti_harm * correction_alignment_anti_harm
+            + lambda_prompt_adapter_update_norm * prompt_adapter_update_norm
+            + lambda_prompt_adapter_gate_budget * prompt_adapter_budget
+            + lambda_prompt_adapter_message_help * prompt_adapter_message_help
         )
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite loss at epoch {epoch}: {loss.item()}")
@@ -3104,6 +3945,12 @@ def run_single(
             "utility_receive_gate_query_loss": float(utility_receive_gate_query_loss.detach().item()),
             "receive_gate_budget": float(receive_gate_budget.detach().item()),
             "query_proto_alignment_loss": float(query_proto_alignment.detach().item()),
+            "edge_utility_supervision_loss": float(edge_utility_supervision.detach().item()),
+            "correction_alignment_loss": float(correction_alignment.detach().item()),
+            "correction_alignment_anti_harm_loss": float(correction_alignment_anti_harm.detach().item()),
+            "prompt_adapter_update_norm_loss": float(prompt_adapter_update_norm.detach().item()),
+            "prompt_adapter_gate_budget_loss": float(prompt_adapter_budget.detach().item()),
+            "prompt_adapter_message_help_loss": float(prompt_adapter_message_help.detach().item()),
             "lambda_edge_l1": lambda_edge_l1,
             "lambda_prompt_balance": lambda_prompt_balance,
             "lambda_prompt_role_diversity": lambda_prompt_role_diversity,
@@ -3125,6 +3972,21 @@ def run_single(
             "lambda_utility_receive_gate_query": lambda_utility_receive_gate_query,
             "lambda_receive_gate_budget": lambda_receive_gate_budget,
             "lambda_query_proto_alignment": lambda_query_proto_alignment,
+            "lambda_edge_utility_supervision": lambda_edge_utility_supervision,
+            "lambda_correction_alignment": lambda_correction_alignment,
+            "lambda_correction_anti_harm": lambda_correction_anti_harm,
+            "lambda_prompt_adapter_update_norm": lambda_prompt_adapter_update_norm,
+            "lambda_prompt_adapter_gate_budget": lambda_prompt_adapter_gate_budget,
+            "lambda_prompt_adapter_message_help": lambda_prompt_adapter_message_help,
+            "prompt_adapter_message_help_margin": prompt_adapter_message_help_margin,
+            "prompt_adapter_message_help_class_balanced": float(prompt_adapter_message_help_class_balanced),
+            "prompt_adapter_update_mask_strategy": prompt_adapter_update_mask_strategy,
+            "prompt_adapter_loss_mask_strategy": prompt_adapter_loss_mask_strategy,
+            "prompt_adapter_gate_budget": prompt_adapter_gate_budget,
+            "edge_utility_margin": edge_utility_margin,
+            "edge_utility_warmup_epochs": edge_utility_warmup_epochs,
+            "correction_alignment_margin": correction_alignment_margin,
+            "correction_alignment_warmup_epochs": correction_alignment_warmup_epochs,
             "utility_receive_gate_warmup_epochs": utility_receive_gate_warmup_epochs,
             "utility_receive_gate_query_warmup_epochs": utility_receive_gate_query_warmup_epochs,
             "utility_receive_gate_quantile": utility_receive_gate_quantile,
@@ -3168,9 +4030,13 @@ def run_single(
             **utility_receive_gate_stats,
             **utility_receive_gate_query_stats,
             **query_proto_alignment_stats,
+            **edge_utility_stats,
+            **correction_alignment_stats,
+            **adapter_train_stats,
+            **prompt_adapter_message_help_stats,
         }
         loss_curve.append(log_item)
-        prompt_curve.append({"epoch": float(epoch), **prompt_aware_log, **prompt_log})
+        prompt_curve.append({"epoch": float(epoch), **prompt_aware_log, **prompt_log, **adapter_train_stats})
 
         should_eval = epoch == 1 or epoch % eval_every == 0 or epoch == epochs
         metrics: dict[str, Any] | None = None
@@ -3187,6 +4053,7 @@ def run_single(
                 test_mask=split.test_mask,
                 num_classes=loaded.num_classes,
                 edge_scale_multiplier=current_edge_scale_multiplier,
+                prompt_adapter_module=prompt_adapter_module,
             )
             monitor_lookup = {
                 **metrics,
@@ -3226,6 +4093,12 @@ def run_single(
                     "utility_receive_gate_query_loss": float(utility_receive_gate_query_loss.detach().item()),
                     "receive_gate_budget": float(receive_gate_budget.detach().item()),
                     "query_proto_alignment_loss": float(query_proto_alignment.detach().item()),
+                    "edge_utility_supervision_loss": float(edge_utility_supervision.detach().item()),
+                    "correction_alignment_loss": float(correction_alignment.detach().item()),
+                    "correction_alignment_anti_harm_loss": float(correction_alignment_anti_harm.detach().item()),
+                    "prompt_adapter_update_norm_loss": float(prompt_adapter_update_norm.detach().item()),
+                    "prompt_adapter_gate_budget_loss": float(prompt_adapter_budget.detach().item()),
+                    "prompt_adapter_message_help_loss": float(prompt_adapter_message_help.detach().item()),
                     "support_query_enabled": float(support_query_stats.get("enabled", False)),
                     "support_only_prompt_graph": float(support_only_prompt_graph),
                     "support_count": float(support_query_stats.get("support_count", 0)),
@@ -3239,6 +4112,10 @@ def run_single(
                     **utility_receive_gate_stats,
                     **utility_receive_gate_query_stats,
                     **query_proto_alignment_stats,
+                    **edge_utility_stats,
+                    **correction_alignment_stats,
+                    **adapter_train_stats,
+                    **prompt_adapter_message_help_stats,
                     "edge_scale_multiplier": current_edge_scale_multiplier,
                     **_adapter_stats(model),
                 }
@@ -3247,6 +4124,7 @@ def run_single(
                     model=model,
                     input_aligner=input_aligner,
                     prompt_graph_module=prompt_graph_module,
+                    prompt_adapter_module=prompt_adapter_module,
                     epoch=epoch,
                     metrics=best_metrics,
                 )
@@ -3268,6 +4146,7 @@ def run_single(
                     test_mask=split.test_mask,
                     num_classes=loaded.num_classes,
                     edge_scale_multiplier=current_edge_scale_multiplier,
+                    prompt_adapter_module=prompt_adapter_module,
                 )
             progress.set_postfix(
                 {
@@ -3295,6 +4174,7 @@ def run_single(
                     test_mask=split.test_mask,
                     num_classes=loaded.num_classes,
                     edge_scale_multiplier=current_edge_scale_multiplier,
+                    prompt_adapter_module=prompt_adapter_module,
                 )
             progress.set_postfix(
                 {
@@ -3320,6 +4200,7 @@ def run_single(
         test_mask=split.test_mask,
         num_classes=loaded.num_classes,
         edge_scale_multiplier=1.0,
+        prompt_adapter_module=prompt_adapter_module,
     )
     prompt_message_utility: dict[str, Any] | None = None
     if bool(training_cfg.get("diagnose_prompt_message_utility", False)):
@@ -3358,6 +4239,7 @@ def run_single(
         "final": {**final_metrics, **init_eq},
         "best": {**best_metrics, **init_eq},
         "prompt_graph_parameter_count": count_trainable_parameters(prompt_graph_module),
+        "prompt_adapter_parameter_count": count_trainable_parameters(prompt_adapter_module),
         "class_key_initialization": class_key_init_stats,
         "pattern_key_initialization": pattern_key_init_stats,
         "trainable_parameters": trainable_summary,
@@ -3401,12 +4283,28 @@ def run_single(
             "prompt_message_help_margin": prompt_message_help_margin,
             "prompt_message_help_class_balanced": prompt_message_help_class_balanced,
             "prompt_class_anti_harm_floor": prompt_class_anti_harm_floor,
+            "lambda_edge_utility_supervision": lambda_edge_utility_supervision,
+            "edge_utility_margin": edge_utility_margin,
+            "edge_utility_warmup_epochs": edge_utility_warmup_epochs,
+            "lambda_correction_alignment": lambda_correction_alignment,
+            "lambda_correction_anti_harm": lambda_correction_anti_harm,
+            "correction_alignment_margin": correction_alignment_margin,
+            "correction_alignment_warmup_epochs": correction_alignment_warmup_epochs,
+            "lambda_prompt_adapter_update_norm": lambda_prompt_adapter_update_norm,
+            "lambda_prompt_adapter_gate_budget": lambda_prompt_adapter_gate_budget,
+            "lambda_prompt_adapter_message_help": lambda_prompt_adapter_message_help,
+            "prompt_adapter_message_help_margin": prompt_adapter_message_help_margin,
+            "prompt_adapter_message_help_class_balanced": prompt_adapter_message_help_class_balanced,
+            "prompt_adapter_update_mask": prompt_adapter_update_mask_strategy,
+            "prompt_adapter_loss_mask": prompt_adapter_loss_mask_strategy,
+            "prompt_adapter_gate_budget": prompt_adapter_gate_budget,
             "edge_scale_warmup_epochs": edge_scale_warmup_epochs,
             "edge_scale_warmup_start": edge_scale_warmup_start,
         },
         "base_checkpoint_path": str(base_checkpoint_path) if base_checkpoint_path is not None else "",
         "freeze_base_model": freeze_base_model,
         "train_prompt_graph_module": bool(training_cfg.get("train_prompt_graph_module", True)),
+        "train_prompt_adapter": bool(training_cfg.get("train_prompt_adapter", True)),
         "early_stopped": early_stopped,
         "stopped_epoch": stopped_epoch,
         "early_stop_metric": monitor,
@@ -3449,7 +4347,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         scale_grid = [float(scale) for scale in scale_grid if float(scale) > 0.0]
         if not scale_grid:
             raise ValueError("diagnose_prompt_message_utility requires at least one positive message scale")
-    use_scale_grid = variant.startswith("p2_") and len(scale_grid) > 1
+    use_scale_grid = (variant.startswith("p2_") or variant.startswith("p13_")) and len(scale_grid) > 1
     if diagnostic_mode:
         use_scale_grid = False
     scale_selection_metric = str(config.get("training", {}).get("message_scale_selection_metric", "val_acc"))
@@ -3578,11 +4476,41 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "query_class_balanced_positive_delta_ratio",
         "utility_receive_gate_loss",
         "utility_receive_gate_query_loss",
+        "edge_utility_supervision_loss",
+        "edge_utility_delta_corr_train",
+        "correction_alignment_loss",
+        "correction_alignment_anti_harm_loss",
+        "correction_alignment_cosine_mean",
+        "pool_score_selected_mean",
+        "pool_uncertainty_mean",
+        "pool_disagreement_mean",
         "support_query_enabled",
         "support_only_prompt_graph",
         "support_count",
         "query_count",
         "pattern_key_init_coverage",
+        "prompt_adapter_enabled",
+        "prompt_adapter_update_norm",
+        "prompt_adapter_update_max_norm",
+        "prompt_adapter_raw_delta_norm",
+        "prompt_adapter_delta_norm",
+        "prompt_adapter_gate_mean",
+        "prompt_adapter_clip_ratio",
+        "adapter_query_mean_delta_ce",
+        "adapter_query_positive_delta_ratio",
+        "adapter_val_mean_delta_ce",
+        "adapter_val_positive_delta_ratio",
+        "adapter_test_mean_delta_ce",
+        "adapter_test_positive_delta_ratio",
+        "support_context_enabled",
+        "support_context_available",
+        "support_context_coverage",
+        "support_context_count",
+        "support_similarity_margin",
+        "support_similarity_entropy",
+        "prompt_adapter_message_help_loss",
+        "prompt_adapter_message_help_mean_delta_ce",
+        "prompt_adapter_message_help_positive_ratio",
     ]
     for key in diagnostic_summary_keys:
         values = [
@@ -3768,6 +4696,13 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "query_proto_class_count",
             "query_proto_mean_delta_dist",
             "query_proto_positive_ratio",
+            "correction_alignment_loss",
+            "correction_alignment_anti_harm_loss",
+            "correction_alignment_node_count",
+            "correction_alignment_harmful_count",
+            "correction_alignment_cosine_mean",
+            "correction_alignment_delta_h_norm",
+            "correction_alignment_delta_ce_mean",
             "support_query_enabled",
             "support_only_prompt_graph",
             "support_count",
@@ -3781,6 +4716,25 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "benefit_gate_mean",
             "benefit_gate_min",
             "benefit_gate_max",
+            "use_edge_utility",
+            "edge_utility_mean",
+            "edge_utility_min",
+            "edge_utility_max",
+            "edge_utility_supervision_loss",
+            "edge_utility_supervised_count",
+            "edge_utility_positive_count",
+            "edge_utility_negative_count",
+            "edge_utility_ignored_count",
+            "edge_utility_target_mean",
+            "edge_utility_delta_ce_mean",
+            "edge_utility_delta_ce_positive_ratio",
+            "edge_utility_delta_corr_train",
+            "pool_strategy_id",
+            "pool_selected_ratio",
+            "pool_score_mean",
+            "pool_score_selected_mean",
+            "pool_uncertainty_mean",
+            "pool_disagreement_mean",
             "use_hard_receive_gate",
             "hard_receive_ratio",
             "hard_receive_selected_ratio",
@@ -3836,6 +4790,42 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "init_original_x_delta",
             "init_logit_delta",
             "init_logit_delta_full_edge_scale",
+            "init_prompt_adapter_update_norm",
+            "prompt_adapter_enabled",
+            "prompt_adapter_update_norm",
+            "prompt_adapter_update_max_norm",
+            "prompt_adapter_raw_delta_norm",
+            "prompt_adapter_delta_norm",
+            "prompt_adapter_gate_mean",
+            "prompt_adapter_gate_min",
+            "prompt_adapter_gate_max",
+            "prompt_adapter_update_mask_ratio",
+            "prompt_adapter_clip_ratio",
+            "high_frequency_norm",
+            "low_frequency_norm",
+            "adapter_query_mean_delta_ce",
+            "adapter_query_positive_delta_ratio",
+            "adapter_query_mean_ce_no_prompt",
+            "adapter_query_mean_ce_prompt",
+            "adapter_query_count",
+            "adapter_train_mean_delta_ce",
+            "adapter_train_positive_delta_ratio",
+            "adapter_val_mean_delta_ce",
+            "adapter_val_positive_delta_ratio",
+            "adapter_test_mean_delta_ce",
+            "adapter_test_positive_delta_ratio",
+            "prompt_adapter_update_norm_loss",
+            "prompt_adapter_gate_budget_loss",
+            "support_context_enabled",
+            "support_context_available",
+            "support_context_coverage",
+            "support_context_count",
+            "support_similarity_margin",
+            "support_similarity_entropy",
+            "prompt_adapter_message_help_loss",
+            "prompt_adapter_message_help_mean_delta_ce",
+            "prompt_adapter_message_help_positive_ratio",
+            "prompt_adapter_message_help_count",
             "early_stopped",
             "stopped_epoch",
             "diagnostic_message_scale",
@@ -3990,6 +4980,23 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "query_proto_class_count": result["best"].get("query_proto_class_count", 0.0),
                     "query_proto_mean_delta_dist": result["best"].get("query_proto_mean_delta_dist", 0.0),
                     "query_proto_positive_ratio": result["best"].get("query_proto_positive_ratio", 0.0),
+                    "correction_alignment_loss": result["best"].get("correction_alignment_loss", 0.0),
+                    "correction_alignment_anti_harm_loss": result["best"].get(
+                        "correction_alignment_anti_harm_loss", 0.0
+                    ),
+                    "correction_alignment_node_count": result["best"].get("correction_alignment_node_count", 0.0),
+                    "correction_alignment_harmful_count": result["best"].get(
+                        "correction_alignment_harmful_count", 0.0
+                    ),
+                    "correction_alignment_cosine_mean": result["best"].get(
+                        "correction_alignment_cosine_mean", 0.0
+                    ),
+                    "correction_alignment_delta_h_norm": result["best"].get(
+                        "correction_alignment_delta_h_norm", 0.0
+                    ),
+                    "correction_alignment_delta_ce_mean": result["best"].get(
+                        "correction_alignment_delta_ce_mean", 0.0
+                    ),
                     "support_query_enabled": result["best"].get("support_query_enabled", 0.0),
                     "support_only_prompt_graph": result["best"].get("support_only_prompt_graph", 0.0),
                     "support_count": result["best"].get("support_count", 0.0),
@@ -4003,6 +5010,27 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "benefit_gate_mean": result["best"].get("benefit_gate_mean", 1.0),
                     "benefit_gate_min": result["best"].get("benefit_gate_min", 1.0),
                     "benefit_gate_max": result["best"].get("benefit_gate_max", 1.0),
+                    "use_edge_utility": result["best"].get("use_edge_utility", 0.0),
+                    "edge_utility_mean": result["best"].get("edge_utility_mean", 1.0),
+                    "edge_utility_min": result["best"].get("edge_utility_min", 1.0),
+                    "edge_utility_max": result["best"].get("edge_utility_max", 1.0),
+                    "edge_utility_supervision_loss": result["best"].get("edge_utility_supervision_loss", 0.0),
+                    "edge_utility_supervised_count": result["best"].get("edge_utility_supervised_count", 0.0),
+                    "edge_utility_positive_count": result["best"].get("edge_utility_positive_count", 0.0),
+                    "edge_utility_negative_count": result["best"].get("edge_utility_negative_count", 0.0),
+                    "edge_utility_ignored_count": result["best"].get("edge_utility_ignored_count", 0.0),
+                    "edge_utility_target_mean": result["best"].get("edge_utility_target_mean", 0.0),
+                    "edge_utility_delta_ce_mean": result["best"].get("edge_utility_delta_ce_mean", 0.0),
+                    "edge_utility_delta_ce_positive_ratio": result["best"].get(
+                        "edge_utility_delta_ce_positive_ratio", 0.0
+                    ),
+                    "edge_utility_delta_corr_train": result["best"].get("edge_utility_delta_corr_train", 0.0),
+                    "pool_strategy_id": result["best"].get("pool_strategy_id", 0.0),
+                    "pool_selected_ratio": result["best"].get("pool_selected_ratio", 0.0),
+                    "pool_score_mean": result["best"].get("pool_score_mean", 0.0),
+                    "pool_score_selected_mean": result["best"].get("pool_score_selected_mean", 0.0),
+                    "pool_uncertainty_mean": result["best"].get("pool_uncertainty_mean", 0.0),
+                    "pool_disagreement_mean": result["best"].get("pool_disagreement_mean", 0.0),
                     "use_hard_receive_gate": result["best"].get("use_hard_receive_gate", 0.0),
                     "hard_receive_ratio": result["best"].get("hard_receive_ratio", 0.0),
                     "hard_receive_selected_ratio": result["best"].get("hard_receive_selected_ratio", 0.0),
@@ -4060,6 +5088,56 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "init_original_x_delta": result["best"].get("init_original_x_delta", 0.0),
                     "init_logit_delta": result["best"].get("init_logit_delta", 0.0),
                     "init_logit_delta_full_edge_scale": result["best"].get("init_logit_delta_full_edge_scale", 0.0),
+                    "init_prompt_adapter_update_norm": result["best"].get("init_prompt_adapter_update_norm", 0.0),
+                    "prompt_adapter_enabled": result["best"].get("prompt_adapter_enabled", 0.0),
+                    "prompt_adapter_update_norm": result["best"].get("prompt_adapter_update_norm", 0.0),
+                    "prompt_adapter_update_max_norm": result["best"].get("prompt_adapter_update_max_norm", 0.0),
+                    "prompt_adapter_raw_delta_norm": result["best"].get("prompt_adapter_raw_delta_norm", 0.0),
+                    "prompt_adapter_delta_norm": result["best"].get("prompt_adapter_delta_norm", 0.0),
+                    "prompt_adapter_gate_mean": result["best"].get("prompt_adapter_gate_mean", 0.0),
+                    "prompt_adapter_gate_min": result["best"].get("prompt_adapter_gate_min", 0.0),
+                    "prompt_adapter_gate_max": result["best"].get("prompt_adapter_gate_max", 0.0),
+                    "prompt_adapter_update_mask_ratio": result["best"].get("prompt_adapter_update_mask_ratio", 0.0),
+                    "prompt_adapter_clip_ratio": result["best"].get("prompt_adapter_clip_ratio", 0.0),
+                    "high_frequency_norm": result["best"].get("high_frequency_norm", 0.0),
+                    "low_frequency_norm": result["best"].get("low_frequency_norm", 0.0),
+                    "adapter_query_mean_delta_ce": result["best"].get("adapter_query_mean_delta_ce", 0.0),
+                    "adapter_query_positive_delta_ratio": result["best"].get(
+                        "adapter_query_positive_delta_ratio", 0.0
+                    ),
+                    "adapter_query_mean_ce_no_prompt": result["best"].get("adapter_query_mean_ce_no_prompt", 0.0),
+                    "adapter_query_mean_ce_prompt": result["best"].get("adapter_query_mean_ce_prompt", 0.0),
+                    "adapter_query_count": result["best"].get("adapter_query_count", 0.0),
+                    "adapter_train_mean_delta_ce": result["best"].get("adapter_train_mean_delta_ce", 0.0),
+                    "adapter_train_positive_delta_ratio": result["best"].get(
+                        "adapter_train_positive_delta_ratio", 0.0
+                    ),
+                    "adapter_val_mean_delta_ce": result["best"].get("adapter_val_mean_delta_ce", 0.0),
+                    "adapter_val_positive_delta_ratio": result["best"].get("adapter_val_positive_delta_ratio", 0.0),
+                    "adapter_test_mean_delta_ce": result["best"].get("adapter_test_mean_delta_ce", 0.0),
+                    "adapter_test_positive_delta_ratio": result["best"].get(
+                        "adapter_test_positive_delta_ratio", 0.0
+                    ),
+                    "prompt_adapter_update_norm_loss": result["best"].get("prompt_adapter_update_norm_loss", 0.0),
+                    "prompt_adapter_gate_budget_loss": result["best"].get("prompt_adapter_gate_budget_loss", 0.0),
+                    "support_context_enabled": result["best"].get("support_context_enabled", 0.0),
+                    "support_context_available": result["best"].get("support_context_available", 0.0),
+                    "support_context_coverage": result["best"].get("support_context_coverage", 0.0),
+                    "support_context_count": result["best"].get("support_context_count", 0.0),
+                    "support_similarity_margin": result["best"].get("support_similarity_margin", 0.0),
+                    "support_similarity_entropy": result["best"].get("support_similarity_entropy", 0.0),
+                    "prompt_adapter_message_help_loss": result["best"].get(
+                        "prompt_adapter_message_help_loss", 0.0
+                    ),
+                    "prompt_adapter_message_help_mean_delta_ce": result["best"].get(
+                        "prompt_adapter_message_help_mean_delta_ce", 0.0
+                    ),
+                    "prompt_adapter_message_help_positive_ratio": result["best"].get(
+                        "prompt_adapter_message_help_positive_ratio", 0.0
+                    ),
+                    "prompt_adapter_message_help_count": result["best"].get(
+                        "prompt_adapter_message_help_count", 0.0
+                    ),
                     "early_stopped": result.get("early_stopped", False),
                     "stopped_epoch": result.get("stopped_epoch", 0),
                     "diagnostic_message_scale": result.get("diagnostic_message_scale", ""),
@@ -4322,6 +5400,7 @@ def main() -> None:
     if args.prompt_message_scale is not None:
         overrides.setdefault("prompt_aware", {})["message_scale"] = float(args.prompt_message_scale)
         overrides.setdefault("prompt_aware", {})["message_scale_grid"] = [float(args.prompt_message_scale)]
+        overrides.setdefault("prompt_adapter", {})["message_scale"] = float(args.prompt_message_scale)
     if args.prompt_message_scale_grid is not None:
         overrides.setdefault("prompt_aware", {})["message_scale_grid"] = [
             float(piece.strip()) for piece in args.prompt_message_scale_grid.split(",") if piece.strip()

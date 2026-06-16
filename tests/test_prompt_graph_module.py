@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 
@@ -23,12 +25,15 @@ from experiments.run_gp2f_prompt_graph import (
     _acceptance_supervision_loss,
     _benefit_supervision_loss,
     _class_balanced_support_query_split,
+    _correction_alignment_losses,
+    _edge_utility_supervision_loss,
     _prompt_message_help_loss,
     _prompt_slot_usage_stats,
     _prompt_correction_losses,
     _query_proto_alignment_loss,
     _utility_receive_gate_loss,
 )
+from utils.io import read_yaml
 
 
 def _config(**overrides: object) -> dict:
@@ -256,6 +261,126 @@ def test_pool_mask_contains_train_nodes_and_rho_zero_keeps_supervised_pool() -> 
 
     assert torch.all(out["pool_mask"][train_mask])
     assert int(out["pool_mask"].sum().item()) == int(train_mask.sum().item())
+
+
+def test_utility_structural_pool_falls_back_to_structural_order_without_no_prompt_evidence() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    structural = PromptGraphModuleP1(4, 3, _config(pool_strategy="structural", rho=0.5))
+    utility = PromptGraphModuleP1(4, 3, _config(pool_strategy="utility_structural", rho=0.5))
+
+    out_struct = structural(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    out_utility = utility(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+
+    assert torch.equal(out_struct["pool_mask"], out_utility["pool_mask"])
+    assert out_utility["aux"]["pool_strategy_id"] == 2
+    assert torch.allclose(out_utility["aux"]["pool_uncertainty_component"], torch.zeros(z.size(0)))
+    assert torch.allclose(out_utility["aux"]["pool_disagreement_component"], torch.zeros(z.size(0)))
+
+
+def test_edge_utility_gate_has_per_edge_values() -> None:
+    z, h_pre, edge_index, _, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(
+        4,
+        3,
+        _config(
+            use_edge_utility=True,
+            edge_utility_init=0.4,
+            use_multiview_routing=True,
+            use_attribute_view=True,
+            use_enhanced_role_view=True,
+            role_context_dim=8,
+        ),
+    )
+
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    edge_utility = out["aux"]["edge_utility"]
+    edge_logits = out["aux"]["edge_utility_logit"]
+
+    assert edge_utility.shape == out["aux"]["assignment_prob"].shape
+    assert edge_logits.shape == edge_utility.shape
+    assert torch.all(edge_utility >= 0.0)
+    assert torch.all(edge_utility <= 1.0)
+    assert out["aux"]["use_edge_utility"] == 1
+
+
+def test_edge_utility_supervision_uses_train_pool_ce_delta() -> None:
+    z, h_pre, edge_index, y, train_mask = _toy_inputs()
+    module = PromptGraphModuleP1(4, 3, _config(use_edge_utility=True, edge_utility_init=0.5))
+    out = module(z=z, h_pre=h_pre, edge_index=edge_index, train_mask=train_mask)
+    logits_off = torch.tensor(
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ]
+    )
+    logits_on = torch.tensor(
+        [
+            [2.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 2.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ]
+    )
+
+    loss, stats = _edge_utility_supervision_loss(
+        prompt_out=out,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        margin=0.0,
+    )
+
+    assert torch.isfinite(loss)
+    assert stats["edge_utility_supervised_count"] == float(train_mask.sum().item())
+    assert stats["edge_utility_positive_count"] == float(train_mask.sum().item())
+    assert stats["edge_utility_negative_count"] == 0.0
+
+
+def test_correction_alignment_loss_uses_classifier_direction_for_helpful_nodes() -> None:
+    z, _, _, y, train_mask = _toy_inputs()
+    model = FaithfulGP2F(BaseGCN(in_channels=4, hidden_channels=3, num_layers=2), hidden_dim=3, num_classes=2)
+    prompt_out = {"pool_mask": train_mask.clone(), "edge_scale": z.new_tensor(1.0)}
+    h_off = torch.zeros(z.size(0), 3)
+    h_on = torch.zeros(z.size(0), 3)
+    h_on[0] = model.classifier.weight.detach()[0]
+    h_on[2] = model.classifier.weight.detach()[1]
+    logits_off = torch.zeros(z.size(0), 2)
+    logits_on = torch.zeros(z.size(0), 2)
+    logits_on[0, 0] = 2.0
+    logits_on[2, 1] = 2.0
+
+    align_loss, anti_harm, stats = _correction_alignment_losses(
+        model=model,
+        prompt_out=prompt_out,
+        h_on=h_on,
+        h_off=h_off,
+        logits_on=logits_on,
+        logits_off=logits_off,
+        labels=y,
+        train_mask=train_mask,
+        margin=0.0,
+    )
+
+    assert torch.isfinite(align_loss)
+    assert torch.isfinite(anti_harm)
+    assert stats["correction_alignment_node_count"] == float(train_mask.sum().item())
+    assert stats["correction_alignment_cosine_mean"] > 0.99
+
+
+def test_p13_config_keeps_zero_message_scale_safety_option() -> None:
+    cfg = read_yaml(Path(__file__).resolve().parents[1] / "configs" / "gp2f_prompt_p13_utility_correction.yaml")
+
+    assert cfg["experiment"]["prompt_variant"] == "p13_utility_correction"
+    assert cfg["prompt_graph"]["pool_strategy"] == "utility_structural"
+    assert cfg["prompt_graph"]["use_edge_utility"] is True
+    assert 0.0 in cfg["prompt_aware"]["message_scale_grid"]
 
 
 def test_val_test_labels_do_not_affect_p1_outputs() -> None:
