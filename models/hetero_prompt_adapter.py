@@ -63,6 +63,15 @@ class HeterophilyAwarePromptAdapter(nn.Module):
         self.use_support_class_similarity = bool(self.config.get("use_support_class_similarity", True))
         self.use_support_proto_residual = bool(self.config.get("use_support_proto_residual", True))
         self.use_support_high_residual = bool(self.config.get("use_support_high_residual", True))
+        self.support_context_mode = str(self.config.get("support_context_mode", "class_proto"))
+        if self.support_context_mode not in {"class_proto", "topk_attention"}:
+            raise ValueError("prompt_adapter.support_context_mode must be 'class_proto' or 'topk_attention'")
+        self.support_topk = int(self.config.get("support_topk", 8))
+        self.use_support_uncertainty_features = bool(self.config.get("use_support_uncertainty_features", False))
+        self.use_support_reliability_gate = bool(self.config.get("use_support_reliability_gate", False))
+        self.support_reliability_strength = float(self.config.get("support_reliability_strength", 1.0))
+        self.support_reliability_floor = float(self.config.get("support_reliability_floor", 0.05))
+        self.support_reliability_margin_weight = float(self.config.get("support_reliability_margin_weight", 0.5))
 
         context_dim = 0
         if self.use_ego:
@@ -84,6 +93,8 @@ class HeterophilyAwarePromptAdapter(nn.Module):
                 context_dim += self.source_dim
             if self.use_support_high_residual:
                 context_dim += self.source_dim
+            if self.use_support_uncertainty_features:
+                context_dim += 3
         if context_dim <= 0:
             raise ValueError("At least one prompt adapter context view must be enabled")
         self.context_dim = int(context_dim)
@@ -117,6 +128,17 @@ class HeterophilyAwarePromptAdapter(nn.Module):
             pieces.append(base.new_zeros(base.shape))
         if self.use_support_high_residual:
             pieces.append(base.new_zeros(base.shape))
+        reliability_value = 1.0 if not self.use_support_reliability_gate else self.support_reliability_floor
+        if self.use_support_uncertainty_features:
+            uncertainty = torch.stack(
+                [
+                    base.new_zeros(base.size(0)),
+                    base.new_ones(base.size(0)),
+                    base.new_full((base.size(0),), float(reliability_value)),
+                ],
+                dim=-1,
+            )
+            pieces.append(uncertainty)
         support_context = torch.cat(pieces, dim=-1) if pieces else base.new_zeros((base.size(0), 0))
         stats = {
             "support_context_enabled": base.new_tensor(float(self.use_support_context)),
@@ -125,6 +147,11 @@ class HeterophilyAwarePromptAdapter(nn.Module):
             "support_context_count": base.new_tensor(0.0),
             "support_similarity_margin": base.new_tensor(0.0),
             "support_similarity_entropy": base.new_tensor(0.0),
+            "support_reliability": base.new_full((base.size(0),), float(reliability_value)),
+            "support_reliability_mean": base.new_tensor(float(reliability_value)),
+            "support_reliability_min": base.new_tensor(float(reliability_value)),
+            "support_reliability_max": base.new_tensor(float(reliability_value)),
+            "support_topk_mean_score": base.new_tensor(0.0),
         }
         return support_context, stats
 
@@ -144,6 +171,11 @@ class HeterophilyAwarePromptAdapter(nn.Module):
                 "support_context_count": base.new_tensor(0.0),
                 "support_similarity_margin": base.new_tensor(0.0),
                 "support_similarity_entropy": base.new_tensor(0.0),
+                "support_reliability": base.new_ones(base.size(0)),
+                "support_reliability_mean": base.new_tensor(1.0),
+                "support_reliability_min": base.new_tensor(1.0),
+                "support_reliability_max": base.new_tensor(1.0),
+                "support_topk_mean_score": base.new_tensor(0.0),
             }
         if labels is None or support_mask is None:
             return self._empty_support_context(base)
@@ -155,26 +187,44 @@ class HeterophilyAwarePromptAdapter(nn.Module):
             return self._empty_support_context(base)
 
         class_ids = labels[valid]
+        support_base = base[valid]
+        support_high = high[valid]
         counts = base.new_zeros((self.num_classes, 1))
         counts.index_add_(0, class_ids, torch.ones((class_ids.numel(), 1), dtype=base.dtype, device=base.device))
         coverage = counts.squeeze(-1) > 0
-        proto = base.new_zeros((self.num_classes, base.size(-1)))
-        high_proto = base.new_zeros((self.num_classes, high.size(-1)))
-        proto.index_add_(0, class_ids, base[valid])
-        high_proto.index_add_(0, class_ids, high[valid])
-        proto = proto / counts.clamp_min(1.0)
-        high_proto = high_proto / counts.clamp_min(1.0)
-
         tau = max(float(self.support_tau), 1e-6)
-        logits = F.normalize(base, dim=-1, eps=1e-12) @ F.normalize(proto, dim=-1, eps=1e-12).t()
-        logits = logits / tau
-        logits = logits.masked_fill(~coverage.view(1, -1), -1e9)
-        weights = torch.softmax(logits, dim=-1)
-        weights = torch.where(coverage.view(1, -1), weights, torch.zeros_like(weights))
-        weight_sums = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        weights = weights / weight_sums
-        weighted_proto = weights @ proto
-        weighted_high_proto = weights @ high_proto
+        topk_mean_score = base.new_tensor(0.0)
+
+        if self.support_context_mode == "topk_attention":
+            support_logits = F.normalize(base, dim=-1, eps=1e-12) @ F.normalize(support_base, dim=-1, eps=1e-12).t()
+            support_logits = support_logits / tau
+            topk = min(max(1, int(self.support_topk)), int(support_logits.size(1)))
+            top_scores, top_idx = torch.topk(support_logits, k=topk, dim=-1)
+            top_weights = torch.softmax(top_scores, dim=-1)
+            selected_classes = class_ids[top_idx]
+            weights = base.new_zeros((base.size(0), self.num_classes))
+            weights.scatter_add_(1, selected_classes, top_weights)
+            weight_sums = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            weights = weights / weight_sums
+            weighted_proto = (top_weights.unsqueeze(-1) * support_base[top_idx]).sum(dim=1)
+            weighted_high_proto = (top_weights.unsqueeze(-1) * support_high[top_idx]).sum(dim=1)
+            topk_mean_score = top_scores.mean()
+        else:
+            proto = base.new_zeros((self.num_classes, base.size(-1)))
+            high_proto = base.new_zeros((self.num_classes, high.size(-1)))
+            proto.index_add_(0, class_ids, support_base)
+            high_proto.index_add_(0, class_ids, support_high)
+            proto = proto / counts.clamp_min(1.0)
+            high_proto = high_proto / counts.clamp_min(1.0)
+            logits = F.normalize(base, dim=-1, eps=1e-12) @ F.normalize(proto, dim=-1, eps=1e-12).t()
+            logits = logits / tau
+            logits = logits.masked_fill(~coverage.view(1, -1), -1e9)
+            weights = torch.softmax(logits, dim=-1)
+            weights = torch.where(coverage.view(1, -1), weights, torch.zeros_like(weights))
+            weight_sums = weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            weights = weights / weight_sums
+            weighted_proto = weights @ proto
+            weighted_high_proto = weights @ high_proto
 
         pieces: list[torch.Tensor] = []
         if self.use_support_class_similarity:
@@ -192,6 +242,16 @@ class HeterophilyAwarePromptAdapter(nn.Module):
         entropy = -(weights * weights.clamp_min(1e-12).log()).sum(dim=-1)
         if self.num_classes > 1:
             entropy = entropy / math.log(float(self.num_classes))
+        margin_reliability = margin.clamp(0.0, 1.0)
+        entropy_reliability = (1.0 - entropy).clamp(0.0, 1.0)
+        reliability = (
+            self.support_reliability_margin_weight * margin_reliability
+            + (1.0 - self.support_reliability_margin_weight) * entropy_reliability
+        ).clamp(0.0, 1.0)
+        floor = min(max(float(self.support_reliability_floor), 0.0), 1.0)
+        reliability = floor + (1.0 - floor) * reliability
+        if self.use_support_uncertainty_features:
+            pieces.append(torch.stack([margin, entropy, reliability], dim=-1))
         support_context = torch.cat(pieces, dim=-1) if pieces else base.new_zeros((base.size(0), 0))
         stats = {
             "support_context_enabled": base.new_tensor(1.0),
@@ -200,6 +260,11 @@ class HeterophilyAwarePromptAdapter(nn.Module):
             "support_context_count": valid.to(dtype=base.dtype).sum(),
             "support_similarity_margin": margin.mean(),
             "support_similarity_entropy": entropy.mean(),
+            "support_reliability": reliability,
+            "support_reliability_mean": reliability.mean(),
+            "support_reliability_min": reliability.min(),
+            "support_reliability_max": reliability.max(),
+            "support_topk_mean_score": topk_mean_score,
         }
         return support_context, stats
 
@@ -285,7 +350,14 @@ class HeterophilyAwarePromptAdapter(nn.Module):
         else:
             bounded_delta = raw_delta
             clip_ratio = raw_delta.new_tensor(0.0)
-        gate = torch.sigmoid(self.gate_mlp(context)).squeeze(-1)
+        raw_gate = torch.sigmoid(self.gate_mlp(context)).squeeze(-1)
+        reliability = ctx.get("support_reliability")
+        if self.use_support_reliability_gate and isinstance(reliability, torch.Tensor):
+            strength = min(max(float(self.support_reliability_strength), 0.0), 1.0)
+            gate_factor = (1.0 - strength) + strength * reliability.to(device=raw_gate.device, dtype=raw_gate.dtype)
+            gate = raw_gate * gate_factor
+        else:
+            gate = raw_gate
         effective_mask = torch.ones_like(gate, dtype=torch.bool) if update_mask is None else update_mask.bool().to(gate.device)
         scale_value = self.message_scale if message_scale is None else float(message_scale)
         update = float(scale_value) * gate.unsqueeze(-1) * bounded_delta
@@ -298,6 +370,7 @@ class HeterophilyAwarePromptAdapter(nn.Module):
             "raw_delta": raw_delta,
             "update": update,
             "gate": gate,
+            "raw_gate": raw_gate,
             "update_mask": effective_mask,
             "context": context,
             "ego": ctx["ego"],
@@ -312,6 +385,9 @@ class HeterophilyAwarePromptAdapter(nn.Module):
             "prompt_gate_mean": gate.mean(),
             "prompt_gate_min": gate.min() if gate.numel() > 0 else gate.new_tensor(0.0),
             "prompt_gate_max": gate.max() if gate.numel() > 0 else gate.new_tensor(0.0),
+            "prompt_raw_gate_mean": raw_gate.mean(),
+            "prompt_raw_gate_min": raw_gate.min() if raw_gate.numel() > 0 else raw_gate.new_tensor(0.0),
+            "prompt_raw_gate_max": raw_gate.max() if raw_gate.numel() > 0 else raw_gate.new_tensor(0.0),
             "prompt_update_mask_ratio": effective_mask.to(dtype=h_adp.dtype).mean(),
             "prompt_update_clip_ratio": clip_ratio,
             "high_frequency_norm": ctx["high"].norm(dim=-1).mean(),
@@ -322,6 +398,10 @@ class HeterophilyAwarePromptAdapter(nn.Module):
             "support_context_count": ctx["support_context_count"],
             "support_similarity_margin": ctx["support_similarity_margin"],
             "support_similarity_entropy": ctx["support_similarity_entropy"],
+            "support_reliability_mean": ctx["support_reliability_mean"],
+            "support_reliability_min": ctx["support_reliability_min"],
+            "support_reliability_max": ctx["support_reliability_max"],
+            "support_topk_mean_score": ctx["support_topk_mean_score"],
             "message_scale": h_adp.new_tensor(float(scale_value)),
             "max_update_norm": h_adp.new_tensor(float(max_norm)),
         }
@@ -394,5 +474,84 @@ def prompt_adapter_message_help_loss(
         "prompt_adapter_message_help_mean_delta_ce": float(delta.detach().mean().item()),
         "prompt_adapter_message_help_positive_ratio": float((delta.detach() > 0.0).float().mean().item()),
         "prompt_adapter_message_help_count": float(idx.numel()),
+    }
+    return loss, stats
+
+
+def prompt_adapter_utility_gate_loss(
+    *,
+    adapter_out: dict[str, torch.Tensor],
+    logits_prompt: torch.Tensor,
+    logits_no_prompt: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    temperature: float = 0.02,
+    margin: float = 0.0,
+    class_balanced: bool = True,
+    gate_source: str = "raw_gate",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if gate_source == "effective_gate":
+        gate = adapter_out.get("gate", adapter_out.get("raw_gate"))
+    elif gate_source == "raw_gate":
+        gate = adapter_out.get("raw_gate", adapter_out.get("gate"))
+    else:
+        raise ValueError("gate_source must be 'raw_gate' or 'effective_gate'")
+    if not isinstance(gate, torch.Tensor) or gate.numel() == 0:
+        fallback = logits_prompt.new_tensor(0.0)
+        return fallback, {
+            "prompt_adapter_utility_gate_loss": 0.0,
+            "prompt_adapter_utility_gate_target_mean": 0.0,
+            "prompt_adapter_utility_gate_count": 0.0,
+            "prompt_adapter_utility_gate_delta_mean": 0.0,
+            "prompt_adapter_utility_gate_positive_ratio": 0.0,
+        }
+    mask = mask.to(device=logits_prompt.device, dtype=torch.bool)
+    idx = torch.where(mask)[0]
+    if idx.numel() == 0:
+        fallback = logits_prompt.new_tensor(0.0)
+        return fallback, {
+            "prompt_adapter_utility_gate_loss": 0.0,
+            "prompt_adapter_utility_gate_target_mean": 0.0,
+            "prompt_adapter_utility_gate_count": 0.0,
+            "prompt_adapter_utility_gate_delta_mean": 0.0,
+            "prompt_adapter_utility_gate_positive_ratio": 0.0,
+        }
+    y = labels.to(device=logits_prompt.device)[idx]
+    ce_no = F.cross_entropy(logits_no_prompt.detach()[idx], y, reduction="none")
+    ce_prompt = F.cross_entropy(logits_prompt.detach()[idx], y, reduction="none")
+    delta = ce_no - ce_prompt
+    temp = max(float(temperature), 1e-6)
+    if margin > 0.0:
+        supervised = delta.abs() >= float(margin)
+    else:
+        supervised = torch.ones_like(delta, dtype=torch.bool)
+    if int(supervised.sum().item()) == 0:
+        fallback = logits_prompt.new_tensor(0.0)
+        return fallback, {
+            "prompt_adapter_utility_gate_loss": 0.0,
+            "prompt_adapter_utility_gate_target_mean": 0.0,
+            "prompt_adapter_utility_gate_count": 0.0,
+            "prompt_adapter_utility_gate_delta_mean": float(delta.detach().mean().item()),
+            "prompt_adapter_utility_gate_positive_ratio": float((delta.detach() > 0.0).float().mean().item()),
+        }
+    target = torch.sigmoid(delta.detach() / temp)
+    gate_values = gate.to(device=logits_prompt.device)[idx].clamp(1e-6, 1.0 - 1e-6)
+    losses = F.binary_cross_entropy(gate_values[supervised], target[supervised], reduction="none")
+    y_supervised = y[supervised]
+    if class_balanced:
+        per_class = []
+        for class_id in torch.unique(y_supervised.detach()).tolist():
+            class_mask = y_supervised == int(class_id)
+            if bool(class_mask.any()):
+                per_class.append(losses[class_mask].mean())
+        loss = torch.stack(per_class).mean() if per_class else losses.mean()
+    else:
+        loss = losses.mean()
+    stats = {
+        "prompt_adapter_utility_gate_loss": float(loss.detach().item()),
+        "prompt_adapter_utility_gate_target_mean": float(target[supervised].detach().mean().item()),
+        "prompt_adapter_utility_gate_count": float(supervised.sum().item()),
+        "prompt_adapter_utility_gate_delta_mean": float(delta.detach().mean().item()),
+        "prompt_adapter_utility_gate_positive_ratio": float((delta.detach() > 0.0).float().mean().item()),
     }
     return loss, stats

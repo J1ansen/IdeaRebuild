@@ -32,6 +32,7 @@ from models.hetero_prompt_adapter import (
     prompt_adapter_gate_budget_loss,
     prompt_adapter_message_help_loss,
     prompt_adapter_update_norm_loss,
+    prompt_adapter_utility_gate_loss,
 )
 from models.prompt_graph_module import (
     prompt_acceptance_budget_loss,
@@ -65,6 +66,8 @@ PROMPT_GRAPH_VARIANTS = {
     "p14_freeze_prompt_adapter",
     "p15_hetero_prompt_adapter",
     "p16_support_prompt_adapter",
+    "p17_selective_support_adapter",
+    "p18_episode_consistency_adapter",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -83,7 +86,13 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
     out = copy.deepcopy(config)
     out.setdefault("experiment", {})["prompt_variant"] = variant
     prompt_graph = out.setdefault("prompt_graph", {})
-    adapter_variants = {"p14_freeze_prompt_adapter", "p15_hetero_prompt_adapter", "p16_support_prompt_adapter"}
+    adapter_variants = {
+        "p14_freeze_prompt_adapter",
+        "p15_hetero_prompt_adapter",
+        "p16_support_prompt_adapter",
+        "p17_selective_support_adapter",
+        "p18_episode_consistency_adapter",
+    }
     if variant == "noprompt" or variant in adapter_variants:
         prompt_graph["enabled"] = False
     else:
@@ -145,7 +154,11 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         if variant == "p14_freeze_prompt_adapter":
             training["freeze_base_model"] = True
             training["train_prompt_adapter"] = True
-        elif variant == "p16_support_prompt_adapter":
+        elif variant in {
+            "p16_support_prompt_adapter",
+            "p17_selective_support_adapter",
+            "p18_episode_consistency_adapter",
+        }:
             training.setdefault("freeze_base_model", False)
             training["train_prompt_adapter"] = True
             if float(training.get("lambda_prompt_adapter_message_help", 0.0)) <= 0.0:
@@ -159,6 +172,29 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
             prompt_adapter.setdefault("use_support_high_residual", True)
             prompt_adapter.setdefault("gate_init", 0.10)
             prompt_adapter.setdefault("max_update_norm", 0.08)
+            if variant in {"p17_selective_support_adapter", "p18_episode_consistency_adapter"}:
+                prompt_adapter.setdefault("support_context_mode", "topk_attention")
+                prompt_adapter.setdefault("support_topk", 8)
+                prompt_adapter.setdefault("support_tau", 0.25)
+                prompt_adapter.setdefault("use_support_uncertainty_features", True)
+                prompt_adapter.setdefault("use_support_reliability_gate", True)
+                prompt_adapter.setdefault("support_reliability_strength", 0.5)
+                prompt_adapter.setdefault("support_reliability_floor", 0.15)
+                prompt_adapter.setdefault("support_reliability_margin_weight", 0.7)
+                prompt_adapter.setdefault("gate_budget", 0.55)
+                training.setdefault("lambda_prompt_adapter_utility_gate", 0.05)
+                training.setdefault("prompt_adapter_utility_gate_temperature", 0.02)
+                training.setdefault("prompt_adapter_utility_gate_margin", 0.001)
+                training.setdefault("prompt_adapter_utility_gate_class_balanced", True)
+                training.setdefault("prompt_adapter_utility_gate_source", "effective_gate")
+                training["lambda_prompt_adapter_gate_budget"] = max(
+                    float(training.get("lambda_prompt_adapter_gate_budget", 0.0)),
+                    0.05,
+                )
+                if variant == "p18_episode_consistency_adapter":
+                    training.setdefault("prompt_adapter_episode_count_per_epoch", 3)
+                    training.setdefault("lambda_prompt_adapter_gate_consistency", 0.02)
+                    training.setdefault("lambda_prompt_adapter_delta_consistency", 0.01)
         else:
             training.setdefault("freeze_base_model", False)
             training["train_prompt_adapter"] = True
@@ -1398,6 +1434,77 @@ def _forward_prompt_adapter(
     return model_out, adapter_out, no_prompt_out
 
 
+def _mean_float_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
+    if not stats_list:
+        return {}
+    keys: set[str] = set()
+    for stats in stats_list:
+        keys.update(stats.keys())
+    averaged: dict[str, Any] = {}
+    for key in keys:
+        values: list[float] = []
+        for stats in stats_list:
+            value = stats.get(key)
+            if isinstance(value, bool):
+                values.append(float(value))
+            elif isinstance(value, (int, float)):
+                values.append(float(value))
+        if values and len(values) == len(stats_list):
+            averaged[key] = float(sum(values) / len(values))
+    return averaged
+
+
+def _prompt_adapter_episode_consistency_loss(
+    adapter_outs: list[dict[str, torch.Tensor]],
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    if len(adapter_outs) < 2:
+        zero = torch.tensor(0.0, device=mask.device)
+        return zero, zero, {
+            "prompt_adapter_gate_consistency_loss": 0.0,
+            "prompt_adapter_delta_consistency_loss": 0.0,
+            "prompt_adapter_episode_count": float(len(adapter_outs)),
+        }
+    gate_values = [out.get("gate") for out in adapter_outs]
+    delta_values = [out.get("delta") for out in adapter_outs]
+    if not all(isinstance(value, torch.Tensor) for value in gate_values + delta_values):
+        zero = torch.tensor(0.0, device=mask.device)
+        return zero, zero, {
+            "prompt_adapter_gate_consistency_loss": 0.0,
+            "prompt_adapter_delta_consistency_loss": 0.0,
+            "prompt_adapter_episode_count": float(len(adapter_outs)),
+        }
+    first_gate = gate_values[0]
+    assert isinstance(first_gate, torch.Tensor)
+    mask = mask.to(device=first_gate.device, dtype=torch.bool)
+    if int(mask.sum().item()) == 0:
+        zero = first_gate.new_tensor(0.0)
+        return zero, zero, {
+            "prompt_adapter_gate_consistency_loss": 0.0,
+            "prompt_adapter_delta_consistency_loss": 0.0,
+            "prompt_adapter_episode_count": float(len(adapter_outs)),
+        }
+
+    gate_stack = torch.stack([value[mask] for value in gate_values if isinstance(value, torch.Tensor)])
+    gate_loss = gate_stack.var(dim=0, unbiased=False).mean()
+
+    delta_stack = torch.stack([value[mask] for value in delta_values if isinstance(value, torch.Tensor)])
+    pair_losses: list[torch.Tensor] = []
+    for left, right in zip(delta_stack[:-1], delta_stack[1:]):
+        left_norm = left.norm(dim=-1)
+        right_norm = right.norm(dim=-1)
+        valid = (left_norm > 1e-8) & (right_norm > 1e-8)
+        if bool(valid.any()):
+            cosine = F.cosine_similarity(left[valid], right[valid], dim=-1, eps=1e-12)
+            pair_losses.append((1.0 - cosine).mean())
+    delta_loss = torch.stack(pair_losses).mean() if pair_losses else gate_loss.new_tensor(0.0)
+    return gate_loss, delta_loss, {
+        "prompt_adapter_gate_consistency_loss": float(gate_loss.detach().item()),
+        "prompt_adapter_delta_consistency_loss": float(delta_loss.detach().item()),
+        "prompt_adapter_episode_count": float(len(adapter_outs)),
+    }
+
+
 def _adapter_mask(
     strategy: str,
     *,
@@ -1430,6 +1537,9 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
             "prompt_adapter_gate_mean": 0.0,
             "prompt_adapter_gate_min": 0.0,
             "prompt_adapter_gate_max": 0.0,
+            "prompt_adapter_raw_gate_mean": 0.0,
+            "prompt_adapter_raw_gate_min": 0.0,
+            "prompt_adapter_raw_gate_max": 0.0,
             "prompt_adapter_update_mask_ratio": 0.0,
             "prompt_adapter_clip_ratio": 0.0,
             "high_frequency_norm": 0.0,
@@ -1440,6 +1550,10 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
             "support_context_count": 0.0,
             "support_similarity_margin": 0.0,
             "support_similarity_entropy": 0.0,
+            "support_reliability_mean": 0.0,
+            "support_reliability_min": 0.0,
+            "support_reliability_max": 0.0,
+            "support_topk_mean_score": 0.0,
         }
 
     def scalar(name: str) -> float:
@@ -1457,6 +1571,9 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
         "prompt_adapter_gate_mean": scalar("prompt_gate_mean"),
         "prompt_adapter_gate_min": scalar("prompt_gate_min"),
         "prompt_adapter_gate_max": scalar("prompt_gate_max"),
+        "prompt_adapter_raw_gate_mean": scalar("prompt_raw_gate_mean"),
+        "prompt_adapter_raw_gate_min": scalar("prompt_raw_gate_min"),
+        "prompt_adapter_raw_gate_max": scalar("prompt_raw_gate_max"),
         "prompt_adapter_update_mask_ratio": scalar("prompt_update_mask_ratio"),
         "prompt_adapter_clip_ratio": scalar("prompt_update_clip_ratio"),
         "high_frequency_norm": scalar("high_frequency_norm"),
@@ -1467,6 +1584,10 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
         "support_context_count": scalar("support_context_count"),
         "support_similarity_margin": scalar("support_similarity_margin"),
         "support_similarity_entropy": scalar("support_similarity_entropy"),
+        "support_reliability_mean": scalar("support_reliability_mean"),
+        "support_reliability_min": scalar("support_reliability_min"),
+        "support_reliability_max": scalar("support_reliability_max"),
+        "support_topk_mean_score": scalar("support_topk_mean_score"),
     }
 
 
@@ -3294,6 +3415,16 @@ def run_single(
     prompt_adapter_message_help_class_balanced = bool(
         training_cfg.get("prompt_adapter_message_help_class_balanced", True)
     )
+    lambda_prompt_adapter_utility_gate = float(training_cfg.get("lambda_prompt_adapter_utility_gate", 0.0))
+    prompt_adapter_utility_gate_temperature = float(training_cfg.get("prompt_adapter_utility_gate_temperature", 0.02))
+    prompt_adapter_utility_gate_margin = float(training_cfg.get("prompt_adapter_utility_gate_margin", 0.0))
+    prompt_adapter_utility_gate_class_balanced = bool(
+        training_cfg.get("prompt_adapter_utility_gate_class_balanced", True)
+    )
+    prompt_adapter_utility_gate_source = str(training_cfg.get("prompt_adapter_utility_gate_source", "raw_gate"))
+    prompt_adapter_episode_count = max(1, int(training_cfg.get("prompt_adapter_episode_count_per_epoch", 1)))
+    lambda_prompt_adapter_gate_consistency = float(training_cfg.get("lambda_prompt_adapter_gate_consistency", 0.0))
+    lambda_prompt_adapter_delta_consistency = float(training_cfg.get("lambda_prompt_adapter_delta_consistency", 0.0))
     prompt_adapter_update_mask_strategy = str(training_cfg.get("prompt_adapter_update_mask", "all"))
     prompt_adapter_loss_mask_strategy = str(training_cfg.get("prompt_adapter_loss_mask", "query"))
     prompt_adapter_gate_budget = float(prompt_adapter_cfg.get("gate_budget", 0.35))
@@ -3352,55 +3483,171 @@ def run_single(
             "prompt_adapter_message_help_positive_ratio": 0.0,
             "prompt_adapter_message_help_count": 0.0,
         }
+        prompt_adapter_utility_gate = z.new_tensor(0.0)
+        prompt_adapter_utility_gate_stats = {
+            "prompt_adapter_utility_gate_loss": 0.0,
+            "prompt_adapter_utility_gate_target_mean": 0.0,
+            "prompt_adapter_utility_gate_count": 0.0,
+            "prompt_adapter_utility_gate_delta_mean": 0.0,
+            "prompt_adapter_utility_gate_positive_ratio": 0.0,
+        }
+        prompt_adapter_gate_consistency = z.new_tensor(0.0)
+        prompt_adapter_delta_consistency = z.new_tensor(0.0)
+        prompt_adapter_consistency_stats = {
+            "prompt_adapter_gate_consistency_loss": 0.0,
+            "prompt_adapter_delta_consistency_loss": 0.0,
+            "prompt_adapter_episode_count": 1.0,
+        }
         no_prompt_out: dict[str, Any] | None = None
         if prompt_adapter_module is not None:
-            adapter_update_mask = _adapter_mask(
-                prompt_adapter_update_mask_strategy,
-                train_mask=split.train_mask,
-                support_mask=support_mask,
-                query_mask=prompt_query_mask,
-            )
-            adapter_loss_mask = _adapter_mask(
-                prompt_adapter_loss_mask_strategy,
-                train_mask=split.train_mask,
-                support_mask=support_mask,
-                query_mask=prompt_query_mask,
-            )
-            if int(adapter_loss_mask.sum().item()) == 0:
-                adapter_loss_mask = split.train_mask.bool()
-            model_out, adapter_out, no_prompt_out = _forward_prompt_adapter(
-                model=model,
-                prompt_adapter_module=prompt_adapter_module,
-                z=z,
-                edge_index=graph.edge_index,
-                update_mask=adapter_update_mask,
-                support_mask=support_mask,
-                labels=graph.y,
-            )
             prompt_out = _default_prompt_graph_out(z, graph.edge_index)
-            cls_loss = F.cross_entropy(model_out["logits"][adapter_loss_mask], graph.y[adapter_loss_mask])
-            prompt_adapter_update_norm = prompt_adapter_update_norm_loss(adapter_out, adapter_update_mask)
-            prompt_adapter_budget = prompt_adapter_gate_budget_loss(
-                adapter_out,
-                max_gate=prompt_adapter_gate_budget,
-                mask=adapter_update_mask,
-            )
-            if lambda_prompt_adapter_message_help > 0.0:
-                prompt_adapter_message_help, prompt_adapter_message_help_stats = prompt_adapter_message_help_loss(
-                    logits_prompt=model_out["logits"],
-                    logits_no_prompt=no_prompt_out["logits"],
-                    labels=graph.y,
-                    mask=adapter_loss_mask,
-                    margin=prompt_adapter_message_help_margin,
-                    class_balanced=prompt_adapter_message_help_class_balanced,
+            episode_count = prompt_adapter_episode_count if support_query_enabled else 1
+            cls_losses: list[torch.Tensor] = []
+            update_losses: list[torch.Tensor] = []
+            budget_losses: list[torch.Tensor] = []
+            message_help_losses: list[torch.Tensor] = []
+            utility_gate_losses: list[torch.Tensor] = []
+            adapter_outs: list[dict[str, torch.Tensor]] = []
+            adapter_stats_list: list[dict[str, Any]] = []
+            message_help_stats_list: list[dict[str, Any]] = []
+            utility_gate_stats_list: list[dict[str, Any]] = []
+            support_query_stats_list: list[dict[str, Any]] = []
+            for episode_idx in range(episode_count):
+                if episode_idx == 0:
+                    episode_support_mask = support_mask
+                    episode_query_mask = prompt_query_mask
+                    episode_support_query_stats = support_query_stats
+                else:
+                    episode_support_mask, episode_query_mask, episode_support_query_stats = _support_query_masks_for_epoch(
+                        graph.y,
+                        split.train_mask,
+                        prompt_graph_cfg,
+                        seed=seed,
+                        epoch=epoch * 1009 + episode_idx,
+                    )
+                episode_loss_query_mask = episode_query_mask if support_query_enabled else split.train_mask
+                episode_update_mask = _adapter_mask(
+                    prompt_adapter_update_mask_strategy,
+                    train_mask=split.train_mask,
+                    support_mask=episode_support_mask,
+                    query_mask=episode_loss_query_mask,
                 )
-            adapter_train_stats = _prompt_adapter_diagnostics(adapter_out)
+                episode_loss_mask = _adapter_mask(
+                    prompt_adapter_loss_mask_strategy,
+                    train_mask=split.train_mask,
+                    support_mask=episode_support_mask,
+                    query_mask=episode_loss_query_mask,
+                )
+                if int(episode_loss_mask.sum().item()) == 0:
+                    episode_loss_mask = split.train_mask.bool()
+                episode_model_out, episode_adapter_out, episode_no_prompt_out = _forward_prompt_adapter(
+                    model=model,
+                    prompt_adapter_module=prompt_adapter_module,
+                    z=z,
+                    edge_index=graph.edge_index,
+                    update_mask=episode_update_mask,
+                    support_mask=episode_support_mask,
+                    labels=graph.y,
+                )
+                cls_losses.append(
+                    F.cross_entropy(
+                        episode_model_out["logits"][episode_loss_mask],
+                        graph.y[episode_loss_mask],
+                    )
+                )
+                update_losses.append(prompt_adapter_update_norm_loss(episode_adapter_out, episode_update_mask))
+                budget_losses.append(
+                    prompt_adapter_gate_budget_loss(
+                        episode_adapter_out,
+                        max_gate=prompt_adapter_gate_budget,
+                        mask=episode_update_mask,
+                    )
+                )
+                if lambda_prompt_adapter_message_help > 0.0:
+                    episode_message_help, episode_message_help_stats = prompt_adapter_message_help_loss(
+                        logits_prompt=episode_model_out["logits"],
+                        logits_no_prompt=episode_no_prompt_out["logits"],
+                        labels=graph.y,
+                        mask=episode_loss_mask,
+                        margin=prompt_adapter_message_help_margin,
+                        class_balanced=prompt_adapter_message_help_class_balanced,
+                    )
+                else:
+                    episode_message_help = z.new_tensor(0.0)
+                    episode_message_help_stats = dict(prompt_adapter_message_help_stats)
+                if lambda_prompt_adapter_utility_gate > 0.0:
+                    episode_utility_gate, episode_utility_gate_stats = prompt_adapter_utility_gate_loss(
+                        adapter_out=episode_adapter_out,
+                        logits_prompt=episode_model_out["logits"],
+                        logits_no_prompt=episode_no_prompt_out["logits"],
+                        labels=graph.y,
+                        mask=episode_loss_mask,
+                        temperature=prompt_adapter_utility_gate_temperature,
+                        margin=prompt_adapter_utility_gate_margin,
+                        class_balanced=prompt_adapter_utility_gate_class_balanced,
+                        gate_source=prompt_adapter_utility_gate_source,
+                    )
+                else:
+                    episode_utility_gate = z.new_tensor(0.0)
+                    episode_utility_gate_stats = dict(prompt_adapter_utility_gate_stats)
+                message_help_losses.append(episode_message_help)
+                utility_gate_losses.append(episode_utility_gate)
+                adapter_outs.append(episode_adapter_out)
+                episode_adapter_stats = _prompt_adapter_diagnostics(episode_adapter_out)
+                episode_adapter_stats.update(
+                    _prompt_adapter_delta_stats(
+                        logits_prompt=episode_model_out["logits"],
+                        logits_no_prompt=episode_no_prompt_out["logits"],
+                        labels=graph.y,
+                        mask=episode_loss_mask,
+                        prefix="adapter_query",
+                    )
+                )
+                adapter_stats_list.append(episode_adapter_stats)
+                message_help_stats_list.append(episode_message_help_stats)
+                utility_gate_stats_list.append(episode_utility_gate_stats)
+                support_query_stats_list.append(episode_support_query_stats)
+                model_out = episode_model_out
+                adapter_out = episode_adapter_out
+                no_prompt_out = episode_no_prompt_out
+
+            cls_loss = torch.stack(cls_losses).mean()
+            prompt_adapter_update_norm = torch.stack(update_losses).mean()
+            prompt_adapter_budget = torch.stack(budget_losses).mean()
+            prompt_adapter_message_help = torch.stack(message_help_losses).mean()
+            prompt_adapter_utility_gate = torch.stack(utility_gate_losses).mean()
+            consistency_mask = split.train_mask.bool()
+            prompt_adapter_gate_consistency, prompt_adapter_delta_consistency, prompt_adapter_consistency_stats = (
+                _prompt_adapter_episode_consistency_loss(adapter_outs, consistency_mask)
+            )
+            adapter_train_stats = _mean_float_stats(adapter_stats_list)
+            prompt_adapter_message_help_stats = _mean_float_stats(message_help_stats_list)
+            prompt_adapter_utility_gate_stats = _mean_float_stats(utility_gate_stats_list)
+            support_query_stats = _mean_float_stats(support_query_stats_list)
+            support_query_stats.setdefault("enabled", float(support_query_enabled))
+            support_query_stats.setdefault("support_count", float(support_mask.sum().item()))
+            support_query_stats.setdefault("query_count", float(prompt_query_mask.sum().item()))
+            support_query_stats.setdefault(
+                "train_support_ratio",
+                float(support_mask.float().sum().item() / max(1, int(split.train_mask.bool().sum().item()))),
+            )
+            adapter_train_stats.update(prompt_adapter_consistency_stats)
+            assert adapter_out is not None and no_prompt_out is not None
             adapter_train_stats.update(
                 _prompt_adapter_delta_stats(
                     logits_prompt=model_out["logits"],
                     logits_no_prompt=no_prompt_out["logits"],
                     labels=graph.y,
-                    mask=adapter_loss_mask,
+                    mask=split.train_mask,
+                    prefix="adapter_train",
+                )
+            )
+            adapter_train_stats.update(
+                _prompt_adapter_delta_stats(
+                    logits_prompt=model_out["logits"],
+                    logits_no_prompt=no_prompt_out["logits"],
+                    labels=graph.y,
+                    mask=prompt_query_mask,
                     prefix="adapter_query",
                 )
             )
@@ -3907,6 +4154,9 @@ def run_single(
             + lambda_prompt_adapter_update_norm * prompt_adapter_update_norm
             + lambda_prompt_adapter_gate_budget * prompt_adapter_budget
             + lambda_prompt_adapter_message_help * prompt_adapter_message_help
+            + lambda_prompt_adapter_utility_gate * prompt_adapter_utility_gate
+            + lambda_prompt_adapter_gate_consistency * prompt_adapter_gate_consistency
+            + lambda_prompt_adapter_delta_consistency * prompt_adapter_delta_consistency
         )
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite loss at epoch {epoch}: {loss.item()}")
@@ -3951,6 +4201,10 @@ def run_single(
             "prompt_adapter_update_norm_loss": float(prompt_adapter_update_norm.detach().item()),
             "prompt_adapter_gate_budget_loss": float(prompt_adapter_budget.detach().item()),
             "prompt_adapter_message_help_loss": float(prompt_adapter_message_help.detach().item()),
+            "prompt_adapter_utility_gate_loss": float(prompt_adapter_utility_gate.detach().item()),
+            "prompt_adapter_gate_consistency_loss": float(prompt_adapter_gate_consistency.detach().item()),
+            "prompt_adapter_delta_consistency_loss": float(prompt_adapter_delta_consistency.detach().item()),
+            "prompt_adapter_episode_count": float(prompt_adapter_episode_count),
             "lambda_edge_l1": lambda_edge_l1,
             "lambda_prompt_balance": lambda_prompt_balance,
             "lambda_prompt_role_diversity": lambda_prompt_role_diversity,
@@ -3978,8 +4232,15 @@ def run_single(
             "lambda_prompt_adapter_update_norm": lambda_prompt_adapter_update_norm,
             "lambda_prompt_adapter_gate_budget": lambda_prompt_adapter_gate_budget,
             "lambda_prompt_adapter_message_help": lambda_prompt_adapter_message_help,
+            "lambda_prompt_adapter_utility_gate": lambda_prompt_adapter_utility_gate,
+            "lambda_prompt_adapter_gate_consistency": lambda_prompt_adapter_gate_consistency,
+            "lambda_prompt_adapter_delta_consistency": lambda_prompt_adapter_delta_consistency,
             "prompt_adapter_message_help_margin": prompt_adapter_message_help_margin,
             "prompt_adapter_message_help_class_balanced": float(prompt_adapter_message_help_class_balanced),
+            "prompt_adapter_utility_gate_temperature": prompt_adapter_utility_gate_temperature,
+            "prompt_adapter_utility_gate_margin": prompt_adapter_utility_gate_margin,
+            "prompt_adapter_utility_gate_class_balanced": float(prompt_adapter_utility_gate_class_balanced),
+            "prompt_adapter_utility_gate_source": prompt_adapter_utility_gate_source,
             "prompt_adapter_update_mask_strategy": prompt_adapter_update_mask_strategy,
             "prompt_adapter_loss_mask_strategy": prompt_adapter_loss_mask_strategy,
             "prompt_adapter_gate_budget": prompt_adapter_gate_budget,
@@ -4034,6 +4295,7 @@ def run_single(
             **correction_alignment_stats,
             **adapter_train_stats,
             **prompt_adapter_message_help_stats,
+            **prompt_adapter_utility_gate_stats,
         }
         loss_curve.append(log_item)
         prompt_curve.append({"epoch": float(epoch), **prompt_aware_log, **prompt_log, **adapter_train_stats})
@@ -4099,6 +4361,10 @@ def run_single(
                     "prompt_adapter_update_norm_loss": float(prompt_adapter_update_norm.detach().item()),
                     "prompt_adapter_gate_budget_loss": float(prompt_adapter_budget.detach().item()),
                     "prompt_adapter_message_help_loss": float(prompt_adapter_message_help.detach().item()),
+                    "prompt_adapter_utility_gate_loss": float(prompt_adapter_utility_gate.detach().item()),
+                    "prompt_adapter_gate_consistency_loss": float(prompt_adapter_gate_consistency.detach().item()),
+                    "prompt_adapter_delta_consistency_loss": float(prompt_adapter_delta_consistency.detach().item()),
+                    "prompt_adapter_episode_count": float(prompt_adapter_episode_count),
                     "support_query_enabled": float(support_query_stats.get("enabled", False)),
                     "support_only_prompt_graph": float(support_only_prompt_graph),
                     "support_count": float(support_query_stats.get("support_count", 0)),
@@ -4116,6 +4382,7 @@ def run_single(
                     **correction_alignment_stats,
                     **adapter_train_stats,
                     **prompt_adapter_message_help_stats,
+                    **prompt_adapter_utility_gate_stats,
                     "edge_scale_multiplier": current_edge_scale_multiplier,
                     **_adapter_stats(model),
                 }
@@ -4293,8 +4560,16 @@ def run_single(
             "lambda_prompt_adapter_update_norm": lambda_prompt_adapter_update_norm,
             "lambda_prompt_adapter_gate_budget": lambda_prompt_adapter_gate_budget,
             "lambda_prompt_adapter_message_help": lambda_prompt_adapter_message_help,
+            "lambda_prompt_adapter_utility_gate": lambda_prompt_adapter_utility_gate,
+            "lambda_prompt_adapter_gate_consistency": lambda_prompt_adapter_gate_consistency,
+            "lambda_prompt_adapter_delta_consistency": lambda_prompt_adapter_delta_consistency,
+            "prompt_adapter_episode_count_per_epoch": prompt_adapter_episode_count,
             "prompt_adapter_message_help_margin": prompt_adapter_message_help_margin,
             "prompt_adapter_message_help_class_balanced": prompt_adapter_message_help_class_balanced,
+            "prompt_adapter_utility_gate_temperature": prompt_adapter_utility_gate_temperature,
+            "prompt_adapter_utility_gate_margin": prompt_adapter_utility_gate_margin,
+            "prompt_adapter_utility_gate_class_balanced": prompt_adapter_utility_gate_class_balanced,
+            "prompt_adapter_utility_gate_source": prompt_adapter_utility_gate_source,
             "prompt_adapter_update_mask": prompt_adapter_update_mask_strategy,
             "prompt_adapter_loss_mask": prompt_adapter_loss_mask_strategy,
             "prompt_adapter_gate_budget": prompt_adapter_gate_budget,
@@ -4495,6 +4770,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "prompt_adapter_raw_delta_norm",
         "prompt_adapter_delta_norm",
         "prompt_adapter_gate_mean",
+        "prompt_adapter_raw_gate_mean",
         "prompt_adapter_clip_ratio",
         "adapter_query_mean_delta_ce",
         "adapter_query_positive_delta_ratio",
@@ -4508,9 +4784,17 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "support_context_count",
         "support_similarity_margin",
         "support_similarity_entropy",
+        "support_reliability_mean",
+        "support_topk_mean_score",
         "prompt_adapter_message_help_loss",
         "prompt_adapter_message_help_mean_delta_ce",
         "prompt_adapter_message_help_positive_ratio",
+        "prompt_adapter_utility_gate_loss",
+        "prompt_adapter_utility_gate_target_mean",
+        "prompt_adapter_utility_gate_positive_ratio",
+        "prompt_adapter_gate_consistency_loss",
+        "prompt_adapter_delta_consistency_loss",
+        "prompt_adapter_episode_count",
     ]
     for key in diagnostic_summary_keys:
         values = [
@@ -4799,6 +5083,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "prompt_adapter_gate_mean",
             "prompt_adapter_gate_min",
             "prompt_adapter_gate_max",
+            "prompt_adapter_raw_gate_mean",
+            "prompt_adapter_raw_gate_min",
+            "prompt_adapter_raw_gate_max",
             "prompt_adapter_update_mask_ratio",
             "prompt_adapter_clip_ratio",
             "high_frequency_norm",
@@ -4816,16 +5103,28 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "adapter_test_positive_delta_ratio",
             "prompt_adapter_update_norm_loss",
             "prompt_adapter_gate_budget_loss",
+            "prompt_adapter_gate_consistency_loss",
+            "prompt_adapter_delta_consistency_loss",
+            "prompt_adapter_episode_count",
             "support_context_enabled",
             "support_context_available",
             "support_context_coverage",
             "support_context_count",
             "support_similarity_margin",
             "support_similarity_entropy",
+            "support_reliability_mean",
+            "support_reliability_min",
+            "support_reliability_max",
+            "support_topk_mean_score",
             "prompt_adapter_message_help_loss",
             "prompt_adapter_message_help_mean_delta_ce",
             "prompt_adapter_message_help_positive_ratio",
             "prompt_adapter_message_help_count",
+            "prompt_adapter_utility_gate_loss",
+            "prompt_adapter_utility_gate_target_mean",
+            "prompt_adapter_utility_gate_count",
+            "prompt_adapter_utility_gate_delta_mean",
+            "prompt_adapter_utility_gate_positive_ratio",
             "early_stopped",
             "stopped_epoch",
             "diagnostic_message_scale",
@@ -5097,6 +5396,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "prompt_adapter_gate_mean": result["best"].get("prompt_adapter_gate_mean", 0.0),
                     "prompt_adapter_gate_min": result["best"].get("prompt_adapter_gate_min", 0.0),
                     "prompt_adapter_gate_max": result["best"].get("prompt_adapter_gate_max", 0.0),
+                    "prompt_adapter_raw_gate_mean": result["best"].get("prompt_adapter_raw_gate_mean", 0.0),
+                    "prompt_adapter_raw_gate_min": result["best"].get("prompt_adapter_raw_gate_min", 0.0),
+                    "prompt_adapter_raw_gate_max": result["best"].get("prompt_adapter_raw_gate_max", 0.0),
                     "prompt_adapter_update_mask_ratio": result["best"].get("prompt_adapter_update_mask_ratio", 0.0),
                     "prompt_adapter_clip_ratio": result["best"].get("prompt_adapter_clip_ratio", 0.0),
                     "high_frequency_norm": result["best"].get("high_frequency_norm", 0.0),
@@ -5120,12 +5422,23 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     ),
                     "prompt_adapter_update_norm_loss": result["best"].get("prompt_adapter_update_norm_loss", 0.0),
                     "prompt_adapter_gate_budget_loss": result["best"].get("prompt_adapter_gate_budget_loss", 0.0),
+                    "prompt_adapter_gate_consistency_loss": result["best"].get(
+                        "prompt_adapter_gate_consistency_loss", 0.0
+                    ),
+                    "prompt_adapter_delta_consistency_loss": result["best"].get(
+                        "prompt_adapter_delta_consistency_loss", 0.0
+                    ),
+                    "prompt_adapter_episode_count": result["best"].get("prompt_adapter_episode_count", 0.0),
                     "support_context_enabled": result["best"].get("support_context_enabled", 0.0),
                     "support_context_available": result["best"].get("support_context_available", 0.0),
                     "support_context_coverage": result["best"].get("support_context_coverage", 0.0),
                     "support_context_count": result["best"].get("support_context_count", 0.0),
                     "support_similarity_margin": result["best"].get("support_similarity_margin", 0.0),
                     "support_similarity_entropy": result["best"].get("support_similarity_entropy", 0.0),
+                    "support_reliability_mean": result["best"].get("support_reliability_mean", 0.0),
+                    "support_reliability_min": result["best"].get("support_reliability_min", 0.0),
+                    "support_reliability_max": result["best"].get("support_reliability_max", 0.0),
+                    "support_topk_mean_score": result["best"].get("support_topk_mean_score", 0.0),
                     "prompt_adapter_message_help_loss": result["best"].get(
                         "prompt_adapter_message_help_loss", 0.0
                     ),
@@ -5137,6 +5450,21 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     ),
                     "prompt_adapter_message_help_count": result["best"].get(
                         "prompt_adapter_message_help_count", 0.0
+                    ),
+                    "prompt_adapter_utility_gate_loss": result["best"].get(
+                        "prompt_adapter_utility_gate_loss", 0.0
+                    ),
+                    "prompt_adapter_utility_gate_target_mean": result["best"].get(
+                        "prompt_adapter_utility_gate_target_mean", 0.0
+                    ),
+                    "prompt_adapter_utility_gate_count": result["best"].get(
+                        "prompt_adapter_utility_gate_count", 0.0
+                    ),
+                    "prompt_adapter_utility_gate_delta_mean": result["best"].get(
+                        "prompt_adapter_utility_gate_delta_mean", 0.0
+                    ),
+                    "prompt_adapter_utility_gate_positive_ratio": result["best"].get(
+                        "prompt_adapter_utility_gate_positive_ratio", 0.0
                     ),
                     "early_stopped": result.get("early_stopped", False),
                     "stopped_epoch": result.get("stopped_epoch", 0),

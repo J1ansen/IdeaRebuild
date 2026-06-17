@@ -147,11 +147,43 @@ def test_support_context_uses_only_support_labels() -> None:
     assert torch.allclose(out_a["h_adp"], out_b["h_adp"], atol=1e-6)
 
 
-def test_p14_p15_p16_variants_disable_prompt_graph_and_enable_adapter() -> None:
+def test_topk_support_context_uses_only_support_labels_and_reports_reliability() -> None:
+    z, edge_index, h_adp = _toy_graph()
+    labels = torch.tensor([0, 1, 2, 1])
+    support_mask = torch.tensor([True, True, False, False])
+    adapter = HeterophilyAwarePromptAdapter(
+        3,
+        5,
+        {
+            "dropout": 0.0,
+            "num_classes": 3,
+            "use_support_context": True,
+            "support_context_mode": "topk_attention",
+            "support_topk": 2,
+            "use_support_reliability_gate": True,
+            "zero_init_delta": False,
+        },
+    )
+
+    out_a = adapter(z=z, edge_index=edge_index, h_adp=h_adp, support_mask=support_mask, labels=labels)
+    labels_changed = labels.clone()
+    labels_changed[~support_mask] = torch.tensor([0, 0])
+    out_b = adapter(z=z, edge_index=edge_index, h_adp=h_adp, support_mask=support_mask, labels=labels_changed)
+
+    assert out_a["support_context_available"].item() == 1.0
+    assert out_a["support_reliability_mean"].item() >= 0.0
+    assert out_a["support_reliability_mean"].item() <= 1.0
+    assert out_a["prompt_gate_mean"].item() <= out_a["prompt_raw_gate_mean"].item()
+    assert torch.allclose(out_a["h_adp"], out_b["h_adp"], atol=1e-6)
+
+
+def test_p14_p15_p16_p17_p18_variants_disable_prompt_graph_and_enable_adapter() -> None:
     base = {"experiment": {"prompt_variant": "p14_freeze_prompt_adapter"}, "prompt_adapter": {"enabled": True}}
     p14 = _config_for_variant(base, "p14_freeze_prompt_adapter")
     p15 = _config_for_variant(base, "p15_hetero_prompt_adapter")
     p16 = _config_for_variant(base, "p16_support_prompt_adapter")
+    p17 = _config_for_variant(base, "p17_selective_support_adapter")
+    p18 = _config_for_variant(base, "p18_episode_consistency_adapter")
     noprompt = _config_for_variant(base, "noprompt")
 
     assert p14["prompt_graph"]["enabled"] is False
@@ -165,4 +197,14 @@ def test_p14_p15_p16_variants_disable_prompt_graph_and_enable_adapter() -> None:
     assert p16["prompt_adapter"]["enabled"] is True
     assert p16["prompt_adapter"]["use_support_context"] is True
     assert p16["training"]["lambda_prompt_adapter_message_help"] > 0.0
+    assert p17["prompt_adapter"]["support_context_mode"] == "topk_attention"
+    assert p17["prompt_adapter"]["use_support_uncertainty_features"] is True
+    assert p17["prompt_adapter"]["use_support_reliability_gate"] is True
+    assert p17["training"]["lambda_prompt_adapter_utility_gate"] > 0.0
+    assert p17["training"]["prompt_adapter_utility_gate_source"] == "effective_gate"
+    assert p18["prompt_adapter"]["support_context_mode"] == "topk_attention"
+    assert p18["prompt_adapter"]["use_support_reliability_gate"] is True
+    assert p18["training"]["prompt_adapter_episode_count_per_epoch"] == 3
+    assert p18["training"]["lambda_prompt_adapter_gate_consistency"] > 0.0
+    assert p18["training"]["lambda_prompt_adapter_delta_consistency"] > 0.0
     assert noprompt["prompt_adapter"]["enabled"] is False
