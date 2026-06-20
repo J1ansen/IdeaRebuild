@@ -3,7 +3,7 @@
 This module applies a prompt-controlled structural filter on the adapted GP2F
 branch without adding prompt nodes or changing graph edges.  It keeps four
 fixed channels separate (ego, one-hop low-pass, two-hop and high-pass) and uses
-a conservative global prior plus a small node-wise residual router.
+a conservative global prior plus a node-wise residual router and gate.
 """
 
 from __future__ import annotations
@@ -46,7 +46,9 @@ class P21LiteAdaptiveFilter(nn.Module):
         self.config = dict(config or {})
         self.context_detach = bool(self.config.get("context_detach", True))
         self.residual_scale = float(self.config.get("residual_scale", 0.1))
-        self.beta_max = float(self.config.get("beta_max", 0.20))
+        self.use_node_wise_gate = bool(self.config.get("use_node_wise_gate", True))
+        self.beta_max = float(self.config.get("beta_max", self.config.get("gate_max", 0.20)))
+        self.gate_max = float(self.config.get("gate_max", self.beta_max))
         self.max_update_norm = float(self.config.get("max_update_norm", 0.05))
         beta_init = float(self.config.get("beta_init", 0.05))
         beta_prob = beta_init / max(self.beta_max, 1e-12)
@@ -70,14 +72,30 @@ class P21LiteAdaptiveFilter(nn.Module):
         )
         nn.init.zeros_(self.router[-1].weight)
         nn.init.zeros_(self.router[-1].bias)
-        self.project = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+        self.gate_router = nn.Sequential(
+            nn.Linear(descriptor_dim, router_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Linear(router_hidden, 1),
         )
-        nn.init.normal_(self.project[-1].weight, std=0.02)
-        nn.init.zeros_(self.project[-1].bias)
+        nn.init.zeros_(self.gate_router[-1].weight)
+        gate_prob = beta_init / max(self.gate_max, 1e-12)
+        nn.init.constant_(self.gate_router[-1].bias, _init_logit_from_probability(gate_prob))
+        self.channel_projects = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+                for _ in CHANNEL_NAMES
+            ]
+        )
+        for project in self.channel_projects:
+            nn.init.normal_(project[-1].weight, std=0.02)
+            nn.init.zeros_(project[-1].bias)
+        self.project = self.channel_projects[0]
 
     def _channels(self, h: torch.Tensor, edge_index: torch.Tensor) -> dict[str, torch.Tensor]:
         num_nodes = int(h.size(0))
@@ -164,23 +182,36 @@ class P21LiteAdaptiveFilter(nn.Module):
 
         stacked = torch.stack([ego, low, two, high], dim=1)
         h_filter = torch.einsum("nk,nkh->nh", alpha, stacked)
-        raw_delta = self.project(h_filter - ego)
+        channel_residuals = stacked - ego.unsqueeze(1)
+        raw_channel_deltas = torch.stack(
+            [project(channel_residuals[:, idx, :]) for idx, project in enumerate(self.channel_projects)],
+            dim=1,
+        )
+        raw_delta = torch.einsum("nk,nkh->nh", alpha, raw_channel_deltas)
         raw_norm = raw_delta.norm(dim=-1, keepdim=True)
         if self.max_update_norm > 0.0:
             clip_scale = (self.max_update_norm / raw_norm.clamp_min(1e-12)).clamp_max(1.0)
             delta = raw_delta * clip_scale
+            channel_deltas = raw_channel_deltas * clip_scale.unsqueeze(1)
             clip_ratio = (raw_norm.squeeze(-1) > self.max_update_norm).to(dtype=h_adp.dtype).mean()
         else:
             delta = raw_delta
+            channel_deltas = raw_channel_deltas
             clip_ratio = h_adp.new_tensor(0.0)
 
         beta = self.beta_max * torch.sigmoid(self.beta_logit)
+        if self.use_node_wise_gate:
+            raw_gate = self.gate_router(descriptor).squeeze(-1)
+            gate = self.gate_max * torch.sigmoid(raw_gate)
+        else:
+            raw_gate = self.beta_logit.expand(num_nodes)
+            gate = beta.expand(num_nodes)
         effective_mask = (
             torch.ones(num_nodes, dtype=torch.bool, device=h_adp.device)
             if update_mask is None
             else update_mask.to(device=h_adp.device, dtype=torch.bool)
         )
-        update = beta * delta * effective_mask.to(dtype=h_adp.dtype).unsqueeze(-1)
+        update = gate.unsqueeze(-1) * delta * effective_mask.to(dtype=h_adp.dtype).unsqueeze(-1)
         h_prompted = h_adp + update
         update_norm = update.norm(dim=-1)
         delta_norm = delta.norm(dim=-1)
@@ -193,9 +224,11 @@ class P21LiteAdaptiveFilter(nn.Module):
             "filter_update": update,
             "delta": delta,
             "raw_delta": raw_delta,
+            "channel_deltas": channel_deltas,
+            "raw_channel_deltas": raw_channel_deltas,
             "update": update,
-            "gate": beta.expand(num_nodes),
-            "raw_gate": beta.expand(num_nodes),
+            "gate": gate,
+            "raw_gate": raw_gate,
             "beta": beta,
             "alpha": alpha,
             "alpha_global": alpha_global,
@@ -206,18 +239,25 @@ class P21LiteAdaptiveFilter(nn.Module):
             "prompt_update_max_norm": update_norm.max() if update_norm.numel() > 0 else h_adp.new_tensor(0.0),
             "prompt_raw_delta_norm": raw_delta.norm(dim=-1).mean(),
             "prompt_delta_norm": delta_norm.mean(),
-            "prompt_gate_mean": beta,
-            "prompt_gate_min": beta,
-            "prompt_gate_max": beta,
-            "prompt_raw_gate_mean": beta,
-            "prompt_raw_gate_min": beta,
-            "prompt_raw_gate_max": beta,
+            "prompt_gate_mean": gate.mean(),
+            "prompt_gate_min": gate.min() if gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "prompt_gate_max": gate.max() if gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "prompt_raw_gate_mean": raw_gate.mean(),
+            "prompt_raw_gate_min": raw_gate.min() if raw_gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "prompt_raw_gate_max": raw_gate.max() if raw_gate.numel() > 0 else h_adp.new_tensor(0.0),
             "prompt_update_mask_ratio": effective_mask.to(dtype=h_adp.dtype).mean(),
             "prompt_update_clip_ratio": clip_ratio,
             "high_frequency_norm": high.norm(dim=-1).mean(),
             "low_frequency_norm": low.norm(dim=-1).mean(),
             "p21_filter_enabled": h_adp.new_tensor(1.0),
             "p21_beta": beta.detach(),
+            "p21_gate_mean": gate.mean(),
+            "p21_gate_min": gate.min() if gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "p21_gate_max": gate.max() if gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "p21_channel_delta_ego_norm": channel_deltas[:, 0, :].norm(dim=-1).mean(),
+            "p21_channel_delta_low_norm": channel_deltas[:, 1, :].norm(dim=-1).mean(),
+            "p21_channel_delta_two_norm": channel_deltas[:, 2, :].norm(dim=-1).mean(),
+            "p21_channel_delta_high_norm": channel_deltas[:, 3, :].norm(dim=-1).mean(),
             "p21_alpha_entropy": alpha_entropy.mean(),
             "p21_alpha_ego_mean": alpha[:, 0].mean(),
             "p21_alpha_low_mean": alpha[:, 1].mean(),

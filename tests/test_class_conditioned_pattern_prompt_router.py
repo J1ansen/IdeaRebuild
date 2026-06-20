@@ -474,6 +474,8 @@ def test_p21_lite_adaptive_filter_shapes_prior_and_mask() -> None:
         atol=1e-5,
     )
     assert 0.049 <= float(out["beta"].item()) <= 0.051
+    assert out["gate"].shape == (5,)
+    assert out["channel_deltas"].shape == (5, 4, 6)
     assert torch.allclose(out["update"][~update_mask], torch.zeros_like(out["update"][~update_mask]))
     assert float(out["delta"].norm(dim=-1).max().item()) <= 0.050001
     for key in (
@@ -482,6 +484,8 @@ def test_p21_lite_adaptive_filter_shapes_prior_and_mask() -> None:
         "p21_alpha_two_mean",
         "p21_alpha_high_mean",
         "p21_channel_high_norm",
+        "p21_gate_mean",
+        "p21_channel_delta_low_norm",
         "p21_ego_low_discrepancy",
     ):
         assert key in out
@@ -495,11 +499,51 @@ def test_p21_lite_adaptive_filter_backpropagates_to_router_and_beta() -> None:
     loss.backward()
 
     router_grads = [p.grad for p in filt.router.parameters() if p.grad is not None]
+    gate_grads = [p.grad for p in filt.gate_router.parameters() if p.grad is not None]
     project_grads = [p.grad for p in filt.project.parameters() if p.grad is not None]
     assert any(g.abs().sum().item() > 0 for g in router_grads)
+    assert any(g.abs().sum().item() > 0 for g in gate_grads)
     assert any(g.abs().sum().item() > 0 for g in project_grads)
-    assert filt.beta_logit.grad is not None
-    assert filt.beta_logit.grad.abs().sum().item() > 0
+
+
+def test_p21_channel_utility_supervision_trains_router() -> None:
+    import torch.nn as nn
+
+    from experiments.run_gp2f_prompt_graph import p21_channel_utility_supervision_loss
+
+    torch.manual_seed(0)
+    z, edge_index, h_adp = _toy_graph()
+    filt = _p21_filter(residual_scale=0.3, beta_init=0.1, beta_max=0.3, gate_max=0.3)
+    h_pre = torch.randn(5, 6)
+    base_logits = torch.randn(5, 3)
+    out = filt(z=z, edge_index=edge_index, h_adp=h_adp, base_logits=base_logits, h_pre=h_pre)
+
+    class _Model:
+        def __init__(self) -> None:
+            self.alpha = torch.tensor(0.5)
+            self.classifier = nn.Linear(6, 3)
+
+    model = _Model()
+    labels = torch.tensor([0, 1, 2, 0, 1])
+    mask = torch.ones(5, dtype=torch.bool)
+    no_prompt_logits = model.classifier(0.5 * h_pre + 0.5 * h_adp)
+    loss, stats = p21_channel_utility_supervision_loss(
+        adapter_out=out,
+        model=model,
+        h_pre=h_pre,
+        h_adp_base=h_adp,
+        logits_no_prompt=no_prompt_logits,
+        labels=labels,
+        mask=mask,
+        temperature=0.05,
+    )
+
+    assert torch.isfinite(loss)
+    assert stats["p21_channel_utility_count"] == 5.0
+    assert "p21_channel_utility_mean_oracle_delta_ce" in stats
+    loss.backward()
+    router_grads = [p.grad for p in filt.router.parameters() if p.grad is not None]
+    assert any(g.abs().sum().item() > 0 for g in router_grads)
 
 
 def test_deployment_utility_loss_trains_actual_prompt_logits() -> None:
@@ -606,12 +650,17 @@ def test_p21_variant_config_enables_lite_adaptive_filter() -> None:
     assert cfg["training"]["freeze_base_model"] is True
     assert cfg["training"]["early_stop_metric"] == "train_loss"
     assert cfg["prompt_adapter"]["channel_prior"] == [0.45, 0.15, 0.25, 0.15]
-    assert cfg["prompt_adapter"]["beta_init"] == 0.05
-    assert cfg["prompt_adapter"]["beta_max"] == 0.20
-    assert cfg["prompt_adapter"]["max_update_norm"] == 0.05
+    assert cfg["prompt_adapter"]["beta_init"] == 0.10
+    assert cfg["prompt_adapter"]["use_node_wise_gate"] is True
+    assert cfg["prompt_adapter"]["use_candidate_pool"] is False
+    assert cfg["training"]["prompt_adapter_update_mask"] == "all"
+    assert cfg["training"]["lambda_p21_channel_utility"] == 0.20
+    assert cfg["prompt_adapter"]["beta_max"] == 0.30
+    assert cfg["prompt_adapter"]["gate_max"] == 0.30
+    assert cfg["prompt_adapter"]["max_update_norm"] == 0.08
     assert cfg["training"]["lambda_prompt_router_pattern_supervision"] == 0.0
     assert cfg["training"]["lambda_prompt_router_pattern_utility"] == 0.0
-    assert cfg["training"]["lambda_prompt_router_deployment_utility"] == 0.05
+    assert cfg["training"]["lambda_prompt_router_deployment_utility"] == 0.10
     assert cfg["training"]["lambda_prompt_adapter_gate_budget"] == 0.0
     assert cfg["training"]["lambda_prompt_adapter_utility_gate"] == 0.0
     assert cfg["training"]["prompt_adapter_episode_count_per_epoch"] == 1

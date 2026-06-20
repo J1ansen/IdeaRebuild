@@ -50,14 +50,16 @@ prompt_adapter:
   hidden_dim: 128
   dropout: 0.1
   context_detach: true
-  residual_scale: 0.10
+  residual_scale: 0.30
+  use_node_wise_gate: true
   channel_prior: [0.45, 0.15, 0.25, 0.15]
-  beta_init: 0.05
-  beta_max: 0.20
-  max_update_norm: 0.05
-  use_candidate_pool: true
+  beta_init: 0.10
+  beta_max: 0.30
+  gate_max: 0.30
+  max_update_norm: 0.08
+  use_candidate_pool: false
   candidate_pool_strategy: utility_structural
-  candidate_pool_ratio: 0.30
+  candidate_pool_ratio: 1.00
   candidate_pool_include_train: true
   candidate_pool_structural_weight: 0.35
   candidate_pool_uncertainty_weight: 0.35
@@ -82,9 +84,9 @@ training:
   train_prompt_adapter: true
   train_prompt_graph_module: false
   train_prompt_aware_module: false
-  prompt_adapter_update_mask: candidate_pool
+  prompt_adapter_update_mask: all
   prompt_adapter_loss_mask: query
-  lambda_prompt_adapter_update_norm: 0.02
+  lambda_prompt_adapter_update_norm: 0.01
   lambda_prompt_adapter_gate_budget: 0.0
   lambda_prompt_adapter_message_help: 0.05
   prompt_adapter_message_help_margin: 0.005
@@ -99,7 +101,13 @@ training:
   lambda_prompt_router_pattern_supervision: 0.0
   lambda_prompt_router_pattern_utility: 0.0
   lambda_prompt_router_class_pattern_reliability: 0.0
-  lambda_prompt_router_deployment_utility: 0.05
+  lambda_p21_channel_utility: 0.20
+  p21_channel_utility_temperature: 0.02
+  p21_channel_utility_margin: 0.0
+  p21_channel_utility_min_teacher_delta: 0.0
+  p21_channel_utility_gate_source: actual
+  p21_channel_utility_class_balanced: true
+  lambda_prompt_router_deployment_utility: 0.10
   prompt_router_deployment_utility_margin: 0.0005
   prompt_router_deployment_utility_anti_harm_weight: 0.5
   prompt_router_deployment_utility_anti_harm_margin: 0.0
