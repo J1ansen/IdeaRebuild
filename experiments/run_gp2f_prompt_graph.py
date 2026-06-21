@@ -349,7 +349,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training.setdefault("p21_channel_utility_temperature", 0.10)
                 training.setdefault("p21_channel_utility_margin", 0.001)
                 training.setdefault("p21_channel_utility_min_teacher_delta", 0.001)
-                training.setdefault("p21_channel_utility_target_mode", "reject_margin_softmax")
+                training.setdefault("p21_channel_utility_target_mode", "hard_reject_or_best")
                 training.setdefault("p21_channel_utility_gate_source", "actual")
                 training.setdefault("p21_channel_utility_class_balanced", True)
                 training.setdefault("lambda_p21_gate_utility", 0.10)
@@ -2959,6 +2959,7 @@ def p21_channel_utility_supervision_loss(
         f"{prefix}_router_agreement_to_oracle": 0.0,
         f"{prefix}_teacher_entropy": 0.0,
         f"{prefix}_gate_target_mean": 0.0,
+        f"{prefix}_gate_target_std": 0.0,
         f"{prefix}_gate_mean": 0.0,
         f"{prefix}_gate_accuracy_to_oracle": 0.0,
         f"{prefix}_best_channel_acc": 0.0,
@@ -3041,7 +3042,14 @@ def p21_channel_utility_supervision_loss(
         if gate_target_mode == "binary":
             gate_target = (best_nonreject_delta > float(gate_margin)).to(dtype=alpha.dtype)
         else:
-            gate_target = torch.sigmoid(gate_target_arg).to(dtype=alpha.dtype)
+            soft_gate_target = torch.sigmoid(gate_target_arg).to(dtype=alpha.dtype)
+            # Reject-aware gate: nodes without enough non-reject utility must
+            # explicitly learn no-update instead of a soft half-open gate.
+            gate_target = torch.where(
+                best_nonreject_delta > float(gate_margin),
+                soft_gate_target,
+                torch.zeros_like(soft_gate_target),
+            )
 
         selected_logits = logits_channels[torch.arange(idx.numel(), device=alpha.device), best_idx]
         y = labels[idx]
@@ -3093,6 +3101,7 @@ def p21_channel_utility_supervision_loss(
         **empty,
         f"{prefix}_loss": float(loss.detach().item()),
         f"{prefix}_gate_loss": float(gate_loss.detach().item()),
+        f"{prefix}_gate_supervision_loss": float(gate_loss.detach().item()),
         f"{prefix}_count": float(idx.numel()),
         f"{prefix}_mean_oracle_delta_ce": float(best_delta.detach().mean().item()),
         f"{prefix}_best_channel_delta_ce": float(best_delta.detach().mean().item()),
@@ -3106,6 +3115,7 @@ def p21_channel_utility_supervision_loss(
         ),
         f"{prefix}_teacher_entropy": float(teacher_entropy.detach().mean().item()),
         f"{prefix}_gate_target_mean": float(gate_target.detach().mean().item()),
+        f"{prefix}_gate_target_std": float(gate_target.detach().std(unbiased=False).item()),
         f"{prefix}_gate_mean": float(gate_prob.detach().mean().item()),
         f"{prefix}_gate_accuracy_to_oracle": float((gate_binary == oracle_binary).float().mean().item()),
         f"{prefix}_best_channel_acc": float(oracle_acc.detach().item()),
@@ -3119,6 +3129,33 @@ def p21_channel_utility_supervision_loss(
         stats[f"{prefix}_{name}_mean_delta_ce"] = float(utility[:, channel_idx].detach().mean().item())
         stats[f"{prefix}_{name}_best_ratio"] = float((best_idx == channel_idx).float().mean().item())
         stats[f"{prefix}_{name}_alpha_mean"] = float(alpha[idx, channel_idx].detach().mean().item())
+    if prefix == "p21_channel_utility":
+        stats.update(
+            {
+                "p21_oracle_best_channel_delta_ce": stats[f"{prefix}_best_channel_delta_ce"],
+                "p21_oracle_best_channel_positive_ratio": stats[f"{prefix}_best_channel_positive_ratio"],
+                "p21_oracle_best_channel_acc": stats[f"{prefix}_best_channel_acc"],
+                "p21_oracle_best_channel_macro_f1": stats[f"{prefix}_best_channel_macro_f1"],
+                "p21_oracle_best_channel_acc_lift_vs_no_prompt": stats[
+                    f"{prefix}_best_channel_acc_lift_vs_no_prompt"
+                ],
+                "p21_oracle_best_channel_macro_f1_lift_vs_no_prompt": stats[
+                    f"{prefix}_best_channel_macro_f1_lift_vs_no_prompt"
+                ],
+                "p21_reject_best_ratio": stats[f"{prefix}_reject_best_ratio"],
+                "p21_low_best_ratio": stats[f"{prefix}_low_best_ratio"],
+                "p21_two_best_ratio": stats[f"{prefix}_two_best_ratio"],
+                "p21_high_best_ratio": stats[f"{prefix}_high_best_ratio"],
+                "p21_routed_delta_ce": stats[f"{prefix}_routed_delta_ce"],
+                "p21_routed_positive_ratio": stats[f"{prefix}_routed_positive_ratio"],
+                "p21_router_agreement_to_oracle": stats[f"{prefix}_router_agreement_to_oracle"],
+                "p21_teacher_entropy": stats[f"{prefix}_teacher_entropy"],
+                "p21_gate_supervision_loss": stats[f"{prefix}_gate_supervision_loss"],
+                "p21_gate_target_mean": stats[f"{prefix}_gate_target_mean"],
+                "p21_gate_target_std": stats[f"{prefix}_gate_target_std"],
+                "p21_gate_accuracy_to_oracle": stats[f"{prefix}_gate_accuracy_to_oracle"],
+            }
+        )
     return loss, gate_loss, stats
 
 
@@ -5398,6 +5435,7 @@ def run_single(
             "p21_channel_utility_router_agreement_to_oracle": 0.0,
             "p21_channel_utility_teacher_entropy": 0.0,
             "p21_channel_utility_gate_target_mean": 0.0,
+            "p21_channel_utility_gate_target_std": 0.0,
             "p21_channel_utility_gate_mean": 0.0,
             "p21_channel_utility_gate_accuracy_to_oracle": 0.0,
             "p21_channel_utility_best_channel_acc": 0.0,
@@ -7169,6 +7207,24 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_low_two_discrepancy",
         "p21_no_prompt_entropy",
         "p21_no_prompt_margin",
+        "p21_oracle_best_channel_delta_ce",
+        "p21_oracle_best_channel_positive_ratio",
+        "p21_oracle_best_channel_acc",
+        "p21_oracle_best_channel_macro_f1",
+        "p21_oracle_best_channel_acc_lift_vs_no_prompt",
+        "p21_oracle_best_channel_macro_f1_lift_vs_no_prompt",
+        "p21_reject_best_ratio",
+        "p21_low_best_ratio",
+        "p21_two_best_ratio",
+        "p21_high_best_ratio",
+        "p21_routed_delta_ce",
+        "p21_routed_positive_ratio",
+        "p21_router_agreement_to_oracle",
+        "p21_teacher_entropy",
+        "p21_gate_supervision_loss",
+        "p21_gate_target_mean",
+        "p21_gate_target_std",
+        "p21_gate_accuracy_to_oracle",
         "adapter_query_mean_delta_ce",
         "adapter_query_positive_delta_ratio",
         "adapter_val_mean_delta_ce",
@@ -7240,6 +7296,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_channel_utility_loss",
         "p21_gate_utility_loss",
         "p21_channel_utility_gate_loss",
+        "p21_channel_utility_gate_supervision_loss",
         "p21_channel_utility_count",
         "p21_channel_utility_mean_oracle_delta_ce",
         "p21_channel_utility_best_channel_delta_ce",
@@ -7251,6 +7308,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_channel_utility_router_agreement_to_oracle",
         "p21_channel_utility_teacher_entropy",
         "p21_channel_utility_gate_target_mean",
+        "p21_channel_utility_gate_target_std",
         "p21_channel_utility_gate_mean",
         "p21_channel_utility_gate_accuracy_to_oracle",
         "p21_channel_utility_best_channel_acc",
@@ -7391,6 +7449,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     p21_oracle_fields = [
         "loss",
         "gate_loss",
+        "gate_supervision_loss",
         "count",
         "mean_oracle_delta_ce",
         "best_channel_delta_ce",
@@ -7402,6 +7461,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "router_agreement_to_oracle",
         "teacher_entropy",
         "gate_target_mean",
+        "gate_target_std",
         "gate_mean",
         "gate_accuracy_to_oracle",
         "best_channel_acc",

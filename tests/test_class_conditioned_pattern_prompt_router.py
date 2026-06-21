@@ -589,6 +589,8 @@ def test_p21_channel_utility_can_reject_when_no_channel_helps() -> None:
     assert torch.isfinite(gate_loss)
     assert stats["p21_channel_utility_reject_best_ratio"] == 1.0
     assert stats["p21_channel_utility_best_channel_positive_ratio"] == 0.0
+    assert stats["p21_channel_utility_gate_target_mean"] == 0.0
+    assert stats["p21_channel_utility_gate_accuracy_to_oracle"] == 1.0
 
 
 def test_deployment_utility_loss_trains_actual_prompt_logits() -> None:
@@ -704,6 +706,7 @@ def test_p21_variant_config_enables_lite_adaptive_filter() -> None:
     assert cfg["training"]["lambda_p21_channel_utility"] == 0.20
     assert cfg["training"]["p21_channel_utility_temperature"] == 0.10
     assert cfg["training"]["p21_channel_utility_min_teacher_delta"] == 0.001
+    assert cfg["training"]["p21_channel_utility_target_mode"] == "hard_reject_or_best"
     assert cfg["training"]["lambda_p21_gate_utility"] == 0.10
     assert cfg["training"]["p21_gate_target_mode"] == "soft"
     assert cfg["prompt_adapter"]["beta_max"] == 0.30

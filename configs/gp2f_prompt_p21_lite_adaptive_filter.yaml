@@ -108,7 +108,7 @@ training:
   p21_channel_utility_temperature: 0.10
   p21_channel_utility_margin: 0.001
   p21_channel_utility_min_teacher_delta: 0.001
-  p21_channel_utility_target_mode: reject_margin_softmax
+  p21_channel_utility_target_mode: hard_reject_or_best
   p21_channel_utility_gate_source: actual
   p21_channel_utility_class_balanced: true
   lambda_p21_gate_utility: 0.10
