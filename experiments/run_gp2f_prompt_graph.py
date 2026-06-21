@@ -36,12 +36,14 @@ from models import (
     FaithfulGP2F,
     HeterophilyAwarePromptAdapter,
     P21LiteAdaptiveFilter,
+    P21V2HeteroFilter,
     PromptAwareGP2F,
     PromptGraphModuleP1,
     UtilitySupervisedPatternPromptRouter,
     load_pretrained_gcn,
 )
 from models.p21_adaptive_filter import CHANNEL_NAMES
+from models.p21_v2_hetero_filter import P21_V2_CHANNEL_NAMES
 from models.class_conditioned_pattern_prompt_router import PATTERN_NAMES, prompt_router_pattern_balance_loss
 from models.hetero_prompt_adapter import (
     prompt_adapter_gate_budget_loss,
@@ -95,6 +97,7 @@ PROMPT_GRAPH_VARIANTS = {
     "p20_class_conditioned_pattern_prompt_router",
     "p20_utility_supervised_pattern_prompt_router",
     "p21_lite_adaptive_filter",
+    "p21_v2_hetero_filter",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -124,6 +127,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         "p20_class_conditioned_pattern_prompt_router",
         "p20_utility_supervised_pattern_prompt_router",
         "p21_lite_adaptive_filter",
+        "p21_v2_hetero_filter",
     }
     if variant == "noprompt" or variant in adapter_variants:
         prompt_graph["enabled"] = False
@@ -232,12 +236,16 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
             "p20_class_conditioned_pattern_prompt_router",
             "p20_utility_supervised_pattern_prompt_router",
             "p21_lite_adaptive_filter",
+            "p21_v2_hetero_filter",
         }:
             training.setdefault("freeze_base_model", False)
             training.setdefault("log_every", 5)
             training["train_prompt_adapter"] = True
-            if variant == "p21_lite_adaptive_filter":
-                prompt_adapter.setdefault("module_type", "p21_lite_adaptive_filter")
+            if variant in {"p21_lite_adaptive_filter", "p21_v2_hetero_filter"}:
+                prompt_adapter.setdefault(
+                    "module_type",
+                    "p21_v2_hetero_filter" if variant == "p21_v2_hetero_filter" else "p21_lite_adaptive_filter",
+                )
                 training["freeze_base_model"] = True
                 training["early_stop_metric"] = str(training.get("early_stop_metric", "val_acc"))
             elif variant == "p20_utility_supervised_pattern_prompt_router":
@@ -322,7 +330,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
             training.setdefault("prompt_router_pattern_utility_temperature", 0.5)
             training.setdefault("prompt_router_pattern_supervision_class_balanced", True)
             training.setdefault("prompt_router_pattern_utility_class_balanced", True)
-            if variant == "p21_lite_adaptive_filter":
+            if variant in {"p21_lite_adaptive_filter", "p21_v2_hetero_filter"}:
                 p21_defaults = {
                     "context_detach": True,
                     "residual_scale": 0.30,
@@ -335,17 +343,29 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 for key, value in p21_defaults.items():
                     if key not in explicit_prompt_adapter_keys:
                         prompt_adapter[key] = value
-                prompt_adapter.setdefault("channel_set", "reject_low_two_high")
+                if variant == "p21_v2_hetero_filter":
+                    prompt_adapter.setdefault("channel_set", "reject_low_two_high_compat_role")
+                    prompt_adapter.setdefault("channel_prior", [0.50, 0.10, 0.12, 0.10, 0.10, 0.08])
+                    prompt_adapter.setdefault("use_compat_channel", True)
+                    prompt_adapter.setdefault("compat_source", "no_prompt_logits")
+                    prompt_adapter.setdefault("compat_matrix", "support_estimated")
+                    prompt_adapter.setdefault("compat_smoothing", 0.10)
+                    prompt_adapter.setdefault("compat_detach_logits", True)
+                    prompt_adapter.setdefault("compat_detach_prototypes", True)
+                    prompt_adapter.setdefault("use_role_channel", True)
+                    prompt_adapter.setdefault("role_hidden_dim", 64)
+                else:
+                    prompt_adapter.setdefault("channel_set", "reject_low_two_high")
+                    prompt_adapter.setdefault("channel_prior", [0.50, 0.15, 0.20, 0.15])
                 prompt_adapter.setdefault("use_reject_channel", True)
                 prompt_adapter.setdefault("reject_channel_index", 0)
-                prompt_adapter.setdefault("channel_prior", [0.50, 0.15, 0.20, 0.15])
                 prompt_adapter["use_candidate_pool"] = False
                 prompt_adapter["candidate_pool_ratio"] = 1.0
                 training["lambda_prompt_router_pattern_balance"] = 0.0
                 training["lambda_prompt_router_pattern_supervision"] = 0.0
                 training["lambda_prompt_router_pattern_utility"] = 0.0
                 training["lambda_prompt_router_class_pattern_reliability"] = 0.0
-                training.setdefault("lambda_p21_channel_utility", 0.20)
+                training.setdefault("lambda_p21_channel_utility", 0.30 if variant == "p21_v2_hetero_filter" else 0.20)
                 training.setdefault("p21_channel_utility_temperature", 0.10)
                 training.setdefault("p21_channel_utility_margin", 0.001)
                 training.setdefault("p21_channel_utility_min_teacher_delta", 0.001)
@@ -367,7 +387,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                     "p21_gate_target_mode",
                 ):
                     prompt_adapter.setdefault(key, training[key])
-                training.setdefault("lambda_prompt_router_deployment_utility", 0.10)
+                training.setdefault("lambda_prompt_router_deployment_utility", 0.05 if variant == "p21_v2_hetero_filter" else 0.10)
                 training.setdefault("prompt_router_deployment_utility_margin", 0.0005)
                 training.setdefault("prompt_router_deployment_utility_anti_harm_weight", 0.5)
                 training.setdefault("prompt_router_deployment_utility_anti_harm_margin", 0.0)
@@ -376,12 +396,12 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training.setdefault("prompt_router_deployment_utility_class_balanced", True)
                 training.setdefault("prompt_adapter_episode_count_per_epoch", 1)
                 if "lambda_prompt_adapter_update_norm" not in explicit_training_keys:
-                    training["lambda_prompt_adapter_update_norm"] = 0.01
+                    training["lambda_prompt_adapter_update_norm"] = 0.005 if variant == "p21_v2_hetero_filter" else 0.01
                 training["lambda_prompt_adapter_gate_budget"] = 0.0
                 training["lambda_prompt_adapter_utility_gate"] = 0.0
                 training["prompt_adapter_update_mask"] = "all"
                 training["lambda_prompt_adapter_message_help"] = min(
-                    float(training.get("lambda_prompt_adapter_message_help", 0.05)),
+                    float(training.get("lambda_prompt_adapter_message_help", 0.02 if variant == "p21_v2_hetero_filter" else 0.05)),
                     0.05,
                 )
             elif variant == "p20_utility_supervised_pattern_prompt_router":
@@ -765,6 +785,7 @@ def _build_prompt_adapter_module(
     | ClassConditionedPatternPromptRouter
     | UtilitySupervisedPatternPromptRouter
     | P21LiteAdaptiveFilter
+    | P21V2HeteroFilter
     | None
 ):
     if not bool(prompt_adapter_cfg.get("enabled", False)):
@@ -778,6 +799,8 @@ def _build_prompt_adapter_module(
         return ClassConditionedPatternPromptRouter(source_dim, hidden_dim, resolved_cfg).to(device)
     if module_type == "p21_lite_adaptive_filter":
         return P21LiteAdaptiveFilter(source_dim, hidden_dim, resolved_cfg).to(device)
+    if module_type == "p21_v2_hetero_filter":
+        return P21V2HeteroFilter(source_dim, hidden_dim, resolved_cfg).to(device)
     if module_type == "hetero_adapter":
         return HeterophilyAwarePromptAdapter(source_dim, hidden_dim, resolved_cfg).to(device)
     raise ValueError(f"Unsupported prompt_adapter.module_type={module_type!r}")
@@ -1778,7 +1801,7 @@ def _needs_no_prompt_pool_evidence(prompt_graph_module: PromptGraphModuleP1 | No
 def _forward_prompt_adapter(
     *,
     model: FaithfulGP2F,
-    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | P21LiteAdaptiveFilter,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | P21LiteAdaptiveFilter | P21V2HeteroFilter,
     z: torch.Tensor,
     edge_index: torch.Tensor,
     update_mask: torch.Tensor | None = None,
@@ -1994,22 +2017,34 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
         "p21_channel_delta_low_norm": scalar("p21_channel_delta_low_norm"),
         "p21_channel_delta_two_norm": scalar("p21_channel_delta_two_norm"),
         "p21_channel_delta_high_norm": scalar("p21_channel_delta_high_norm"),
+        "p21_channel_delta_compat_norm": scalar("p21_channel_delta_compat_norm"),
+        "p21_channel_delta_role_norm": scalar("p21_channel_delta_role_norm"),
         "p21_alpha_entropy": scalar("p21_alpha_entropy"),
         "p21_alpha_reject_mean": scalar("p21_alpha_reject_mean"),
         "p21_alpha_ego_mean": scalar("p21_alpha_ego_mean"),
         "p21_alpha_low_mean": scalar("p21_alpha_low_mean"),
         "p21_alpha_two_mean": scalar("p21_alpha_two_mean"),
         "p21_alpha_high_mean": scalar("p21_alpha_high_mean"),
+        "p21_alpha_compat_mean": scalar("p21_alpha_compat_mean"),
+        "p21_alpha_role_mean": scalar("p21_alpha_role_mean"),
         "p21_alpha_global_reject": scalar("p21_alpha_global_reject"),
         "p21_alpha_global_ego": scalar("p21_alpha_global_ego"),
         "p21_alpha_global_low": scalar("p21_alpha_global_low"),
         "p21_alpha_global_two": scalar("p21_alpha_global_two"),
         "p21_alpha_global_high": scalar("p21_alpha_global_high"),
+        "p21_alpha_global_compat": scalar("p21_alpha_global_compat"),
+        "p21_alpha_global_role": scalar("p21_alpha_global_role"),
         "p21_channel_reject_norm": scalar("p21_channel_reject_norm"),
         "p21_channel_ego_norm": scalar("p21_channel_ego_norm"),
         "p21_channel_low_norm": scalar("p21_channel_low_norm"),
         "p21_channel_two_norm": scalar("p21_channel_two_norm"),
         "p21_channel_high_norm": scalar("p21_channel_high_norm"),
+        "p21_channel_compat_norm": scalar("p21_channel_compat_norm"),
+        "p21_channel_role_norm": scalar("p21_channel_role_norm"),
+        "p21_v2_filter_enabled": scalar("p21_v2_filter_enabled"),
+        "p21_v2_compat_class_coverage": scalar("p21_v2_compat_class_coverage"),
+        "p21_v2_compat_proto_coverage": scalar("p21_v2_compat_proto_coverage"),
+        "p21_v2_neighbor_prediction_entropy": scalar("p21_v2_neighbor_prediction_entropy"),
         "p21_ego_low_discrepancy": scalar("p21_ego_low_discrepancy"),
         "p21_low_two_discrepancy": scalar("p21_low_two_discrepancy"),
         "p21_no_prompt_entropy": scalar("p21_no_prompt_entropy"),
@@ -2945,6 +2980,10 @@ def p21_channel_utility_supervision_loss(
     num_classes: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """Supervise P21 reject-aware router and gate from channel CE probes."""
+    raw_channel_names = adapter_out.get("channel_names", CHANNEL_NAMES)
+    channel_names = tuple(str(name) for name in raw_channel_names) if isinstance(raw_channel_names, (list, tuple)) else CHANNEL_NAMES
+    if len(channel_names) == 0 or channel_names[0] != "reject":
+        channel_names = CHANNEL_NAMES
     empty = {
         f"{prefix}_loss": 0.0,
         f"{prefix}_gate_loss": 0.0,
@@ -2967,7 +3006,7 @@ def p21_channel_utility_supervision_loss(
         f"{prefix}_best_channel_acc_lift_vs_no_prompt": 0.0,
         f"{prefix}_best_channel_macro_f1_lift_vs_no_prompt": 0.0,
     }
-    for name in CHANNEL_NAMES:
+    for name in channel_names:
         empty[f"{prefix}_{name}_mean_delta_ce"] = 0.0
         empty[f"{prefix}_{name}_best_ratio"] = 0.0
         empty[f"{prefix}_{name}_alpha_mean"] = 0.0
@@ -2978,6 +3017,11 @@ def p21_channel_utility_supervision_loss(
     if not isinstance(alpha, torch.Tensor) or not isinstance(channel_deltas, torch.Tensor):
         ref = logits_no_prompt if isinstance(logits_no_prompt, torch.Tensor) else h_adp_base
         return ref.new_tensor(0.0), ref.new_tensor(0.0), dict(empty)
+    if alpha.size(1) != channel_deltas.size(1):
+        return alpha.new_tensor(0.0), alpha.new_tensor(0.0), dict(empty)
+    if len(channel_names) != int(channel_deltas.size(1)):
+        channel_names = tuple(f"channel_{idx}" for idx in range(int(channel_deltas.size(1))))
+        channel_names = ("reject", *channel_names[1:])
 
     mask = mask.to(device=alpha.device, dtype=torch.bool)
     idx = torch.where(mask)[0]
@@ -3094,7 +3138,7 @@ def p21_channel_utility_supervision_loss(
         loss = per_node_loss.mean()
         gate_loss = gate_loss_per_node.mean()
 
-    teacher_entropy = -(teacher * teacher.clamp_min(1e-12).log()).sum(dim=-1) / math.log(float(len(CHANNEL_NAMES)))
+    teacher_entropy = -(teacher * teacher.clamp_min(1e-12).log()).sum(dim=-1) / math.log(float(len(channel_names)))
     oracle_binary = (best_idx != 0).to(dtype=alpha.dtype)
     gate_binary = (gate_prob.detach() >= 0.5).to(dtype=alpha.dtype)
     stats = {
@@ -3125,10 +3169,41 @@ def p21_channel_utility_supervision_loss(
             (oracle_macro - no_prompt_macro).detach().item()
         ),
     }
-    for channel_idx, name in enumerate(CHANNEL_NAMES):
+    for channel_idx, name in enumerate(channel_names):
         stats[f"{prefix}_{name}_mean_delta_ce"] = float(utility[:, channel_idx].detach().mean().item())
         stats[f"{prefix}_{name}_best_ratio"] = float((best_idx == channel_idx).float().mean().item())
         stats[f"{prefix}_{name}_alpha_mean"] = float(alpha[idx, channel_idx].detach().mean().item())
+    is_v2_channel_bank = "compat" in channel_names or "role" in channel_names
+    if is_v2_channel_bank and prefix.startswith("p21_oracle_"):
+        v2_prefix = prefix.replace("p21_oracle", "p21_v2_oracle", 1)
+        for field in (
+            "loss",
+            "gate_loss",
+            "gate_supervision_loss",
+            "count",
+            "mean_oracle_delta_ce",
+            "best_channel_delta_ce",
+            "positive_oracle_ratio",
+            "best_channel_positive_ratio",
+            "routed_delta_ce",
+            "routed_positive_ratio",
+            "routing_agreement",
+            "router_agreement_to_oracle",
+            "teacher_entropy",
+            "gate_target_mean",
+            "gate_target_std",
+            "gate_mean",
+            "gate_accuracy_to_oracle",
+            "best_channel_acc",
+            "best_channel_macro_f1",
+            "best_channel_acc_lift_vs_no_prompt",
+            "best_channel_macro_f1_lift_vs_no_prompt",
+        ):
+            stats[f"{v2_prefix}_{field}"] = stats[f"{prefix}_{field}"]
+        for name in channel_names:
+            stats[f"{v2_prefix}_{name}_mean_delta_ce"] = stats[f"{prefix}_{name}_mean_delta_ce"]
+            stats[f"{v2_prefix}_{name}_best_ratio"] = stats[f"{prefix}_{name}_best_ratio"]
+            stats[f"{v2_prefix}_{name}_alpha_mean"] = stats[f"{prefix}_{name}_alpha_mean"]
     if prefix == "p21_channel_utility":
         stats.update(
             {
@@ -3142,10 +3217,6 @@ def p21_channel_utility_supervision_loss(
                 "p21_oracle_best_channel_macro_f1_lift_vs_no_prompt": stats[
                     f"{prefix}_best_channel_macro_f1_lift_vs_no_prompt"
                 ],
-                "p21_reject_best_ratio": stats[f"{prefix}_reject_best_ratio"],
-                "p21_low_best_ratio": stats[f"{prefix}_low_best_ratio"],
-                "p21_two_best_ratio": stats[f"{prefix}_two_best_ratio"],
-                "p21_high_best_ratio": stats[f"{prefix}_high_best_ratio"],
                 "p21_routed_delta_ce": stats[f"{prefix}_routed_delta_ce"],
                 "p21_routed_positive_ratio": stats[f"{prefix}_routed_positive_ratio"],
                 "p21_router_agreement_to_oracle": stats[f"{prefix}_router_agreement_to_oracle"],
@@ -3156,6 +3227,36 @@ def p21_channel_utility_supervision_loss(
                 "p21_gate_accuracy_to_oracle": stats[f"{prefix}_gate_accuracy_to_oracle"],
             }
         )
+        for name in channel_names:
+            stats[f"p21_{name}_best_ratio"] = stats[f"{prefix}_{name}_best_ratio"]
+            stats[f"p21_{name}_mean_delta_ce"] = stats[f"{prefix}_{name}_mean_delta_ce"]
+            stats[f"p21_{name}_alpha_mean"] = stats[f"{prefix}_{name}_alpha_mean"]
+        if is_v2_channel_bank:
+            stats.update(
+                {
+                    "p21_v2_oracle_best_channel_delta_ce": stats[f"{prefix}_best_channel_delta_ce"],
+                    "p21_v2_oracle_best_channel_positive_ratio": stats[f"{prefix}_best_channel_positive_ratio"],
+                    "p21_v2_oracle_best_channel_acc": stats[f"{prefix}_best_channel_acc"],
+                    "p21_v2_oracle_best_channel_macro_f1": stats[f"{prefix}_best_channel_macro_f1"],
+                    "p21_v2_oracle_best_channel_acc_lift_vs_no_prompt": stats[
+                        f"{prefix}_best_channel_acc_lift_vs_no_prompt"
+                    ],
+                    "p21_v2_oracle_best_channel_macro_f1_lift_vs_no_prompt": stats[
+                        f"{prefix}_best_channel_macro_f1_lift_vs_no_prompt"
+                    ],
+                    "p21_v2_routed_delta_ce": stats[f"{prefix}_routed_delta_ce"],
+                    "p21_v2_routed_positive_ratio": stats[f"{prefix}_routed_positive_ratio"],
+                    "p21_v2_router_agreement_to_oracle": stats[f"{prefix}_router_agreement_to_oracle"],
+                    "p21_v2_gate_target_mean": stats[f"{prefix}_gate_target_mean"],
+                    "p21_v2_gate_target_std": stats[f"{prefix}_gate_target_std"],
+                    "p21_v2_gate_mean": stats[f"{prefix}_gate_mean"],
+                    "p21_v2_gate_accuracy_to_oracle": stats[f"{prefix}_gate_accuracy_to_oracle"],
+                }
+            )
+            for name in channel_names:
+                stats[f"p21_v2_{name}_best_ratio"] = stats[f"{prefix}_{name}_best_ratio"]
+                stats[f"p21_v2_{name}_mean_delta_ce"] = stats[f"{prefix}_{name}_mean_delta_ce"]
+                stats[f"p21_v2_{name}_alpha_mean"] = stats[f"{prefix}_{name}_alpha_mean"]
     return loss, gate_loss, stats
 
 
@@ -4206,7 +4307,7 @@ def evaluate_prompt_graph(
     test_mask: torch.Tensor,
     num_classes: int,
     edge_scale_multiplier: float = 1.0,
-    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | None = None,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | P21LiteAdaptiveFilter | P21V2HeteroFilter | None = None,
 ) -> dict[str, Any]:
     model.eval()
     input_aligner.eval()
@@ -5443,10 +5544,16 @@ def run_single(
             "p21_channel_utility_best_channel_acc_lift_vs_no_prompt": 0.0,
             "p21_channel_utility_best_channel_macro_f1_lift_vs_no_prompt": 0.0,
         }
-        for channel_name in CHANNEL_NAMES:
+        for channel_name in P21_V2_CHANNEL_NAMES:
             p21_channel_utility_stats[f"p21_channel_utility_{channel_name}_mean_delta_ce"] = 0.0
             p21_channel_utility_stats[f"p21_channel_utility_{channel_name}_best_ratio"] = 0.0
             p21_channel_utility_stats[f"p21_channel_utility_{channel_name}_alpha_mean"] = 0.0
+            p21_channel_utility_stats[f"p21_{channel_name}_mean_delta_ce"] = 0.0
+            p21_channel_utility_stats[f"p21_{channel_name}_best_ratio"] = 0.0
+            p21_channel_utility_stats[f"p21_{channel_name}_alpha_mean"] = 0.0
+            p21_channel_utility_stats[f"p21_v2_{channel_name}_mean_delta_ce"] = 0.0
+            p21_channel_utility_stats[f"p21_v2_{channel_name}_best_ratio"] = 0.0
+            p21_channel_utility_stats[f"p21_v2_{channel_name}_alpha_mean"] = 0.0
         prompt_adapter_expert_utility_stats = {
             "prompt_router_expert_loss": 0.0,
             "prompt_router_expert_count": 0.0,
@@ -7187,22 +7294,34 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_channel_delta_low_norm",
         "p21_channel_delta_two_norm",
         "p21_channel_delta_high_norm",
+        "p21_channel_delta_compat_norm",
+        "p21_channel_delta_role_norm",
         "p21_alpha_entropy",
         "p21_alpha_reject_mean",
         "p21_alpha_ego_mean",
         "p21_alpha_low_mean",
         "p21_alpha_two_mean",
         "p21_alpha_high_mean",
+        "p21_alpha_compat_mean",
+        "p21_alpha_role_mean",
         "p21_alpha_global_reject",
         "p21_alpha_global_ego",
         "p21_alpha_global_low",
         "p21_alpha_global_two",
         "p21_alpha_global_high",
+        "p21_alpha_global_compat",
+        "p21_alpha_global_role",
         "p21_channel_reject_norm",
         "p21_channel_ego_norm",
         "p21_channel_low_norm",
         "p21_channel_two_norm",
         "p21_channel_high_norm",
+        "p21_channel_compat_norm",
+        "p21_channel_role_norm",
+        "p21_v2_filter_enabled",
+        "p21_v2_compat_class_coverage",
+        "p21_v2_compat_proto_coverage",
+        "p21_v2_neighbor_prediction_entropy",
         "p21_ego_low_discrepancy",
         "p21_low_two_discrepancy",
         "p21_no_prompt_entropy",
@@ -7217,6 +7336,10 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_low_best_ratio",
         "p21_two_best_ratio",
         "p21_high_best_ratio",
+        "p21_compat_best_ratio",
+        "p21_role_best_ratio",
+        "p21_compat_mean_delta_ce",
+        "p21_role_mean_delta_ce",
         "p21_routed_delta_ce",
         "p21_routed_positive_ratio",
         "p21_router_agreement_to_oracle",
@@ -7225,6 +7348,27 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_gate_target_mean",
         "p21_gate_target_std",
         "p21_gate_accuracy_to_oracle",
+        "p21_v2_oracle_best_channel_delta_ce",
+        "p21_v2_oracle_best_channel_positive_ratio",
+        "p21_v2_oracle_best_channel_acc",
+        "p21_v2_oracle_best_channel_macro_f1",
+        "p21_v2_oracle_best_channel_acc_lift_vs_no_prompt",
+        "p21_v2_oracle_best_channel_macro_f1_lift_vs_no_prompt",
+        "p21_v2_reject_best_ratio",
+        "p21_v2_low_best_ratio",
+        "p21_v2_two_best_ratio",
+        "p21_v2_high_best_ratio",
+        "p21_v2_compat_best_ratio",
+        "p21_v2_role_best_ratio",
+        "p21_v2_compat_mean_delta_ce",
+        "p21_v2_role_mean_delta_ce",
+        "p21_v2_routed_delta_ce",
+        "p21_v2_routed_positive_ratio",
+        "p21_v2_router_agreement_to_oracle",
+        "p21_v2_gate_target_mean",
+        "p21_v2_gate_target_std",
+        "p21_v2_gate_mean",
+        "p21_v2_gate_accuracy_to_oracle",
         "adapter_query_mean_delta_ce",
         "adapter_query_positive_delta_ratio",
         "adapter_val_mean_delta_ce",
@@ -7319,14 +7463,20 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_channel_utility_low_mean_delta_ce",
         "p21_channel_utility_two_mean_delta_ce",
         "p21_channel_utility_high_mean_delta_ce",
+        "p21_channel_utility_compat_mean_delta_ce",
+        "p21_channel_utility_role_mean_delta_ce",
         "p21_channel_utility_reject_best_ratio",
         "p21_channel_utility_low_best_ratio",
         "p21_channel_utility_two_best_ratio",
         "p21_channel_utility_high_best_ratio",
+        "p21_channel_utility_compat_best_ratio",
+        "p21_channel_utility_role_best_ratio",
         "p21_channel_utility_reject_alpha_mean",
         "p21_channel_utility_low_alpha_mean",
         "p21_channel_utility_two_alpha_mean",
         "p21_channel_utility_high_alpha_mean",
+        "p21_channel_utility_compat_alpha_mean",
+        "p21_channel_utility_role_alpha_mean",
         "prompt_router_expert_loss",
         "prompt_router_expert_oracle_best_expert_gain",
         "prompt_router_expert_oracle_positive_ratio",
@@ -7445,7 +7595,14 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "prompt_router_expert_val_pool",
         "prompt_router_expert_test_pool",
     ]
-    p21_oracle_prefixes = ["p21_oracle_train", "p21_oracle_val", "p21_oracle_test"]
+    p21_oracle_prefixes = [
+        "p21_oracle_train",
+        "p21_oracle_val",
+        "p21_oracle_test",
+        "p21_v2_oracle_train",
+        "p21_v2_oracle_val",
+        "p21_v2_oracle_test",
+    ]
     p21_oracle_fields = [
         "loss",
         "gate_loss",
@@ -7472,7 +7629,8 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     for prefix in p21_oracle_prefixes:
         for field in p21_oracle_fields:
             diagnostic_summary_keys.append(f"{prefix}_{field}")
-        for channel_name in CHANNEL_NAMES:
+        oracle_channel_names = P21_V2_CHANNEL_NAMES if prefix.startswith("p21_v2_") else CHANNEL_NAMES
+        for channel_name in oracle_channel_names:
             diagnostic_summary_keys.append(f"{prefix}_{channel_name}_mean_delta_ce")
             diagnostic_summary_keys.append(f"{prefix}_{channel_name}_best_ratio")
             diagnostic_summary_keys.append(f"{prefix}_{channel_name}_alpha_mean")

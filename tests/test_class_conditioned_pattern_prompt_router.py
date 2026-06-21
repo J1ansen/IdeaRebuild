@@ -9,6 +9,7 @@ from models.class_conditioned_pattern_prompt_router import (
 )
 from models.hetero_prompt_adapter import prompt_adapter_message_help_loss
 from models.p21_adaptive_filter import P21LiteAdaptiveFilter
+from models.p21_v2_hetero_filter import P21V2HeteroFilter
 from models.utility_supervised_pattern_prompt_router import UtilitySupervisedPatternPromptRouter
 
 
@@ -51,10 +52,17 @@ def _p21_filter(**overrides) -> P21LiteAdaptiveFilter:
     return P21LiteAdaptiveFilter(3, 6, config)
 
 
+def _p21_v2_filter(**overrides) -> P21V2HeteroFilter:
+    config = {"dropout": 0.0, "num_classes": 3}
+    config.update(overrides)
+    return P21V2HeteroFilter(3, 6, config)
+
+
 def test_consumes_base_logits_flag() -> None:
     assert ClassConditionedPatternPromptRouter.consumes_base_logits is True
     assert UtilitySupervisedPatternPromptRouter.consumes_base_logits is True
     assert P21LiteAdaptiveFilter.consumes_base_logits is True
+    assert P21V2HeteroFilter.consumes_base_logits is True
 
 
 def test_forward_shapes_and_routing_normalisation() -> None:
@@ -593,6 +601,77 @@ def test_p21_channel_utility_can_reject_when_no_channel_helps() -> None:
     assert stats["p21_channel_utility_gate_accuracy_to_oracle"] == 1.0
 
 
+def test_p21_v2_hetero_filter_adds_compat_and_role_channels() -> None:
+    z, edge_index, h_adp = _toy_graph()
+    filt = _p21_v2_filter(beta_init=0.05, beta_max=0.20, channel_prior=[0.50, 0.10, 0.12, 0.10, 0.10, 0.08])
+    labels = torch.tensor([0, 1, 2, 0, 1])
+    support_mask = torch.tensor([True, True, True, False, False])
+    out = filt(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=torch.randn(5, 3),
+        h_pre=torch.randn(5, 6),
+        support_mask=support_mask,
+        labels=labels,
+    )
+
+    assert out["channel_names"] == ("reject", "low", "two", "high", "compat", "role")
+    assert out["alpha"].shape == (5, 6)
+    assert out["channel_deltas"].shape == (5, 6, 6)
+    assert torch.allclose(out["channel_deltas"][:, 0, :], torch.zeros_like(out["channel_deltas"][:, 0, :]))
+    assert torch.allclose(out["alpha"].sum(dim=-1), torch.ones(5), atol=1e-5)
+    assert "p21_channel_delta_compat_norm" in out
+    assert "p21_channel_delta_role_norm" in out
+    assert "p21_v2_compat_class_coverage" in out
+
+
+def test_p21_v2_channel_utility_supports_dynamic_channel_bank() -> None:
+    import torch.nn as nn
+
+    from experiments.run_gp2f_prompt_graph import p21_channel_utility_supervision_loss
+
+    z, edge_index, h_adp = _toy_graph()
+    filt = _p21_v2_filter(residual_scale=0.3, beta_init=0.1, beta_max=0.3, gate_max=0.3)
+    h_pre = torch.randn(5, 6)
+    labels = torch.tensor([0, 1, 2, 0, 1])
+    support_mask = torch.tensor([True, True, True, False, False])
+    out = filt(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=torch.randn(5, 3),
+        h_pre=h_pre,
+        support_mask=support_mask,
+        labels=labels,
+    )
+
+    class _Model:
+        def __init__(self) -> None:
+            self.alpha = torch.tensor(0.5)
+            self.classifier = nn.Linear(6, 3)
+
+    model = _Model()
+    no_prompt_logits = model.classifier(0.5 * h_pre + 0.5 * h_adp)
+    loss, gate_loss, stats = p21_channel_utility_supervision_loss(
+        adapter_out=out,
+        model=model,
+        h_pre=h_pre,
+        h_adp_base=h_adp,
+        logits_no_prompt=no_prompt_logits,
+        labels=labels,
+        mask=torch.ones(5, dtype=torch.bool),
+        target_mode="hard_reject_or_best",
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(gate_loss)
+    assert "p21_channel_utility_compat_mean_delta_ce" in stats
+    assert "p21_channel_utility_role_best_ratio" in stats
+    assert "p21_v2_compat_best_ratio" in stats
+    assert "p21_v2_role_mean_delta_ce" in stats
+
+
 def test_deployment_utility_loss_trains_actual_prompt_logits() -> None:
     from experiments.run_gp2f_prompt_graph import prompt_router_deployment_utility_loss
 
@@ -718,6 +797,29 @@ def test_p21_variant_config_enables_lite_adaptive_filter() -> None:
     assert cfg["training"]["lambda_prompt_adapter_gate_budget"] == 0.0
     assert cfg["training"]["lambda_prompt_adapter_utility_gate"] == 0.0
     assert cfg["training"]["prompt_adapter_episode_count_per_epoch"] == 1
+
+
+def test_p21_v2_variant_config_enables_hetero_filter() -> None:
+    base = {
+        "experiment": {"prompt_variant": "p21_v2_hetero_filter"},
+        "prompt_adapter": {"enabled": True},
+    }
+    cfg = _config_for_variant(base, "p21_v2_hetero_filter")
+    assert cfg["prompt_graph"]["enabled"] is False
+    assert cfg["prompt_aware"]["enabled"] is False
+    assert cfg["prompt_adapter"]["enabled"] is True
+    assert cfg["prompt_adapter"]["module_type"] == "p21_v2_hetero_filter"
+    assert cfg["training"]["freeze_base_model"] is True
+    assert cfg["training"]["early_stop_metric"] == "val_acc"
+    assert cfg["prompt_adapter"]["channel_set"] == "reject_low_two_high_compat_role"
+    assert cfg["prompt_adapter"]["channel_prior"] == [0.50, 0.10, 0.12, 0.10, 0.10, 0.08]
+    assert cfg["prompt_adapter"]["use_compat_channel"] is True
+    assert cfg["prompt_adapter"]["use_role_channel"] is True
+    assert cfg["prompt_adapter"]["compat_smoothing"] == 0.10
+    assert cfg["training"]["prompt_adapter_update_mask"] == "all"
+    assert cfg["training"]["lambda_p21_channel_utility"] == 0.30
+    assert cfg["training"]["lambda_prompt_router_deployment_utility"] == 0.05
+    assert cfg["training"]["lambda_prompt_adapter_update_norm"] == 0.005
 
 
 def test_p20_yaml_config_uses_conservative_gate_and_nonzero_message() -> None:
