@@ -52,7 +52,10 @@ prompt_adapter:
   context_detach: true
   residual_scale: 0.30
   use_node_wise_gate: true
-  channel_prior: [0.45, 0.15, 0.25, 0.15]
+  channel_set: reject_low_two_high
+  use_reject_channel: true
+  reject_channel_index: 0
+  channel_prior: [0.50, 0.15, 0.20, 0.15]
   beta_init: 0.10
   beta_max: 0.30
   gate_max: 0.30
@@ -78,7 +81,7 @@ training:
   output_dir: outputs/gp2f_prompt_p21_lite_adaptive_filter
   early_stop_patience: 40
   early_stop_min_epochs: 20
-  early_stop_metric: train_loss
+  early_stop_metric: val_acc
   keep_best_checkpoint: true
   freeze_base_model: true
   train_prompt_adapter: true
@@ -102,11 +105,16 @@ training:
   lambda_prompt_router_pattern_utility: 0.0
   lambda_prompt_router_class_pattern_reliability: 0.0
   lambda_p21_channel_utility: 0.20
-  p21_channel_utility_temperature: 0.02
-  p21_channel_utility_margin: 0.0
-  p21_channel_utility_min_teacher_delta: 0.0
+  p21_channel_utility_temperature: 0.10
+  p21_channel_utility_margin: 0.001
+  p21_channel_utility_min_teacher_delta: 0.001
+  p21_channel_utility_target_mode: reject_margin_softmax
   p21_channel_utility_gate_source: actual
   p21_channel_utility_class_balanced: true
+  lambda_p21_gate_utility: 0.10
+  p21_gate_utility_temperature: 0.02
+  p21_gate_utility_margin: 0.001
+  p21_gate_target_mode: soft
   lambda_prompt_router_deployment_utility: 0.10
   prompt_router_deployment_utility_margin: 0.0005
   prompt_router_deployment_utility_anti_harm_weight: 0.5

@@ -1,9 +1,9 @@
 """P21-lite adaptive heterophily filter.
 
 This module applies a prompt-controlled structural filter on the adapted GP2F
-branch without adding prompt nodes or changing graph edges.  It keeps four
-fixed channels separate (ego, one-hop low-pass, two-hop and high-pass) and uses
-a conservative global prior plus a node-wise residual router and gate.
+branch without adding prompt nodes or changing graph edges.  It keeps a strict
+reject channel plus three structural residual channels (low, two-hop and
+high-pass), then uses a conservative prior plus a node-wise router and gate.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ import torch.nn.functional as F
 from models.prompt_module import mean_neighbor_summary
 
 
-CHANNEL_NAMES = ("ego", "low", "two", "high")
+CHANNEL_NAMES = ("reject", "low", "two", "high")
+STRUCTURAL_CHANNEL_NAMES = ("low", "two", "high")
 
 
 def _init_logit_from_probability(value: float) -> float:
@@ -54,9 +55,9 @@ class P21LiteAdaptiveFilter(nn.Module):
         beta_prob = beta_init / max(self.beta_max, 1e-12)
         self.beta_logit = nn.Parameter(torch.tensor(_init_logit_from_probability(beta_prob)))
 
-        prior = self.config.get("channel_prior", [0.45, 0.15, 0.25, 0.15])
+        prior = self.config.get("channel_prior", [0.50, 0.15, 0.20, 0.15])
         if not isinstance(prior, (list, tuple)) or len(prior) != len(CHANNEL_NAMES):
-            raise ValueError("p21.channel_prior must contain four values: ego, low, two, high")
+            raise ValueError("p21.channel_prior must contain four values: reject, low, two, high")
         prior_t = torch.tensor([float(v) for v in prior], dtype=torch.float32).clamp_min(1e-8)
         prior_t = prior_t / prior_t.sum().clamp_min(1e-12)
         self.theta_global = nn.Parameter(prior_t.log())
@@ -89,12 +90,15 @@ class P21LiteAdaptiveFilter(nn.Module):
                     nn.Dropout(dropout),
                     nn.Linear(self.hidden_dim, self.hidden_dim),
                 )
-                for _ in CHANNEL_NAMES
+                for _ in STRUCTURAL_CHANNEL_NAMES
             ]
         )
         for project in self.channel_projects:
             nn.init.normal_(project[-1].weight, std=0.02)
             nn.init.zeros_(project[-1].bias)
+        # Backward-compatible alias for tests/checkpoints that inspect the
+        # old shared projector name. This is the low-channel projector; reject
+        # itself never passes through a projector.
         self.project = self.channel_projects[0]
 
     def _channels(self, h: torch.Tensor, edge_index: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -182,22 +186,26 @@ class P21LiteAdaptiveFilter(nn.Module):
 
         stacked = torch.stack([ego, low, two, high], dim=1)
         h_filter = torch.einsum("nk,nkh->nh", alpha, stacked)
-        channel_residuals = stacked - ego.unsqueeze(1)
-        raw_channel_deltas = torch.stack(
-            [project(channel_residuals[:, idx, :]) for idx, project in enumerate(self.channel_projects)],
+        structural_residuals = torch.stack([low - ego, two - ego, high - ego], dim=1)
+        zero_delta = ego.new_zeros(num_nodes, 1, self.hidden_dim)
+        raw_structural_deltas = torch.stack(
+            [project(structural_residuals[:, idx, :]) for idx, project in enumerate(self.channel_projects)],
             dim=1,
         )
-        raw_delta = torch.einsum("nk,nkh->nh", alpha, raw_channel_deltas)
-        raw_norm = raw_delta.norm(dim=-1, keepdim=True)
+        raw_channel_deltas = torch.stack(
+            [zero_delta.squeeze(1), raw_structural_deltas[:, 0, :], raw_structural_deltas[:, 1, :], raw_structural_deltas[:, 2, :]],
+            dim=1,
+        )
+        raw_channel_norm = raw_channel_deltas.norm(dim=-1, keepdim=True)
         if self.max_update_norm > 0.0:
-            clip_scale = (self.max_update_norm / raw_norm.clamp_min(1e-12)).clamp_max(1.0)
-            delta = raw_delta * clip_scale
-            channel_deltas = raw_channel_deltas * clip_scale.unsqueeze(1)
-            clip_ratio = (raw_norm.squeeze(-1) > self.max_update_norm).to(dtype=h_adp.dtype).mean()
+            channel_clip_scale = (self.max_update_norm / raw_channel_norm.clamp_min(1e-12)).clamp_max(1.0)
+            channel_deltas = raw_channel_deltas * channel_clip_scale
+            clip_ratio = (raw_channel_norm.squeeze(-1) > self.max_update_norm).to(dtype=h_adp.dtype).mean()
         else:
-            delta = raw_delta
             channel_deltas = raw_channel_deltas
             clip_ratio = h_adp.new_tensor(0.0)
+        raw_delta = torch.einsum("nk,nkh->nh", alpha, raw_channel_deltas)
+        delta = torch.einsum("nk,nkh->nh", alpha, channel_deltas)
 
         beta = self.beta_max * torch.sigmoid(self.beta_logit)
         if self.use_node_wise_gate:
@@ -229,6 +237,7 @@ class P21LiteAdaptiveFilter(nn.Module):
             "update": update,
             "gate": gate,
             "raw_gate": raw_gate,
+            "gate_max": h_adp.new_tensor(float(self.gate_max)),
             "beta": beta,
             "alpha": alpha,
             "alpha_global": alpha_global,
@@ -254,19 +263,23 @@ class P21LiteAdaptiveFilter(nn.Module):
             "p21_gate_mean": gate.mean(),
             "p21_gate_min": gate.min() if gate.numel() > 0 else h_adp.new_tensor(0.0),
             "p21_gate_max": gate.max() if gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "p21_channel_delta_reject_norm": channel_deltas[:, 0, :].norm(dim=-1).mean(),
             "p21_channel_delta_ego_norm": channel_deltas[:, 0, :].norm(dim=-1).mean(),
             "p21_channel_delta_low_norm": channel_deltas[:, 1, :].norm(dim=-1).mean(),
             "p21_channel_delta_two_norm": channel_deltas[:, 2, :].norm(dim=-1).mean(),
             "p21_channel_delta_high_norm": channel_deltas[:, 3, :].norm(dim=-1).mean(),
             "p21_alpha_entropy": alpha_entropy.mean(),
+            "p21_alpha_reject_mean": alpha[:, 0].mean(),
             "p21_alpha_ego_mean": alpha[:, 0].mean(),
             "p21_alpha_low_mean": alpha[:, 1].mean(),
             "p21_alpha_two_mean": alpha[:, 2].mean(),
             "p21_alpha_high_mean": alpha[:, 3].mean(),
+            "p21_alpha_global_reject": alpha_global[0],
             "p21_alpha_global_ego": alpha_global[0],
             "p21_alpha_global_low": alpha_global[1],
             "p21_alpha_global_two": alpha_global[2],
             "p21_alpha_global_high": alpha_global[3],
+            "p21_channel_reject_norm": ego.new_tensor(0.0),
             "p21_channel_ego_norm": ego.norm(dim=-1).mean(),
             "p21_channel_low_norm": low.norm(dim=-1).mean(),
             "p21_channel_two_norm": two.norm(dim=-1).mean(),

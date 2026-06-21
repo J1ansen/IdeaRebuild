@@ -454,7 +454,7 @@ def test_prompt_adapter_message_help_can_penalise_pool_harm() -> None:
 
 def test_p21_lite_adaptive_filter_shapes_prior_and_mask() -> None:
     z, edge_index, h_adp = _toy_graph()
-    filt = _p21_filter(beta_init=0.05, beta_max=0.20, channel_prior=[0.45, 0.15, 0.25, 0.15])
+    filt = _p21_filter(beta_init=0.05, beta_max=0.20, channel_prior=[0.50, 0.15, 0.20, 0.15])
     update_mask = torch.tensor([True, False, True, False, True])
     out = filt(
         z=z,
@@ -470,21 +470,23 @@ def test_p21_lite_adaptive_filter_shapes_prior_and_mask() -> None:
     assert torch.allclose(out["alpha"].sum(dim=-1), torch.ones(5), atol=1e-5)
     assert torch.allclose(
         out["alpha_global"],
-        torch.tensor([0.45, 0.15, 0.25, 0.15], dtype=out["alpha_global"].dtype),
+        torch.tensor([0.50, 0.15, 0.20, 0.15], dtype=out["alpha_global"].dtype),
         atol=1e-5,
     )
     assert 0.049 <= float(out["beta"].item()) <= 0.051
     assert out["gate"].shape == (5,)
     assert out["channel_deltas"].shape == (5, 4, 6)
+    assert torch.allclose(out["channel_deltas"][:, 0, :], torch.zeros_like(out["channel_deltas"][:, 0, :]))
     assert torch.allclose(out["update"][~update_mask], torch.zeros_like(out["update"][~update_mask]))
     assert float(out["delta"].norm(dim=-1).max().item()) <= 0.050001
     for key in (
-        "p21_alpha_ego_mean",
+        "p21_alpha_reject_mean",
         "p21_alpha_low_mean",
         "p21_alpha_two_mean",
         "p21_alpha_high_mean",
         "p21_channel_high_norm",
         "p21_gate_mean",
+        "p21_channel_delta_reject_norm",
         "p21_channel_delta_low_norm",
         "p21_ego_low_discrepancy",
     ):
@@ -527,7 +529,7 @@ def test_p21_channel_utility_supervision_trains_router() -> None:
     labels = torch.tensor([0, 1, 2, 0, 1])
     mask = torch.ones(5, dtype=torch.bool)
     no_prompt_logits = model.classifier(0.5 * h_pre + 0.5 * h_adp)
-    loss, stats = p21_channel_utility_supervision_loss(
+    loss, gate_loss, stats = p21_channel_utility_supervision_loss(
         adapter_out=out,
         model=model,
         h_pre=h_pre,
@@ -539,11 +541,54 @@ def test_p21_channel_utility_supervision_trains_router() -> None:
     )
 
     assert torch.isfinite(loss)
+    assert torch.isfinite(gate_loss)
     assert stats["p21_channel_utility_count"] == 5.0
     assert "p21_channel_utility_mean_oracle_delta_ce" in stats
+    assert "p21_channel_utility_reject_best_ratio" in stats
+    assert "p21_channel_utility_gate_target_mean" in stats
     loss.backward()
     router_grads = [p.grad for p in filt.router.parameters() if p.grad is not None]
     assert any(g.abs().sum().item() > 0 for g in router_grads)
+
+
+def test_p21_channel_utility_can_reject_when_no_channel_helps() -> None:
+    import torch.nn as nn
+
+    from experiments.run_gp2f_prompt_graph import p21_channel_utility_supervision_loss
+
+    z, edge_index, h_adp = _toy_graph()
+    filt = _p21_filter(residual_scale=0.3, beta_init=0.1, beta_max=0.3, gate_max=0.3)
+    h_pre = torch.randn(5, 6)
+    out = filt(z=z, edge_index=edge_index, h_adp=h_adp, base_logits=torch.randn(5, 3), h_pre=h_pre)
+    # Force every non-reject channel to be identical to reject, so no channel
+    # can produce positive utility over no-prompt.
+    out["channel_deltas"] = torch.zeros_like(out["channel_deltas"])
+
+    class _Model:
+        def __init__(self) -> None:
+            self.alpha = torch.tensor(0.5)
+            self.classifier = nn.Linear(6, 3)
+
+    model = _Model()
+    labels = torch.tensor([0, 1, 2, 0, 1])
+    no_prompt_logits = model.classifier(0.5 * h_pre + 0.5 * h_adp)
+    loss, gate_loss, stats = p21_channel_utility_supervision_loss(
+        adapter_out=out,
+        model=model,
+        h_pre=h_pre,
+        h_adp_base=h_adp,
+        logits_no_prompt=no_prompt_logits,
+        labels=labels,
+        mask=torch.ones(5, dtype=torch.bool),
+        margin=0.001,
+        min_teacher_delta=0.001,
+        target_mode="hard_reject_or_best",
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(gate_loss)
+    assert stats["p21_channel_utility_reject_best_ratio"] == 1.0
+    assert stats["p21_channel_utility_best_channel_positive_ratio"] == 0.0
 
 
 def test_deployment_utility_loss_trains_actual_prompt_logits() -> None:
@@ -648,13 +693,19 @@ def test_p21_variant_config_enables_lite_adaptive_filter() -> None:
     assert cfg["prompt_adapter"]["enabled"] is True
     assert cfg["prompt_adapter"]["module_type"] == "p21_lite_adaptive_filter"
     assert cfg["training"]["freeze_base_model"] is True
-    assert cfg["training"]["early_stop_metric"] == "train_loss"
-    assert cfg["prompt_adapter"]["channel_prior"] == [0.45, 0.15, 0.25, 0.15]
+    assert cfg["training"]["early_stop_metric"] == "val_acc"
+    assert cfg["prompt_adapter"]["channel_prior"] == [0.50, 0.15, 0.20, 0.15]
+    assert cfg["prompt_adapter"]["channel_set"] == "reject_low_two_high"
+    assert cfg["prompt_adapter"]["use_reject_channel"] is True
     assert cfg["prompt_adapter"]["beta_init"] == 0.10
     assert cfg["prompt_adapter"]["use_node_wise_gate"] is True
     assert cfg["prompt_adapter"]["use_candidate_pool"] is False
     assert cfg["training"]["prompt_adapter_update_mask"] == "all"
     assert cfg["training"]["lambda_p21_channel_utility"] == 0.20
+    assert cfg["training"]["p21_channel_utility_temperature"] == 0.10
+    assert cfg["training"]["p21_channel_utility_min_teacher_delta"] == 0.001
+    assert cfg["training"]["lambda_p21_gate_utility"] == 0.10
+    assert cfg["training"]["p21_gate_target_mode"] == "soft"
     assert cfg["prompt_adapter"]["beta_max"] == 0.30
     assert cfg["prompt_adapter"]["gate_max"] == 0.30
     assert cfg["prompt_adapter"]["max_update_norm"] == 0.08
