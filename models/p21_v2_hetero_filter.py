@@ -272,6 +272,7 @@ class P21V2HeteroFilter(nn.Module):
         base_logits: torch.Tensor | None = None,
         h_pre: torch.Tensor | None = None,
         support_mask: torch.Tensor | None = None,
+        compat_support_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         **_: Any,
     ) -> dict[str, torch.Tensor | tuple[str, ...]]:
@@ -317,6 +318,8 @@ class P21V2HeteroFilter(nn.Module):
         alpha_logits = alpha_global.clamp_min(1e-8).log().unsqueeze(0) + self.residual_scale * residual
         alpha = torch.softmax(alpha_logits, dim=-1)
 
+        compat_source = str(self.config.get("compat_support_source", "episode_support"))
+        support_for_compat = compat_support_mask if compat_source == "full_train" and compat_support_mask is not None else support_mask
         raw_channel_deltas, bank_stats = self.channel_bank(
             ego=ego,
             low=low,
@@ -324,7 +327,7 @@ class P21V2HeteroFilter(nn.Module):
             high=high,
             edge_index=edge_index,
             base_logits=base_logits,
-            support_mask=support_mask,
+            support_mask=support_for_compat,
             labels=labels,
             role_feat=role_feat,
         )

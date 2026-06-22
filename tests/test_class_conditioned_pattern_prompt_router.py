@@ -672,6 +672,102 @@ def test_p21_v2_channel_utility_supports_dynamic_channel_bank() -> None:
     assert "p21_v2_role_mean_delta_ce" in stats
 
 
+def test_p21_v2_expert_utility_trains_channel_projectors() -> None:
+    import torch.nn as nn
+
+    from experiments.run_gp2f_prompt_graph import p21_channel_expert_utility_loss
+
+    z, edge_index, h_adp = _toy_graph()
+    filt = _p21_v2_filter(residual_scale=0.3, beta_init=0.1, beta_max=0.3, gate_max=0.3)
+    h_pre = torch.randn(5, 6)
+    labels = torch.tensor([0, 1, 2, 0, 1])
+    support_mask = torch.tensor([True, True, True, False, False])
+    out = filt(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=torch.randn(5, 3),
+        h_pre=h_pre,
+        support_mask=support_mask,
+        compat_support_mask=support_mask,
+        labels=labels,
+    )
+
+    class _Model:
+        def __init__(self) -> None:
+            self.alpha = torch.tensor(0.5)
+            self.classifier = nn.Linear(6, 3)
+
+    model = _Model()
+    no_prompt_logits = model.classifier(0.5 * h_pre + 0.5 * h_adp)
+    loss, stats = p21_channel_expert_utility_loss(
+        adapter_out=out,
+        model=model,
+        h_pre=h_pre,
+        h_adp_base=h_adp,
+        logits_no_prompt=no_prompt_logits,
+        labels=labels,
+        mask=torch.ones(5, dtype=torch.bool),
+    )
+    assert torch.isfinite(loss)
+    assert "p21_channel_expert_best_channel_ratio_compat" in stats
+    loss.backward()
+    structural_grads = [
+        p.grad for project in filt.channel_bank.channel_projects for p in project.parameters() if p.grad is not None
+    ]
+    compat_grads = [p.grad for p in filt.channel_bank.compat_project.parameters() if p.grad is not None]
+    role_grads = [p.grad for p in filt.channel_bank.role_project.parameters() if p.grad is not None]
+    assert any(g.abs().sum().item() > 0 for g in structural_grads)
+    assert any(g.abs().sum().item() > 0 for g in compat_grads)
+    assert any(g.abs().sum().item() > 0 for g in role_grads)
+
+
+def test_p21_v2_ungated_oracle_reports_scale_grid_metrics() -> None:
+    import torch.nn as nn
+
+    from experiments.run_gp2f_prompt_graph import p21_channel_ungated_oracle_diagnostics
+
+    z, edge_index, h_adp = _toy_graph()
+    filt = _p21_v2_filter(residual_scale=0.3, beta_init=0.1, beta_max=0.3, gate_max=0.3)
+    h_pre = torch.randn(5, 6)
+    labels = torch.tensor([0, 1, 2, 0, 1])
+    support_mask = torch.tensor([True, True, True, False, False])
+    out = filt(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=torch.randn(5, 3),
+        h_pre=h_pre,
+        support_mask=support_mask,
+        compat_support_mask=support_mask,
+        labels=labels,
+    )
+
+    class _Model:
+        def __init__(self) -> None:
+            self.alpha = torch.tensor(0.5)
+            self.classifier = nn.Linear(6, 3)
+
+    model = _Model()
+    no_prompt_logits = model.classifier(0.5 * h_pre + 0.5 * h_adp)
+    stats = p21_channel_ungated_oracle_diagnostics(
+        adapter_out=out,
+        model=model,
+        h_pre=h_pre,
+        h_adp_base=h_adp,
+        logits_no_prompt=no_prompt_logits,
+        labels=labels,
+        mask=torch.ones(5, dtype=torch.bool),
+        prefix="p21_v2_ungated_oracle_test",
+        scale_grid=[0.5, 1.0],
+        num_classes=3,
+    )
+    assert stats["p21_v2_ungated_oracle_test_count"] == 5.0
+    assert "p21_v2_ungated_oracle_test_best_scale" in stats
+    assert "p21_v2_ungated_oracle_test_compat_best_ratio" in stats
+    assert "p21_v2_ungated_oracle_test_role_mean_delta_ce" in stats
+
+
 def test_deployment_utility_loss_trains_actual_prompt_logits() -> None:
     from experiments.run_gp2f_prompt_graph import prompt_router_deployment_utility_loss
 
@@ -815,9 +911,14 @@ def test_p21_v2_variant_config_enables_hetero_filter() -> None:
     assert cfg["prompt_adapter"]["channel_prior"] == [0.50, 0.10, 0.12, 0.10, 0.10, 0.08]
     assert cfg["prompt_adapter"]["use_compat_channel"] is True
     assert cfg["prompt_adapter"]["use_role_channel"] is True
-    assert cfg["prompt_adapter"]["compat_smoothing"] == 0.10
+    assert cfg["prompt_adapter"]["compat_support_source"] == "full_train"
+    assert cfg["prompt_adapter"]["compat_smoothing"] == 0.50
     assert cfg["training"]["prompt_adapter_update_mask"] == "all"
+    assert cfg["training"]["expert_warmup_epochs"] == 30
+    assert cfg["training"]["lambda_p21_channel_expert_utility"] == 0.20
     assert cfg["training"]["lambda_p21_channel_utility"] == 0.30
+    assert cfg["training"]["p21_channel_utility_gate_source"] == "max"
+    assert cfg["training"]["p21_oracle_gate_source"] == "max"
     assert cfg["training"]["lambda_prompt_router_deployment_utility"] == 0.05
     assert cfg["training"]["lambda_prompt_adapter_update_norm"] == 0.005
 

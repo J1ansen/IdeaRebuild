@@ -347,9 +347,10 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                     prompt_adapter.setdefault("channel_set", "reject_low_two_high_compat_role")
                     prompt_adapter.setdefault("channel_prior", [0.50, 0.10, 0.12, 0.10, 0.10, 0.08])
                     prompt_adapter.setdefault("use_compat_channel", True)
+                    prompt_adapter.setdefault("compat_support_source", "full_train")
                     prompt_adapter.setdefault("compat_source", "no_prompt_logits")
                     prompt_adapter.setdefault("compat_matrix", "support_estimated")
-                    prompt_adapter.setdefault("compat_smoothing", 0.10)
+                    prompt_adapter.setdefault("compat_smoothing", 0.50)
                     prompt_adapter.setdefault("compat_detach_logits", True)
                     prompt_adapter.setdefault("compat_detach_prototypes", True)
                     prompt_adapter.setdefault("use_role_channel", True)
@@ -365,12 +366,24 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training["lambda_prompt_router_pattern_supervision"] = 0.0
                 training["lambda_prompt_router_pattern_utility"] = 0.0
                 training["lambda_prompt_router_class_pattern_reliability"] = 0.0
+                if variant == "p21_v2_hetero_filter":
+                    training.setdefault("expert_warmup_epochs", 30)
+                    training.setdefault("lambda_p21_channel_expert_utility", 0.20)
+                    training.setdefault("lambda_p21_channel_expert_utility_after_warmup", 0.05)
+                    training.setdefault("p21_channel_expert_probe_scale", 1.0)
+                    training.setdefault("p21_channel_expert_temperature", 0.10)
+                    training.setdefault("p21_channel_expert_margin", 0.001)
+                    training.setdefault("p21_channel_expert_anti_harm_weight", 0.5)
+                    training.setdefault("p21_oracle_gate_source", "max")
+                    training.setdefault("p21_oracle_scale_grid", [0.25, 0.5, 1.0, 2.0, 4.0])
                 training.setdefault("lambda_p21_channel_utility", 0.30 if variant == "p21_v2_hetero_filter" else 0.20)
                 training.setdefault("p21_channel_utility_temperature", 0.10)
                 training.setdefault("p21_channel_utility_margin", 0.001)
                 training.setdefault("p21_channel_utility_min_teacher_delta", 0.001)
                 training.setdefault("p21_channel_utility_target_mode", "hard_reject_or_best")
-                training.setdefault("p21_channel_utility_gate_source", "actual")
+                training.setdefault("p21_channel_utility_gate_source", "max" if variant == "p21_v2_hetero_filter" else "actual")
+                training.setdefault("p21_channel_utility_gate_source_warmup", "max")
+                training.setdefault("p21_channel_utility_actual_gate_start_epoch", 80 if variant == "p21_v2_hetero_filter" else 0)
                 training.setdefault("p21_channel_utility_class_balanced", True)
                 training.setdefault("lambda_p21_gate_utility", 0.10)
                 training.setdefault("p21_gate_utility_temperature", 0.02)
@@ -382,11 +395,16 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                     "p21_channel_utility_min_teacher_delta",
                     "p21_channel_utility_target_mode",
                     "p21_channel_utility_gate_source",
+                    "p21_channel_utility_gate_source_warmup",
+                    "p21_channel_utility_actual_gate_start_epoch",
                     "p21_gate_utility_temperature",
                     "p21_gate_utility_margin",
                     "p21_gate_target_mode",
+                    "p21_oracle_gate_source",
+                    "p21_oracle_scale_grid",
                 ):
-                    prompt_adapter.setdefault(key, training[key])
+                    if key in training:
+                        prompt_adapter.setdefault(key, training[key])
                 training.setdefault("lambda_prompt_router_deployment_utility", 0.05 if variant == "p21_v2_hetero_filter" else 0.10)
                 training.setdefault("prompt_router_deployment_utility_margin", 0.0005)
                 training.setdefault("prompt_router_deployment_utility_anti_harm_weight", 0.5)
@@ -659,6 +677,36 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
     }:
         prompt_graph.setdefault("pool_strategy", "structural")
     return out
+
+
+def _resolve_p21_utility_cfg(
+    prompt_adapter_cfg: dict[str, Any],
+    training_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve P21 utility/oracle knobs with training config priority."""
+    training_cfg = training_cfg or {}
+
+    def get(key: str, default: Any) -> Any:
+        if key in training_cfg:
+            return training_cfg[key]
+        if key in prompt_adapter_cfg:
+            return prompt_adapter_cfg[key]
+        return default
+
+    return {
+        "p21_channel_utility_temperature": float(get("p21_channel_utility_temperature", 0.10)),
+        "p21_channel_utility_margin": float(get("p21_channel_utility_margin", 0.001)),
+        "p21_channel_utility_min_teacher_delta": float(get("p21_channel_utility_min_teacher_delta", 0.001)),
+        "p21_channel_utility_target_mode": str(get("p21_channel_utility_target_mode", "hard_reject_or_best")),
+        "p21_channel_utility_gate_source": str(get("p21_channel_utility_gate_source", "actual")),
+        "p21_channel_utility_gate_source_warmup": str(get("p21_channel_utility_gate_source_warmup", "max")),
+        "p21_channel_utility_actual_gate_start_epoch": int(get("p21_channel_utility_actual_gate_start_epoch", 0)),
+        "p21_gate_utility_temperature": float(get("p21_gate_utility_temperature", 0.02)),
+        "p21_gate_utility_margin": float(get("p21_gate_utility_margin", 0.001)),
+        "p21_gate_target_mode": str(get("p21_gate_target_mode", "soft")),
+        "p21_oracle_gate_source": str(get("p21_oracle_gate_source", get("p21_channel_utility_gate_source", "actual"))),
+        "p21_oracle_scale_grid": get("p21_oracle_scale_grid", [0.25, 0.5, 1.0, 2.0, 4.0]),
+    }
 
 
 def _class_balanced_support_query_split(
@@ -1806,6 +1854,7 @@ def _forward_prompt_adapter(
     edge_index: torch.Tensor,
     update_mask: torch.Tensor | None = None,
     support_mask: torch.Tensor | None = None,
+    compat_support_mask: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor], dict[str, Any]]:
     h_pre = model.encode_frozen(z, edge_index)
@@ -1821,6 +1870,7 @@ def _forward_prompt_adapter(
         "h_adp": no_prompt_out["h_adp"],
         "update_mask": update_mask,
         "support_mask": support_mask,
+        "compat_support_mask": compat_support_mask,
         "labels": labels,
     }
     if bool(getattr(prompt_adapter_module, "consumes_base_logits", False)):
@@ -3260,6 +3310,240 @@ def p21_channel_utility_supervision_loss(
     return loss, gate_loss, stats
 
 
+def _p21_channel_names(adapter_out: dict[str, Any]) -> tuple[str, ...]:
+    raw_channel_names = adapter_out.get("channel_names", CHANNEL_NAMES)
+    channel_names = (
+        tuple(str(name) for name in raw_channel_names)
+        if isinstance(raw_channel_names, (list, tuple))
+        else CHANNEL_NAMES
+    )
+    if len(channel_names) == 0 or channel_names[0] != "reject":
+        return CHANNEL_NAMES
+    return channel_names
+
+
+def _p21_acc_and_macro_f1(
+    *,
+    pred: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int | None,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    acc = (pred == labels).to(dtype=dtype).mean()
+    class_count = int(num_classes) if num_classes is not None else int(pred.max().item() + 1 if pred.numel() else 1)
+    f1_values = []
+    for class_id in range(class_count):
+        cls = labels == class_id
+        pred_cls = pred == class_id
+        tp = (cls & pred_cls).to(dtype=dtype).sum()
+        fp = (~cls & pred_cls).to(dtype=dtype).sum()
+        fn = (cls & ~pred_cls).to(dtype=dtype).sum()
+        denom = (2.0 * tp + fp + fn).clamp_min(1e-12)
+        f1_values.append((2.0 * tp) / denom)
+    return acc, torch.stack(f1_values).mean()
+
+
+def p21_channel_ungated_oracle_diagnostics(
+    *,
+    adapter_out: dict[str, torch.Tensor],
+    model: FaithfulGP2F,
+    h_pre: torch.Tensor,
+    h_adp_base: torch.Tensor,
+    logits_no_prompt: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    prefix: str = "p21_v2_ungated_oracle",
+    scale_grid: list[float] | tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0),
+    num_classes: int | None = None,
+) -> dict[str, float]:
+    """Evaluate true scale-grid expert upper bound without actual gate."""
+    channel_names = _p21_channel_names(adapter_out)
+    channel_deltas = adapter_out.get("channel_deltas")
+    if not isinstance(channel_deltas, torch.Tensor):
+        return {f"{prefix}_count": 0.0}
+    if len(channel_names) != int(channel_deltas.size(1)):
+        channel_names = tuple(f"channel_{idx}" for idx in range(int(channel_deltas.size(1))))
+        channel_names = ("reject", *channel_names[1:])
+
+    mask = mask.to(device=channel_deltas.device, dtype=torch.bool)
+    idx = torch.where(mask)[0]
+    empty = {
+        f"{prefix}_count": 0.0,
+        f"{prefix}_best_channel_delta_ce": 0.0,
+        f"{prefix}_best_channel_positive_ratio": 0.0,
+        f"{prefix}_best_channel_acc": 0.0,
+        f"{prefix}_best_channel_macro_f1": 0.0,
+        f"{prefix}_best_channel_acc_lift_vs_no_prompt": 0.0,
+        f"{prefix}_best_channel_macro_f1_lift_vs_no_prompt": 0.0,
+        f"{prefix}_best_scale": 0.0,
+    }
+    for name in channel_names:
+        empty[f"{prefix}_{name}_best_ratio"] = 0.0
+        empty[f"{prefix}_{name}_mean_delta_ce"] = 0.0
+    if idx.numel() == 0:
+        return dict(empty)
+
+    h_pre = h_pre.to(device=channel_deltas.device)
+    h_adp_base = h_adp_base.to(device=channel_deltas.device)
+    labels = labels.to(device=channel_deltas.device, dtype=torch.long)
+    logits_no_prompt = logits_no_prompt.to(device=channel_deltas.device)
+    scale_values = [float(v) for v in scale_grid if float(v) > 0.0]
+    if not scale_values:
+        scale_values = [1.0]
+
+    classifier = model.classifier
+    mix_alpha = model.alpha
+    with torch.no_grad():
+        ce_no = F.cross_entropy(logits_no_prompt[idx], labels[idx], reduction="none")
+        candidate_delta: list[torch.Tensor] = [ce_no.new_zeros(idx.numel())]
+        candidate_logits: list[torch.Tensor] = [logits_no_prompt[idx]]
+        candidate_channel_idx: list[int] = [0]
+        candidate_scale: list[float] = [0.0]
+        channel_mean_delta = ce_no.new_zeros(channel_deltas.size(1))
+        for channel_idx in range(1, int(channel_deltas.size(1))):
+            channel_scale_deltas = []
+            for scale in scale_values:
+                h_channel = h_adp_base + float(scale) * channel_deltas[:, channel_idx, :]
+                logits_channel = classifier(mix_alpha * h_pre + (1.0 - mix_alpha) * h_channel)
+                ce_channel = F.cross_entropy(logits_channel[idx], labels[idx], reduction="none")
+                delta = ce_no - ce_channel
+                candidate_delta.append(delta)
+                candidate_logits.append(logits_channel[idx])
+                candidate_channel_idx.append(channel_idx)
+                candidate_scale.append(float(scale))
+                channel_scale_deltas.append(delta)
+            channel_mean_delta[channel_idx] = torch.stack(channel_scale_deltas, dim=-1).max(dim=-1).values.mean()
+        delta_matrix = torch.stack(candidate_delta, dim=-1)
+        best_delta, best_candidate = delta_matrix.max(dim=-1)
+        logits_matrix = torch.stack(candidate_logits, dim=1)
+        selected_logits = logits_matrix[torch.arange(idx.numel(), device=idx.device), best_candidate]
+        best_channel = torch.tensor(candidate_channel_idx, device=idx.device, dtype=torch.long)[best_candidate]
+        best_scale = torch.tensor(candidate_scale, device=idx.device, dtype=ce_no.dtype)[best_candidate]
+        y = labels[idx]
+        no_prompt_pred = logits_no_prompt[idx].argmax(dim=-1)
+        oracle_pred = selected_logits.argmax(dim=-1)
+        no_prompt_acc, no_prompt_macro = _p21_acc_and_macro_f1(
+            pred=no_prompt_pred,
+            labels=y,
+            num_classes=num_classes,
+            dtype=ce_no.dtype,
+        )
+        oracle_acc, oracle_macro = _p21_acc_and_macro_f1(
+            pred=oracle_pred,
+            labels=y,
+            num_classes=num_classes,
+            dtype=ce_no.dtype,
+        )
+
+    stats = {
+        **empty,
+        f"{prefix}_count": float(idx.numel()),
+        f"{prefix}_best_channel_delta_ce": float(best_delta.detach().mean().item()),
+        f"{prefix}_best_channel_positive_ratio": float((best_delta.detach() > 0.0).float().mean().item()),
+        f"{prefix}_best_channel_acc": float(oracle_acc.detach().item()),
+        f"{prefix}_best_channel_macro_f1": float(oracle_macro.detach().item()),
+        f"{prefix}_best_channel_acc_lift_vs_no_prompt": float((oracle_acc - no_prompt_acc).detach().item()),
+        f"{prefix}_best_channel_macro_f1_lift_vs_no_prompt": float((oracle_macro - no_prompt_macro).detach().item()),
+        f"{prefix}_best_scale": float(best_scale.detach().mean().item()),
+    }
+    for channel_idx, name in enumerate(channel_names):
+        stats[f"{prefix}_{name}_best_ratio"] = float((best_channel == channel_idx).float().mean().item())
+        stats[f"{prefix}_{name}_mean_delta_ce"] = float(channel_mean_delta[channel_idx].detach().item())
+    return stats
+
+
+def p21_channel_expert_utility_loss(
+    *,
+    adapter_out: dict[str, torch.Tensor],
+    model: FaithfulGP2F,
+    h_pre: torch.Tensor,
+    h_adp_base: torch.Tensor,
+    logits_no_prompt: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    prefix: str = "p21_channel_expert",
+    probe_scale: float = 1.0,
+    temperature: float = 0.10,
+    margin: float = 0.001,
+    anti_harm_weight: float = 0.5,
+    class_balanced: bool = True,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Directly train non-reject expert deltas to reduce labeled-query CE."""
+    channel_names = _p21_channel_names(adapter_out)
+    channel_deltas = adapter_out.get("channel_deltas")
+    ref = h_adp_base if isinstance(h_adp_base, torch.Tensor) else logits_no_prompt
+    empty = {
+        f"{prefix}_loss": 0.0,
+        f"{prefix}_count": 0.0,
+        f"{prefix}_mean_delta_ce": 0.0,
+        f"{prefix}_positive_ratio": 0.0,
+        f"{prefix}_best_delta_ce": 0.0,
+        f"{prefix}_anti_harm_loss": 0.0,
+    }
+    for name in channel_names[1:]:
+        empty[f"{prefix}_best_channel_ratio_{name}"] = 0.0
+        empty[f"{prefix}_{name}_mean_delta_ce"] = 0.0
+    if not isinstance(channel_deltas, torch.Tensor) or channel_deltas.size(1) <= 1:
+        return ref.new_tensor(0.0), dict(empty)
+    if len(channel_names) != int(channel_deltas.size(1)):
+        channel_names = tuple(f"channel_{idx}" for idx in range(int(channel_deltas.size(1))))
+        channel_names = ("reject", *channel_names[1:])
+
+    mask = mask.to(device=channel_deltas.device, dtype=torch.bool)
+    idx = torch.where(mask)[0]
+    if idx.numel() == 0:
+        return channel_deltas.new_tensor(0.0), dict(empty)
+    h_pre_d = h_pre.detach().to(device=channel_deltas.device)
+    h_adp_base_d = h_adp_base.detach().to(device=channel_deltas.device)
+    logits_no_prompt_d = logits_no_prompt.detach().to(device=channel_deltas.device)
+    labels = labels.to(device=channel_deltas.device, dtype=torch.long)
+    mix_alpha = model.alpha.detach()
+    classifier = model.classifier
+    ce_channels = []
+    logits_channels = []
+    for channel_idx in range(1, int(channel_deltas.size(1))):
+        h_channel = h_adp_base_d + float(probe_scale) * channel_deltas[:, channel_idx, :]
+        logits_channel = classifier(mix_alpha * h_pre_d + (1.0 - mix_alpha) * h_channel)
+        logits_channels.append(logits_channel[idx])
+        ce_channels.append(F.cross_entropy(logits_channel[idx], labels[idx], reduction="none"))
+    ce_stack = torch.stack(ce_channels, dim=-1)
+    with torch.no_grad():
+        weights = torch.softmax(-ce_stack / max(float(temperature), 1e-6), dim=-1)
+        ce_no = F.cross_entropy(logits_no_prompt_d[idx], labels[idx], reduction="none")
+        delta = ce_no.unsqueeze(-1) - ce_stack.detach()
+        best_delta, best_offset = delta.max(dim=-1)
+    expert_per_node = (weights * ce_stack).sum(dim=-1)
+    anti_harm = F.relu(float(margin) - (ce_no.unsqueeze(-1) - ce_stack))
+    per_node = expert_per_node + float(anti_harm_weight) * anti_harm.mean(dim=-1)
+    if class_balanced:
+        per_class = []
+        per_class_anti = []
+        for class_id in torch.unique(labels[idx].detach()).tolist():
+            class_mask = labels[idx] == int(class_id)
+            if bool(class_mask.any()):
+                per_class.append(per_node[class_mask].mean())
+                per_class_anti.append(anti_harm[class_mask].mean())
+        loss = torch.stack(per_class).mean() if per_class else per_node.mean()
+        anti_harm_loss = torch.stack(per_class_anti).mean() if per_class_anti else anti_harm.mean()
+    else:
+        loss = per_node.mean()
+        anti_harm_loss = anti_harm.mean()
+
+    stats = {
+        **empty,
+        f"{prefix}_loss": float(loss.detach().item()),
+        f"{prefix}_count": float(idx.numel()),
+        f"{prefix}_mean_delta_ce": float(delta.detach().mean().item()),
+        f"{prefix}_positive_ratio": float((delta.detach() > 0.0).float().mean().item()),
+        f"{prefix}_best_delta_ce": float(best_delta.detach().mean().item()),
+        f"{prefix}_anti_harm_loss": float(anti_harm_loss.detach().item()),
+    }
+    for offset, name in enumerate(channel_names[1:]):
+        stats[f"{prefix}_best_channel_ratio_{name}"] = float((best_offset == offset).float().mean().item())
+        stats[f"{prefix}_{name}_mean_delta_ce"] = float(delta[:, offset].detach().mean().item())
+    return loss, stats
+
+
 def _forward_prompt_graph_with_message_scale(
     *,
     model: FaithfulGP2F,
@@ -4223,6 +4507,7 @@ def _init_equivalence(
     x: torch.Tensor,
     edge_index: torch.Tensor,
     train_mask: torch.Tensor,
+    labels: torch.Tensor | None = None,
     prompt_adapter_module: HeterophilyAwarePromptAdapter | None = None,
 ) -> dict[str, float]:
     model.eval()
@@ -4246,6 +4531,9 @@ def _init_equivalence(
             z=z,
             edge_index=edge_index,
             update_mask=torch.ones_like(train_mask, dtype=torch.bool),
+            support_mask=train_mask,
+            compat_support_mask=train_mask,
+            labels=labels,
         )
         return {
             "init_original_x_delta": 0.0,
@@ -4317,6 +4605,7 @@ def evaluate_prompt_graph(
     if prompt_adapter_module is not None:
         prompt_adapter_module.eval()
         prompt_adapter_cfg = dict(getattr(prompt_adapter_module, "config", {}) or {})
+        p21_eval_cfg = _resolve_p21_utility_cfg(prompt_adapter_cfg)
         update_mask = torch.ones_like(train_mask, dtype=torch.bool)
         pool_stats: dict[str, Any] = {}
         if bool(prompt_adapter_cfg.get("use_candidate_pool", False)):
@@ -4343,6 +4632,7 @@ def evaluate_prompt_graph(
             edge_index=edge_index,
             update_mask=update_mask,
             support_mask=train_mask,
+            compat_support_mask=train_mask,
             labels=labels,
         )
         logits = model_out["logits"]
@@ -4425,18 +4715,41 @@ def evaluate_prompt_graph(
                     labels=labels,
                     mask=eval_mask,
                     prefix=eval_prefix,
-                    temperature=float(prompt_adapter_cfg.get("p21_channel_utility_temperature", 0.10)),
-                    margin=float(prompt_adapter_cfg.get("p21_channel_utility_margin", 0.001)),
-                    min_teacher_delta=float(prompt_adapter_cfg.get("p21_channel_utility_min_teacher_delta", 0.001)),
-                    target_mode=str(prompt_adapter_cfg.get("p21_channel_utility_target_mode", "reject_margin_softmax")),
-                    gate_source=str(prompt_adapter_cfg.get("p21_channel_utility_gate_source", "actual")),
-                    gate_temperature=float(prompt_adapter_cfg.get("p21_gate_utility_temperature", 0.02)),
-                    gate_margin=float(prompt_adapter_cfg.get("p21_gate_utility_margin", 0.001)),
-                    gate_target_mode=str(prompt_adapter_cfg.get("p21_gate_target_mode", "soft")),
+                    temperature=float(p21_eval_cfg["p21_channel_utility_temperature"]),
+                    margin=float(p21_eval_cfg["p21_channel_utility_margin"]),
+                    min_teacher_delta=float(p21_eval_cfg["p21_channel_utility_min_teacher_delta"]),
+                    target_mode=str(p21_eval_cfg["p21_channel_utility_target_mode"]),
+                    gate_source=str(p21_eval_cfg["p21_oracle_gate_source"]),
+                    gate_temperature=float(p21_eval_cfg["p21_gate_utility_temperature"]),
+                    gate_margin=float(p21_eval_cfg["p21_gate_utility_margin"]),
+                    gate_target_mode=str(p21_eval_cfg["p21_gate_target_mode"]),
                     class_balanced=False,
                     num_classes=num_classes,
                 )
                 adapter_diag.update(oracle_stats)
+            oracle_scale_grid = _float_grid(
+                p21_eval_cfg.get("p21_oracle_scale_grid"),
+                default=[0.25, 0.5, 1.0, 2.0, 4.0],
+            )
+            for eval_mask, eval_prefix in (
+                (train_mask, "p21_v2_ungated_oracle_train"),
+                (val_mask, "p21_v2_ungated_oracle_val"),
+                (test_mask, "p21_v2_ungated_oracle_test"),
+            ):
+                adapter_diag.update(
+                    p21_channel_ungated_oracle_diagnostics(
+                        adapter_out=adapter_out,
+                        model=model,
+                        h_pre=model_out["h_pre"],
+                        h_adp_base=no_prompt_out["h_adp"],
+                        logits_no_prompt=no_prompt_out["logits"],
+                        labels=labels,
+                        mask=eval_mask,
+                        prefix=eval_prefix,
+                        scale_grid=oracle_scale_grid,
+                        num_classes=num_classes,
+                    )
+                )
         if "pattern_messages" in adapter_out:
             oracle_scale_grid = _float_grid(
                 prompt_adapter_cfg.get("prompt_router_expert_oracle_scale_grid"),
@@ -5132,6 +5445,7 @@ def run_single(
         x=graph.x,
         edge_index=graph.edge_index,
         train_mask=label_train_mask,
+        labels=graph.y,
         prompt_adapter_module=prompt_adapter_module,
     )
 
@@ -5258,6 +5572,16 @@ def run_single(
     )
     lambda_p21_channel_utility = float(training_cfg.get("lambda_p21_channel_utility", 0.0))
     lambda_p21_gate_utility = float(training_cfg.get("lambda_p21_gate_utility", 0.0))
+    expert_warmup_epochs = int(training_cfg.get("expert_warmup_epochs", 0))
+    lambda_p21_channel_expert_utility = float(training_cfg.get("lambda_p21_channel_expert_utility", 0.0))
+    lambda_p21_channel_expert_utility_after_warmup = float(
+        training_cfg.get("lambda_p21_channel_expert_utility_after_warmup", min(lambda_p21_channel_expert_utility, 0.05))
+    )
+    p21_channel_expert_probe_scale = float(training_cfg.get("p21_channel_expert_probe_scale", 1.0))
+    p21_channel_expert_temperature = float(training_cfg.get("p21_channel_expert_temperature", 0.10))
+    p21_channel_expert_margin = float(training_cfg.get("p21_channel_expert_margin", 0.001))
+    p21_channel_expert_anti_harm_weight = float(training_cfg.get("p21_channel_expert_anti_harm_weight", 0.5))
+    p21_channel_expert_class_balanced = bool(training_cfg.get("p21_channel_expert_class_balanced", True))
     lambda_prompt_router_expert_utility_supervision = float(
         training_cfg.get("lambda_prompt_router_expert_utility_supervision", 0.0)
     )
@@ -5289,21 +5613,22 @@ def run_single(
     prompt_router_pattern_utility_unhelpful_node_weight = float(
         training_cfg.get("prompt_router_pattern_utility_unhelpful_node_weight", 0.0)
     )
-    p21_channel_utility_temperature = float(training_cfg.get("p21_channel_utility_temperature", 0.10))
-    p21_channel_utility_margin = float(training_cfg.get("p21_channel_utility_margin", 0.0))
-    p21_channel_utility_min_teacher_delta = float(
-        training_cfg.get("p21_channel_utility_min_teacher_delta", 0.0)
+    p21_utility_cfg = _resolve_p21_utility_cfg(prompt_adapter_cfg, training_cfg)
+    p21_channel_utility_temperature = float(p21_utility_cfg["p21_channel_utility_temperature"])
+    p21_channel_utility_margin = float(p21_utility_cfg["p21_channel_utility_margin"])
+    p21_channel_utility_min_teacher_delta = float(p21_utility_cfg["p21_channel_utility_min_teacher_delta"])
+    p21_channel_utility_target_mode = str(p21_utility_cfg["p21_channel_utility_target_mode"])
+    p21_channel_utility_gate_source = str(p21_utility_cfg["p21_channel_utility_gate_source"])
+    p21_channel_utility_gate_source_warmup = str(
+        p21_utility_cfg["p21_channel_utility_gate_source_warmup"]
     )
-    p21_channel_utility_target_mode = str(
-        training_cfg.get("p21_channel_utility_target_mode", "reject_margin_softmax")
-    )
-    p21_channel_utility_gate_source = str(training_cfg.get("p21_channel_utility_gate_source", "actual"))
+    p21_channel_utility_actual_gate_start_epoch = int(p21_utility_cfg["p21_channel_utility_actual_gate_start_epoch"])
     p21_channel_utility_class_balanced = bool(
         training_cfg.get("p21_channel_utility_class_balanced", True)
     )
-    p21_gate_utility_temperature = float(training_cfg.get("p21_gate_utility_temperature", 0.02))
-    p21_gate_utility_margin = float(training_cfg.get("p21_gate_utility_margin", 0.001))
-    p21_gate_target_mode = str(training_cfg.get("p21_gate_target_mode", "soft"))
+    p21_gate_utility_temperature = float(p21_utility_cfg["p21_gate_utility_temperature"])
+    p21_gate_utility_margin = float(p21_utility_cfg["p21_gate_utility_margin"])
+    p21_gate_target_mode = str(p21_utility_cfg["p21_gate_target_mode"])
     prompt_router_class_pattern_reliability_temperature = float(
         training_cfg.get(
             "prompt_router_class_pattern_reliability_temperature",
@@ -5522,6 +5847,7 @@ def run_single(
         }
         p21_channel_utility = z.new_tensor(0.0)
         p21_gate_utility = z.new_tensor(0.0)
+        p21_channel_expert_utility = z.new_tensor(0.0)
         p21_channel_utility_stats = {
             "p21_channel_utility_loss": 0.0,
             "p21_channel_utility_gate_loss": 0.0,
@@ -5554,6 +5880,17 @@ def run_single(
             p21_channel_utility_stats[f"p21_v2_{channel_name}_mean_delta_ce"] = 0.0
             p21_channel_utility_stats[f"p21_v2_{channel_name}_best_ratio"] = 0.0
             p21_channel_utility_stats[f"p21_v2_{channel_name}_alpha_mean"] = 0.0
+        p21_channel_expert_stats = {
+            "p21_channel_expert_loss": 0.0,
+            "p21_channel_expert_count": 0.0,
+            "p21_channel_expert_mean_delta_ce": 0.0,
+            "p21_channel_expert_positive_ratio": 0.0,
+            "p21_channel_expert_best_delta_ce": 0.0,
+            "p21_channel_expert_anti_harm_loss": 0.0,
+        }
+        for channel_name in P21_V2_CHANNEL_NAMES[1:]:
+            p21_channel_expert_stats[f"p21_channel_expert_best_channel_ratio_{channel_name}"] = 0.0
+            p21_channel_expert_stats[f"p21_channel_expert_{channel_name}_mean_delta_ce"] = 0.0
         prompt_adapter_expert_utility_stats = {
             "prompt_router_expert_loss": 0.0,
             "prompt_router_expert_count": 0.0,
@@ -5601,6 +5938,7 @@ def run_single(
             pattern_utility_losses: list[torch.Tensor] = []
             class_pattern_reliability_losses: list[torch.Tensor] = []
             deployment_utility_losses: list[torch.Tensor] = []
+            p21_channel_expert_losses: list[torch.Tensor] = []
             p21_channel_utility_losses: list[torch.Tensor] = []
             p21_gate_utility_losses: list[torch.Tensor] = []
             expert_utility_losses: list[torch.Tensor] = []
@@ -5608,6 +5946,7 @@ def run_single(
             pattern_utility_stats_list: list[dict[str, Any]] = []
             class_pattern_reliability_stats_list: list[dict[str, Any]] = []
             deployment_utility_stats_list: list[dict[str, Any]] = []
+            p21_channel_expert_stats_list: list[dict[str, Any]] = []
             p21_channel_utility_stats_list: list[dict[str, Any]] = []
             expert_utility_stats_list: list[dict[str, Any]] = []
             adapter_outs: list[dict[str, torch.Tensor]] = []
@@ -5615,6 +5954,20 @@ def run_single(
             message_help_stats_list: list[dict[str, Any]] = []
             utility_gate_stats_list: list[dict[str, Any]] = []
             support_query_stats_list: list[dict[str, Any]] = []
+            in_expert_warmup = epoch <= expert_warmup_epochs
+            effective_lambda_p21_channel_expert = (
+                lambda_p21_channel_expert_utility
+                if in_expert_warmup
+                else lambda_p21_channel_expert_utility_after_warmup
+            )
+            effective_lambda_p21_channel_utility = 0.0 if in_expert_warmup else lambda_p21_channel_utility
+            effective_lambda_p21_gate_utility = 0.0 if in_expert_warmup else lambda_p21_gate_utility
+            effective_lambda_deployment_utility = (
+                0.0 if in_expert_warmup else lambda_prompt_router_deployment_utility
+            )
+            effective_p21_gate_source = p21_channel_utility_gate_source
+            if p21_channel_utility_actual_gate_start_epoch > 0 and epoch < p21_channel_utility_actual_gate_start_epoch:
+                effective_p21_gate_source = p21_channel_utility_gate_source_warmup
             for episode_idx in range(episode_count):
                 if episode_idx == 0:
                     episode_support_mask = support_mask
@@ -5655,6 +6008,7 @@ def run_single(
                     edge_index=graph.edge_index,
                     update_mask=episode_update_mask,
                     support_mask=episode_support_mask,
+                    compat_support_mask=label_train_mask,
                     labels=graph.y,
                 )
                 cls_losses.append(
@@ -5771,7 +6125,7 @@ def run_single(
                 else:
                     episode_class_pattern_reliability = z.new_tensor(0.0)
                     episode_class_pattern_reliability_stats = dict(prompt_adapter_class_pattern_reliability_stats)
-                if lambda_prompt_router_deployment_utility > 0.0:
+                if effective_lambda_deployment_utility > 0.0:
                     episode_deployment_utility, episode_deployment_utility_stats = (
                         prompt_router_deployment_utility_loss(
                             logits_prompt=episode_model_out["logits"],
@@ -5790,7 +6144,25 @@ def run_single(
                 else:
                     episode_deployment_utility = z.new_tensor(0.0)
                     episode_deployment_utility_stats = dict(prompt_adapter_deployment_utility_stats)
-                if lambda_p21_channel_utility > 0.0 and "channel_deltas" in episode_adapter_out:
+                if effective_lambda_p21_channel_expert > 0.0 and "channel_deltas" in episode_adapter_out:
+                    episode_p21_channel_expert, episode_p21_channel_expert_stats = p21_channel_expert_utility_loss(
+                        adapter_out=episode_adapter_out,
+                        model=model,
+                        h_pre=episode_no_prompt_out["h_pre"],
+                        h_adp_base=episode_no_prompt_out["h_adp"],
+                        logits_no_prompt=episode_no_prompt_out["logits"],
+                        labels=graph.y,
+                        mask=episode_adapter_supervision_mask,
+                        probe_scale=p21_channel_expert_probe_scale,
+                        temperature=p21_channel_expert_temperature,
+                        margin=p21_channel_expert_margin,
+                        anti_harm_weight=p21_channel_expert_anti_harm_weight,
+                        class_balanced=p21_channel_expert_class_balanced,
+                    )
+                else:
+                    episode_p21_channel_expert = z.new_tensor(0.0)
+                    episode_p21_channel_expert_stats = dict(p21_channel_expert_stats)
+                if effective_lambda_p21_channel_utility > 0.0 and "channel_deltas" in episode_adapter_out:
                     episode_p21_channel_utility, episode_p21_gate_utility, episode_p21_channel_utility_stats = (
                         p21_channel_utility_supervision_loss(
                             adapter_out=episode_adapter_out,
@@ -5804,7 +6176,7 @@ def run_single(
                             margin=p21_channel_utility_margin,
                             min_teacher_delta=p21_channel_utility_min_teacher_delta,
                             target_mode=p21_channel_utility_target_mode,
-                            gate_source=p21_channel_utility_gate_source,
+                            gate_source=effective_p21_gate_source,
                             gate_temperature=p21_gate_utility_temperature,
                             gate_margin=p21_gate_utility_margin,
                             gate_target_mode=p21_gate_target_mode,
@@ -5852,6 +6224,7 @@ def run_single(
                 pattern_utility_losses.append(episode_pattern_utility)
                 class_pattern_reliability_losses.append(episode_class_pattern_reliability)
                 deployment_utility_losses.append(episode_deployment_utility)
+                p21_channel_expert_losses.append(episode_p21_channel_expert)
                 p21_channel_utility_losses.append(episode_p21_channel_utility)
                 p21_gate_utility_losses.append(episode_p21_gate_utility)
                 expert_utility_losses.append(episode_expert_utility)
@@ -5859,6 +6232,7 @@ def run_single(
                 pattern_utility_stats_list.append(episode_pattern_utility_stats)
                 class_pattern_reliability_stats_list.append(episode_class_pattern_reliability_stats)
                 deployment_utility_stats_list.append(episode_deployment_utility_stats)
+                p21_channel_expert_stats_list.append(episode_p21_channel_expert_stats)
                 p21_channel_utility_stats_list.append(episode_p21_channel_utility_stats)
                 expert_utility_stats_list.append(episode_expert_utility_stats)
                 adapter_outs.append(episode_adapter_out)
@@ -5901,6 +6275,7 @@ def run_single(
             prompt_adapter_pattern_utility = torch.stack(pattern_utility_losses).mean()
             prompt_adapter_class_pattern_reliability = torch.stack(class_pattern_reliability_losses).mean()
             prompt_adapter_deployment_utility = torch.stack(deployment_utility_losses).mean()
+            p21_channel_expert_utility = torch.stack(p21_channel_expert_losses).mean()
             p21_channel_utility = torch.stack(p21_channel_utility_losses).mean()
             p21_gate_utility = torch.stack(p21_gate_utility_losses).mean()
             prompt_adapter_expert_utility_supervision = torch.stack(expert_utility_losses).mean()
@@ -5908,6 +6283,7 @@ def run_single(
             prompt_adapter_pattern_utility_stats = _mean_float_stats(pattern_utility_stats_list)
             prompt_adapter_class_pattern_reliability_stats = _mean_float_stats(class_pattern_reliability_stats_list)
             prompt_adapter_deployment_utility_stats = _mean_float_stats(deployment_utility_stats_list)
+            p21_channel_expert_stats = _mean_float_stats(p21_channel_expert_stats_list)
             p21_channel_utility_stats = _mean_float_stats(p21_channel_utility_stats_list)
             prompt_adapter_expert_utility_stats = _mean_float_stats(expert_utility_stats_list)
             consistency_mask = label_train_mask.bool()
@@ -5931,6 +6307,7 @@ def run_single(
             adapter_train_stats.update(prompt_adapter_pattern_utility_stats)
             adapter_train_stats.update(prompt_adapter_class_pattern_reliability_stats)
             adapter_train_stats.update(prompt_adapter_deployment_utility_stats)
+            adapter_train_stats.update(p21_channel_expert_stats)
             adapter_train_stats.update(p21_channel_utility_stats)
             adapter_train_stats.update(prompt_adapter_expert_utility_stats)
             assert adapter_out is not None and no_prompt_out is not None
@@ -6473,9 +6850,10 @@ def run_single(
             + lambda_prompt_router_pattern_supervision * prompt_adapter_pattern_supervision
             + lambda_prompt_router_pattern_utility * prompt_adapter_pattern_utility
             + lambda_prompt_router_class_pattern_reliability * prompt_adapter_class_pattern_reliability
-            + lambda_prompt_router_deployment_utility * prompt_adapter_deployment_utility
-            + lambda_p21_channel_utility * p21_channel_utility
-            + lambda_p21_gate_utility * p21_gate_utility
+            + effective_lambda_deployment_utility * prompt_adapter_deployment_utility
+            + effective_lambda_p21_channel_expert * p21_channel_expert_utility
+            + effective_lambda_p21_channel_utility * p21_channel_utility
+            + effective_lambda_p21_gate_utility * p21_gate_utility
             + lambda_prompt_router_expert_utility_supervision * prompt_adapter_expert_utility_supervision
         )
         if not torch.isfinite(loss):
@@ -6536,6 +6914,7 @@ def run_single(
                 prompt_adapter_class_pattern_reliability.detach().item()
             ),
             "prompt_router_deployment_utility_loss": float(prompt_adapter_deployment_utility.detach().item()),
+            "p21_channel_expert_utility_loss": float(p21_channel_expert_utility.detach().item()),
             "p21_channel_utility_loss": float(p21_channel_utility.detach().item()),
             "p21_gate_utility_loss": float(p21_gate_utility.detach().item()),
             "prompt_router_expert_utility_supervision_loss": float(
@@ -6577,8 +6956,16 @@ def run_single(
             "lambda_prompt_router_pattern_utility": lambda_prompt_router_pattern_utility,
             "lambda_prompt_router_class_pattern_reliability": lambda_prompt_router_class_pattern_reliability,
             "lambda_prompt_router_deployment_utility": lambda_prompt_router_deployment_utility,
+            "lambda_p21_channel_expert_utility": lambda_p21_channel_expert_utility,
+            "lambda_p21_channel_expert_utility_after_warmup": lambda_p21_channel_expert_utility_after_warmup,
             "lambda_p21_channel_utility": lambda_p21_channel_utility,
             "lambda_p21_gate_utility": lambda_p21_gate_utility,
+            "effective_lambda_prompt_router_deployment_utility": effective_lambda_deployment_utility,
+            "effective_lambda_p21_channel_expert_utility": effective_lambda_p21_channel_expert,
+            "effective_lambda_p21_channel_utility": effective_lambda_p21_channel_utility,
+            "effective_lambda_p21_gate_utility": effective_lambda_p21_gate_utility,
+            "p21_expert_warmup_active": float(in_expert_warmup),
+            "p21_expert_warmup_epochs": float(expert_warmup_epochs),
             "lambda_prompt_router_expert_utility_supervision": lambda_prompt_router_expert_utility_supervision,
             "prompt_router_pattern_utility_margin": prompt_router_pattern_utility_margin,
             "prompt_router_pattern_utility_anti_harm_weight": prompt_router_pattern_utility_anti_harm_weight,
@@ -6614,7 +7001,14 @@ def run_single(
             "p21_channel_utility_min_teacher_delta": p21_channel_utility_min_teacher_delta,
             "p21_channel_utility_target_mode": p21_channel_utility_target_mode,
             "p21_channel_utility_gate_source": p21_channel_utility_gate_source,
+            "p21_channel_utility_effective_gate_source": effective_p21_gate_source,
+            "p21_channel_utility_gate_source_warmup": p21_channel_utility_gate_source_warmup,
+            "p21_channel_utility_actual_gate_start_epoch": float(p21_channel_utility_actual_gate_start_epoch),
             "p21_channel_utility_class_balanced": float(p21_channel_utility_class_balanced),
+            "p21_channel_expert_probe_scale": p21_channel_expert_probe_scale,
+            "p21_channel_expert_temperature": p21_channel_expert_temperature,
+            "p21_channel_expert_margin": p21_channel_expert_margin,
+            "p21_channel_expert_anti_harm_weight": p21_channel_expert_anti_harm_weight,
             "p21_gate_utility_temperature": p21_gate_utility_temperature,
             "p21_gate_utility_margin": p21_gate_utility_margin,
             "p21_gate_target_mode": p21_gate_target_mode,
@@ -6696,6 +7090,7 @@ def run_single(
             **adapter_train_stats,
             **prompt_adapter_message_help_stats,
             **prompt_adapter_utility_gate_stats,
+            **p21_channel_expert_stats,
             **p21_channel_utility_stats,
         }
         loss_curve.append(log_item)
@@ -7437,6 +7832,23 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "prompt_router_deployment_no_prompt_ce",
         "prompt_router_deployment_anti_harm_loss",
         "prompt_router_deployment_gain_reward",
+        "p21_channel_expert_utility_loss",
+        "p21_channel_expert_loss",
+        "p21_channel_expert_count",
+        "p21_channel_expert_mean_delta_ce",
+        "p21_channel_expert_positive_ratio",
+        "p21_channel_expert_best_delta_ce",
+        "p21_channel_expert_anti_harm_loss",
+        "p21_channel_expert_best_channel_ratio_low",
+        "p21_channel_expert_best_channel_ratio_two",
+        "p21_channel_expert_best_channel_ratio_high",
+        "p21_channel_expert_best_channel_ratio_compat",
+        "p21_channel_expert_best_channel_ratio_role",
+        "p21_channel_expert_low_mean_delta_ce",
+        "p21_channel_expert_two_mean_delta_ce",
+        "p21_channel_expert_high_mean_delta_ce",
+        "p21_channel_expert_compat_mean_delta_ce",
+        "p21_channel_expert_role_mean_delta_ce",
         "p21_channel_utility_loss",
         "p21_gate_utility_loss",
         "p21_channel_utility_gate_loss",
@@ -7477,6 +7889,11 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_channel_utility_high_alpha_mean",
         "p21_channel_utility_compat_alpha_mean",
         "p21_channel_utility_role_alpha_mean",
+        "effective_lambda_p21_channel_expert_utility",
+        "effective_lambda_p21_channel_utility",
+        "effective_lambda_p21_gate_utility",
+        "effective_lambda_prompt_router_deployment_utility",
+        "p21_expert_warmup_active",
         "prompt_router_expert_loss",
         "prompt_router_expert_oracle_best_expert_gain",
         "prompt_router_expert_oracle_positive_ratio",
@@ -7602,6 +8019,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "p21_v2_oracle_train",
         "p21_v2_oracle_val",
         "p21_v2_oracle_test",
+        "p21_v2_ungated_oracle_train",
+        "p21_v2_ungated_oracle_val",
+        "p21_v2_ungated_oracle_test",
     ]
     p21_oracle_fields = [
         "loss",
@@ -7625,6 +8045,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "best_channel_macro_f1",
         "best_channel_acc_lift_vs_no_prompt",
         "best_channel_macro_f1_lift_vs_no_prompt",
+        "best_scale",
     ]
     for prefix in p21_oracle_prefixes:
         for field in p21_oracle_fields:

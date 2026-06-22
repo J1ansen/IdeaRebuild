@@ -55,9 +55,10 @@ prompt_adapter:
   use_reject_channel: true
   reject_channel_index: 0
   use_compat_channel: false
+  compat_support_source: full_train
   compat_source: no_prompt_logits
   compat_matrix: support_estimated
-  compat_smoothing: 0.10
+  compat_smoothing: 0.50
   compat_detach_logits: true
   compat_detach_prototypes: true
   use_role_channel: true
@@ -107,13 +108,24 @@ training:
   lambda_prompt_router_pattern_supervision: 0.0
   lambda_prompt_router_pattern_utility: 0.0
   lambda_prompt_router_class_pattern_reliability: 0.0
+  expert_warmup_epochs: 30
+  lambda_p21_channel_expert_utility: 0.20
+  lambda_p21_channel_expert_utility_after_warmup: 0.05
+  p21_channel_expert_probe_scale: 1.0
+  p21_channel_expert_temperature: 0.10
+  p21_channel_expert_margin: 0.001
+  p21_channel_expert_anti_harm_weight: 0.5
   lambda_p21_channel_utility: 0.30
   p21_channel_utility_temperature: 0.10
   p21_channel_utility_margin: 0.001
   p21_channel_utility_min_teacher_delta: 0.001
   p21_channel_utility_target_mode: hard_reject_or_best
-  p21_channel_utility_gate_source: actual
+  p21_channel_utility_gate_source: max
+  p21_channel_utility_gate_source_warmup: max
+  p21_channel_utility_actual_gate_start_epoch: 80
   p21_channel_utility_class_balanced: true
+  p21_oracle_gate_source: max
+  p21_oracle_scale_grid: [0.25, 0.5, 1.0, 2.0, 4.0]
   lambda_p21_gate_utility: 0.10
   p21_gate_utility_temperature: 0.02
   p21_gate_utility_margin: 0.001
