@@ -25,13 +25,47 @@ def _minmax(values: torch.Tensor) -> torch.Tensor:
     return (values - lo) / (hi - lo).clamp_min(1e-12)
 
 
+@torch.no_grad()
+def estimate_class_transition_from_support(
+    *,
+    labels: torch.Tensor,
+    support_mask: torch.Tensor,
+    edge_index: torch.Tensor,
+    num_classes: int,
+    smoothing: float = 0.5,
+) -> torch.Tensor:
+    """Estimate T[c, d] = P(neighbor class=d | center class=c) from support edges."""
+
+    device = labels.device
+    transition = torch.full(
+        (int(num_classes), int(num_classes)),
+        float(smoothing),
+        device=device,
+        dtype=torch.float32,
+    )
+    if edge_index.numel() > 0:
+        src, dst = edge_index.to(device)
+        support = support_mask.to(device=device, dtype=torch.bool)
+        edge_mask = support[src] & support[dst]
+        src_y = labels[src[edge_mask]].long()
+        dst_y = labels[dst[edge_mask]].long()
+        valid = (src_y >= 0) & (src_y < int(num_classes)) & (dst_y >= 0) & (dst_y < int(num_classes))
+        src_y = src_y[valid]
+        dst_y = dst_y[valid]
+        if src_y.numel() > 0:
+            flat_idx = src_y * int(num_classes) + dst_y
+            counts = torch.bincount(flat_idx, minlength=int(num_classes) * int(num_classes)).float()
+            transition = transition + counts.view(int(num_classes), int(num_classes))
+    return transition / transition.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
 class P22ClassPatternEnrichmentBank(nn.Module):
-    """Pattern-only logit-evidence adapter for P22-v0.1.
+    """Basis-supervised logit-evidence adapter for P22.
 
     The module leaves ``edge_index`` and hidden states unchanged. It builds a
     detached structural-predictive signature from NoPrompt logits and hidden
-    relations, learns shared pattern tokens, then converts support-label pattern
-    enrichment into a bounded class-level logit bias.
+    relations, learns shared pattern tokens, then lets patterns choose explicit
+    heterophily evidence bases before emitting a bounded class-level logit bias.
     """
 
     consumes_base_logits = True
@@ -52,9 +86,32 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         self.pattern_init = str(self.config.get("pattern_init", "kmeans_all_signature"))
         self.pattern_init_use_labels = bool(self.config.get("pattern_init_use_labels", False))
         if self.pattern_init_use_labels:
-            raise ValueError("P22 pattern_init_use_labels must remain false for v0.1")
+            raise ValueError("P22 pattern_init_use_labels must remain false")
         self.class_pattern_smoothing = float(self.config.get("class_pattern_smoothing", 0.5))
+        self.detach_class_pattern = bool(self.config.get("detach_class_pattern", True))
         self.eps = float(self.config.get("eps", 1e-8))
+        self.use_basis_evidence = bool(self.config.get("use_basis_evidence", True))
+        self.basis_types = list(
+            self.config.get(
+                "basis_types",
+                [
+                    "ego_logprob",
+                    "onehop_logprob",
+                    "twohop_logprob",
+                    "highpass_ego_onehop",
+                    "highpass_onehop_twohop",
+                    "class_transition",
+                ],
+            )
+        )
+        self.num_bases = int(self.config.get("num_bases", len(self.basis_types)))
+        if self.num_bases != len(self.basis_types):
+            raise ValueError("P22 num_bases must match len(basis_types)")
+        self.enrichment_weight = float(self.config.get("enrichment_weight", 0.5))
+        self.basis_weight_scale = float(self.config.get("basis_weight_scale", 1.0))
+        self.use_class_transition = bool(self.config.get("use_class_transition", True))
+        self.class_transition_smoothing = float(self.config.get("class_transition_smoothing", 0.5))
+        self.basis_usage_entropy_floor = float(self.config.get("basis_usage_entropy_floor", 0.60))
         self.pattern_scale_max = float(self.config.get("pattern_scale_max", 1.0))
         pattern_scale_init = float(self.config.get("pattern_scale_init", 0.10))
         self.raw_pattern_scale = nn.Parameter(
@@ -69,7 +126,7 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         self.evidence_std_floor = float(self.config.get("pattern_evidence_std_floor", 0.5))
         self.use_pattern_gate = bool(self.config.get("use_pattern_gate", False))
         if self.use_pattern_gate:
-            raise ValueError("P22-v0.1 keeps use_pattern_gate disabled")
+            raise ValueError("P22 keeps use_pattern_gate disabled in the basis-supervised version")
 
         signature_dim = 2 * self.num_classes + 8
         dropout = float(self.config.get("dropout", 0.0))
@@ -81,8 +138,8 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(encoder_hidden, self.pattern_dim),
         )
-        self.token_init_projector = nn.Linear(signature_dim, self.pattern_dim)
         self.pattern_tokens = nn.Parameter(torch.randn(self.num_patterns, self.pattern_dim) * 0.02)
+        self.pattern_basis_logits = nn.Parameter(torch.zeros(self.num_patterns, self.num_bases))
         self.register_buffer("pattern_tokens_initialized", torch.tensor(False), persistent=True)
 
     def set_epoch(self, epoch: int | float) -> None:
@@ -193,9 +250,13 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             return
         if self.pattern_init != "kmeans_all_signature":
             raise ValueError(f"Unsupported P22 pattern_init={self.pattern_init!r}")
-        centers = self._kmeans_centers(signature.detach())
-        projected = self.token_init_projector(centers)
-        self.pattern_tokens.copy_(projected)
+        was_training = self.pattern_encoder.training
+        self.pattern_encoder.eval()
+        encoded_all = F.normalize(self.pattern_encoder(signature.detach()), dim=-1, eps=1e-12)
+        centers = self._kmeans_centers(encoded_all)
+        self.pattern_tokens.copy_(F.normalize(centers, dim=-1, eps=1e-12))
+        if was_training:
+            self.pattern_encoder.train()
         self.pattern_tokens_initialized.fill_(True)
 
     def _class_pattern_enrichment(
@@ -228,6 +289,57 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         enrichment = (class_pattern.clamp_min(self.eps).log() - global_pattern.clamp_min(self.eps).log().unsqueeze(0))
         return enrichment, class_pattern, global_pattern
 
+    def _basis_evidence(
+        self,
+        *,
+        base_logits: torch.Tensor,
+        edge_index: torch.Tensor,
+        support_mask: torch.Tensor | None,
+        labels: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = base_logits.detach()
+        num_nodes = int(logits.size(0))
+        prob = F.softmax(logits, dim=-1)
+        neigh_prob = mean_neighbor_summary(prob, edge_index, num_nodes=num_nodes)
+        two_prob = mean_neighbor_summary(neigh_prob, edge_index, num_nodes=num_nodes)
+        if support_mask is None:
+            support = torch.ones(num_nodes, dtype=torch.bool, device=logits.device)
+        else:
+            support = support_mask.to(device=logits.device, dtype=torch.bool)
+        if labels is None:
+            labels_t = torch.zeros(num_nodes, dtype=torch.long, device=logits.device)
+        else:
+            labels_t = labels.to(device=logits.device, dtype=torch.long)
+        transition = estimate_class_transition_from_support(
+            labels=labels_t,
+            support_mask=support,
+            edge_index=edge_index,
+            num_classes=self.num_classes,
+            smoothing=self.class_transition_smoothing,
+        ).to(device=logits.device, dtype=logits.dtype)
+
+        values: list[torch.Tensor] = []
+        for basis_type in self.basis_types:
+            if basis_type == "ego_logprob":
+                values.append(prob.clamp_min(self.eps).log())
+            elif basis_type == "onehop_logprob":
+                values.append(neigh_prob.clamp_min(self.eps).log())
+            elif basis_type == "twohop_logprob":
+                values.append(two_prob.clamp_min(self.eps).log())
+            elif basis_type == "highpass_ego_onehop":
+                values.append(prob - neigh_prob)
+            elif basis_type == "highpass_onehop_twohop":
+                values.append(neigh_prob - two_prob)
+            elif basis_type == "class_transition":
+                if self.use_class_transition:
+                    transition_evidence = neigh_prob @ transition.t()
+                    values.append(transition_evidence.clamp_min(self.eps).log())
+                else:
+                    values.append(logits.new_zeros(num_nodes, self.num_classes))
+            else:
+                raise ValueError(f"Unsupported P22 basis type: {basis_type!r}")
+        return torch.stack(values, dim=1), transition
+
     def forward(
         self,
         *,
@@ -248,12 +360,41 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         tokens = F.normalize(self.pattern_tokens, dim=-1)
         pattern_logits = encoded @ tokens.t() / self._temperature()
         pattern_weights = F.softmax(pattern_logits, dim=-1)
+        pattern_weights_for_stats = pattern_weights.detach() if self.detach_class_pattern else pattern_weights
         enrichment, class_pattern, global_pattern = self._class_pattern_enrichment(
-            pattern_weights=pattern_weights,
+            pattern_weights=pattern_weights_for_stats,
             support_mask=support_mask,
             labels=labels,
         )
-        pattern_evidence = pattern_weights @ enrichment.t()
+        enrichment_evidence = pattern_weights @ enrichment.t()
+        if self.use_basis_evidence:
+            basis_evidence, transition_matrix = self._basis_evidence(
+                base_logits=base_logits,
+                edge_index=edge_index,
+                support_mask=support_mask,
+                labels=labels,
+            )
+            pattern_basis_weight = F.softmax(self.pattern_basis_logits, dim=-1)
+            basis_pattern_evidence = torch.einsum("nk,kb,nbc->nc", pattern_weights, pattern_basis_weight, basis_evidence)
+            student_basis = pattern_weights @ pattern_basis_weight
+            basis_usage = pattern_weights.mean(dim=0) @ pattern_basis_weight
+            basis_usage = basis_usage / basis_usage.sum().clamp_min(self.eps)
+            basis_usage_entropy = -(basis_usage * basis_usage.clamp_min(1e-12).log()).sum()
+            if self.num_bases > 1:
+                basis_usage_entropy = basis_usage_entropy / math.log(float(self.num_bases))
+            basis_usage_loss = F.relu(self.basis_usage_entropy_floor - basis_usage_entropy).pow(2)
+        else:
+            basis_evidence = h_adp.new_zeros(h_adp.size(0), self.num_bases, self.num_classes)
+            transition_matrix = h_adp.new_zeros(self.num_classes, self.num_classes)
+            pattern_basis_weight = F.softmax(self.pattern_basis_logits, dim=-1)
+            basis_pattern_evidence = h_adp.new_zeros(h_adp.size(0), self.num_classes)
+            student_basis = pattern_weights @ pattern_basis_weight
+            basis_usage = student_basis.mean(dim=0)
+            basis_usage = basis_usage / basis_usage.sum().clamp_min(self.eps)
+            basis_usage_entropy = h_adp.new_tensor(0.0)
+            basis_usage_loss = h_adp.new_tensor(0.0)
+
+        pattern_evidence = self.enrichment_weight * enrichment_evidence + self.basis_weight_scale * basis_pattern_evidence
         pattern_evidence = pattern_evidence - pattern_evidence.mean(dim=-1, keepdim=True)
         if self.normalize_evidence:
             std = pattern_evidence.std(dim=-1, keepdim=True).detach().clamp_min(self.evidence_std_floor)
@@ -279,19 +420,38 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         )
         pattern_reg = F.relu(pattern_usage_mean.max() - float(self.config.get("pattern_usage_max", 0.80)))
         pattern_reg = pattern_reg + F.relu(float(self.config.get("pattern_usage_entropy_floor", 0.35)) - pattern_usage_entropy)
+        class_pattern_kl = (
+            class_pattern.clamp_min(self.eps)
+            * (class_pattern.clamp_min(self.eps).log() - global_pattern.clamp_min(self.eps).log().unsqueeze(0))
+        ).sum(dim=-1).mean()
+        topk = min(3, self.num_patterns)
+        class_pattern_topk_value, class_pattern_topk_index = torch.topk(class_pattern.detach(), k=topk, dim=-1)
         return {
             "h_adp": h_adp,
             "logits": logits,
             "pattern_evidence": pattern_evidence,
+            "enrichment_evidence": enrichment_evidence,
+            "basis_pattern_evidence": basis_pattern_evidence,
+            "basis_evidence": basis_evidence,
             "logit_bias": logit_bias,
             "pattern_scale": pattern_scale,
             "pattern_weights": pattern_weights,
             "pattern_logits": pattern_logits,
+            "pattern_basis_weight": pattern_basis_weight,
+            "student_basis": student_basis,
+            "basis_usage": basis_usage,
+            "basis_usage_entropy": basis_usage_entropy,
+            "basis_usage_loss": basis_usage_loss,
+            "transition_matrix": transition_matrix,
             "class_pattern_enrichment": enrichment,
             "class_pattern": class_pattern,
+            "class_pattern_kl_to_global": class_pattern_kl,
+            "class_pattern_topk_value": class_pattern_topk_value,
+            "class_pattern_topk_index": class_pattern_topk_index,
             "global_pattern": global_pattern,
             "pattern_usage_mean": pattern_usage_mean,
             "pattern_usage_entropy": pattern_usage_entropy,
+            "pattern_max_prob_mean": pattern_weights.max(dim=-1).values.mean(),
             "pattern_reg": pattern_reg,
             "signature": signature.detach(),
             "delta": zero,

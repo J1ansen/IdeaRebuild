@@ -247,18 +247,41 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
             training["train_prompt_adapter"] = True
             if variant == "p22_class_pattern_enrichment_bank":
                 prompt_adapter.setdefault("module_type", "p22_class_pattern_enrichment_bank")
-                prompt_adapter.setdefault("num_patterns", 6)
-                prompt_adapter.setdefault("pattern_dim", 32)
+                prompt_adapter.setdefault("num_patterns", 8)
+                prompt_adapter.setdefault("pattern_dim", 64)
+                prompt_adapter.setdefault("pattern_encoder_hidden_dim", 128)
                 prompt_adapter.setdefault("dropout", 0.0)
                 prompt_adapter.setdefault("pattern_init", "kmeans_all_signature")
                 prompt_adapter.setdefault("pattern_init_use_labels", False)
+                prompt_adapter.setdefault("detach_class_pattern", True)
+                prompt_adapter.setdefault("use_basis_evidence", True)
+                prompt_adapter.setdefault(
+                    "basis_types",
+                    [
+                        "ego_logprob",
+                        "onehop_logprob",
+                        "twohop_logprob",
+                        "highpass_ego_onehop",
+                        "highpass_onehop_twohop",
+                        "class_transition",
+                    ],
+                )
+                prompt_adapter.setdefault("num_bases", len(prompt_adapter["basis_types"]))
+                prompt_adapter.setdefault("enrichment_weight", 0.5)
+                prompt_adapter.setdefault("basis_weight_scale", 1.0)
+                prompt_adapter.setdefault("use_class_transition", True)
+                prompt_adapter.setdefault("class_transition_smoothing", 0.5)
                 prompt_adapter.setdefault("class_pattern_smoothing", 0.5)
+                prompt_adapter.setdefault("use_basis_teacher", True)
+                prompt_adapter.setdefault("basis_teacher_temperature", 0.5)
+                prompt_adapter.setdefault("basis_teacher_scale", 1.0)
+                prompt_adapter.setdefault("basis_usage_entropy_floor", 0.60)
                 prompt_adapter.setdefault("pattern_temperature_init", 0.70)
-                prompt_adapter.setdefault("pattern_temperature_final", 0.25)
-                prompt_adapter.setdefault("pattern_temperature_warmdown_epochs", 50)
-                prompt_adapter.setdefault("pattern_scale_init", 0.10)
+                prompt_adapter.setdefault("pattern_temperature_final", 0.30)
+                prompt_adapter.setdefault("pattern_temperature_warmdown_epochs", 80)
+                prompt_adapter.setdefault("pattern_scale_init", 0.05)
                 prompt_adapter.setdefault("pattern_scale_max", 1.0)
-                prompt_adapter.setdefault("pattern_scale_warmup_epochs", 20)
+                prompt_adapter.setdefault("pattern_scale_warmup_epochs", 80)
                 prompt_adapter.setdefault("use_pattern_gate", False)
                 prompt_adapter["use_candidate_pool"] = False
                 prompt_adapter["candidate_pool_ratio"] = 1.0
@@ -266,6 +289,14 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training["train_prompt_adapter"] = True
                 training["prompt_adapter_update_mask"] = "all"
                 training["prompt_adapter_loss_mask"] = "query"
+                training.setdefault("epochs", 300)
+                training.setdefault("early_stop_min_epochs", 120)
+                training.setdefault("early_stop_patience", 80)
+                training.setdefault("prompt_weight_decay", 0.0)
+                training.setdefault("p22_stage1_epochs", 80)
+                training.setdefault("p22_stage1_pattern_only", True)
+                training.setdefault("p22_support_source", "full_train")
+                training.setdefault("p22_loss_source", "train")
                 training["lambda_prompt_adapter_update_norm"] = 0.0
                 training["lambda_prompt_adapter_gate_budget"] = 0.0
                 training["lambda_prompt_adapter_message_help"] = 0.0
@@ -274,9 +305,11 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training["lambda_prompt_router_pattern_supervision"] = 0.0
                 training["lambda_prompt_router_pattern_utility"] = 0.0
                 training["lambda_prompt_router_class_pattern_reliability"] = 0.0
-                training.setdefault("lambda_p22_pattern_only", 0.2)
+                training.setdefault("lambda_p22_pattern_only", 1.0)
                 training.setdefault("lambda_p22_pattern_reg", 0.005)
-                training.setdefault("prompt_adapter_episode_count_per_epoch", 3)
+                training.setdefault("lambda_p22_basis_teacher", 0.5)
+                training.setdefault("lambda_p22_basis_usage", 0.01)
+                training.setdefault("prompt_adapter_episode_count_per_epoch", 5)
                 training.setdefault("lambda_prompt_adapter_gate_consistency", 0.0)
                 training.setdefault("lambda_prompt_adapter_delta_consistency", 0.0)
             elif variant in {"p21_lite_adaptive_filter", "p21_v2_hetero_filter"}:
@@ -404,6 +437,10 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training["lambda_prompt_router_pattern_supervision"] = 0.0
                 training["lambda_prompt_router_pattern_utility"] = 0.0
                 training["lambda_prompt_router_class_pattern_reliability"] = 0.0
+                training.setdefault("lambda_p22_pattern_only", 1.0)
+                training.setdefault("lambda_p22_pattern_reg", 0.005)
+                training.setdefault("lambda_p22_basis_teacher", 0.5)
+                training.setdefault("lambda_p22_basis_usage", 0.01)
                 if variant == "p21_v2_hetero_filter":
                     training.setdefault("expert_warmup_epochs", 30)
                     training.setdefault("lambda_p21_channel_expert_utility", 0.20)
@@ -2087,7 +2124,19 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
             return float(value.detach().mean().item())
         return 0.0
 
-    return {
+    def norm(name: str) -> float:
+        value = adapter_out.get(name)
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().norm(dim=-1).mean().item()) if value.ndim >= 2 else float(value.detach().abs().mean().item())
+        return 0.0
+
+    def vector(name: str) -> list[float]:
+        value = adapter_out.get(name)
+        if isinstance(value, torch.Tensor) and value.ndim == 1:
+            return [float(item) for item in value.detach().cpu().tolist()]
+        return []
+
+    out = {
         "prompt_adapter_enabled": 1.0,
         "prompt_adapter_update_norm": scalar("prompt_update_norm"),
         "prompt_adapter_update_max_norm": scalar("prompt_update_max_norm"),
@@ -2157,9 +2206,34 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
         "p21_no_prompt_margin": scalar("p21_no_prompt_margin"),
         "p22_pattern_scale": scalar("pattern_scale"),
         "p22_pattern_reg": scalar("pattern_reg"),
-        "p22_logit_bias_norm": scalar("logit_bias"),
-        "p22_pattern_evidence_norm": scalar("pattern_evidence"),
+        "p22_basis_usage_loss": scalar("basis_usage_loss"),
+        "p22_pattern_usage_entropy": scalar("pattern_usage_entropy"),
+        "p22_pattern_max_prob_mean": scalar("pattern_max_prob_mean"),
+        "p22_basis_usage_entropy": scalar("basis_usage_entropy"),
+        "p22_class_pattern_kl_to_global": scalar("class_pattern_kl_to_global"),
+        "p22_logit_bias_norm": norm("logit_bias"),
+        "p22_enrichment_evidence_norm": norm("enrichment_evidence"),
+        "p22_basis_evidence_norm": norm("basis_pattern_evidence"),
+        "p22_final_pattern_evidence_norm": norm("pattern_evidence"),
+        "p22_pattern_usage_distribution": vector("pattern_usage_mean"),
+        "p22_basis_usage_distribution": vector("basis_usage"),
     }
+    basis_weight = adapter_out.get("pattern_basis_weight")
+    if isinstance(basis_weight, torch.Tensor):
+        out["p22_pattern_basis_weight"] = [
+            [float(v) for v in row] for row in basis_weight.detach().cpu().tolist()
+        ]
+    topk_index = adapter_out.get("class_pattern_topk_index")
+    topk_value = adapter_out.get("class_pattern_topk_value")
+    if isinstance(topk_index, torch.Tensor) and isinstance(topk_value, torch.Tensor):
+        out["p22_class_pattern_topk"] = {
+            str(class_id): [
+                {"pattern": int(idx), "value": float(val)}
+                for idx, val in zip(topk_index[class_id].detach().cpu().tolist(), topk_value[class_id].detach().cpu().tolist())
+            ]
+            for class_id in range(int(topk_index.size(0)))
+        }
+    return out
 
 
 def _prompt_adapter_delta_stats(
@@ -2200,6 +2274,114 @@ def _prompt_adapter_delta_stats(
         f"{prefix}_mean_ce_prompt": float(ce_prompt.mean().item()),
         f"{prefix}_count": float(idx.numel()),
         f"{prefix}_delta_ce_by_class": by_class,
+    }
+
+
+def _p22_pattern_only_metrics(
+    *,
+    adapter_out: dict[str, torch.Tensor] | None,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    num_classes: int,
+    prefix: str = "p22_pattern_only",
+) -> dict[str, float]:
+    if adapter_out is None or not isinstance(adapter_out.get("pattern_evidence"), torch.Tensor):
+        return {f"{prefix}_acc": 0.0, f"{prefix}_macro_f1": 0.0}
+    logits = adapter_out["pattern_evidence"]
+    metrics = split_metrics(logits.detach(), labels.to(device=logits.device), mask.to(device=logits.device), num_classes=num_classes)
+    return {f"{prefix}_acc": metrics["acc"], f"{prefix}_macro_f1": metrics["macro_f1"]}
+
+
+def _p22_basis_teacher_loss(
+    *,
+    adapter_out: dict[str, torch.Tensor],
+    base_logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    temperature: float,
+    scale: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    basis_evidence = adapter_out.get("basis_evidence")
+    student_basis = adapter_out.get("student_basis")
+    if not isinstance(basis_evidence, torch.Tensor) or not isinstance(student_basis, torch.Tensor):
+        zero = base_logits.new_tensor(0.0)
+        return zero, {
+            "p22_basis_teacher_loss": 0.0,
+            "p22_basis_teacher_count": 0.0,
+            "p22_basis_teacher_entropy": 0.0,
+            "p22_basis_teacher_student_kl": 0.0,
+            "p22_basis_teacher_agreement": 0.0,
+        }
+    mask = mask.to(device=base_logits.device, dtype=torch.bool)
+    idx = torch.where(mask)[0]
+    if idx.numel() == 0:
+        zero = base_logits.new_tensor(0.0)
+        return zero, {
+            "p22_basis_teacher_loss": 0.0,
+            "p22_basis_teacher_count": 0.0,
+            "p22_basis_teacher_entropy": 0.0,
+            "p22_basis_teacher_student_kl": 0.0,
+            "p22_basis_teacher_agreement": 0.0,
+        }
+    y = labels.to(device=base_logits.device, dtype=torch.long)
+    base = base_logits.detach()
+    with torch.no_grad():
+        ce_no = F.cross_entropy(base[idx], y[idx], reduction="none")
+        deltas: list[torch.Tensor] = []
+        for basis_idx in range(int(basis_evidence.size(1))):
+            logits_b = base + float(scale) * basis_evidence[:, basis_idx, :].detach()
+            ce_b = F.cross_entropy(logits_b[idx], y[idx], reduction="none")
+            deltas.append(ce_no - ce_b)
+        basis_delta = torch.stack(deltas, dim=-1)
+        centered = basis_delta - basis_delta.mean(dim=-1, keepdim=True)
+        std = centered.std(dim=-1, keepdim=True).clamp_min(1e-8)
+        teacher = torch.softmax(centered / std / max(float(temperature), 1e-6), dim=-1)
+    student = student_basis[idx].clamp_min(1e-12)
+    loss = -(teacher * student.log()).sum(dim=-1).mean()
+    teacher_entropy = -(teacher * teacher.clamp_min(1e-12).log()).sum(dim=-1).mean()
+    if teacher.size(-1) > 1:
+        teacher_entropy = teacher_entropy / math.log(float(teacher.size(-1)))
+    student_kl = (teacher * (teacher.clamp_min(1e-12).log() - student.log())).sum(dim=-1).mean()
+    agreement = (teacher.argmax(dim=-1) == student.argmax(dim=-1)).to(dtype=base_logits.dtype).mean()
+    return loss, {
+        "p22_basis_teacher_loss": float(loss.detach().item()),
+        "p22_basis_teacher_count": float(idx.numel()),
+        "p22_basis_teacher_entropy": float(teacher_entropy.detach().item()),
+        "p22_basis_teacher_student_kl": float(student_kl.detach().item()),
+        "p22_basis_teacher_agreement": float(agreement.detach().item()),
+    }
+
+
+def _p22_grad_diagnostics(
+    prompt_adapter_module: torch.nn.Module | None,
+    *,
+    token_before: torch.Tensor | None = None,
+) -> dict[str, float]:
+    if prompt_adapter_module is None or not isinstance(prompt_adapter_module, P22ClassPatternEnrichmentBank):
+        return {
+            "p22_pattern_token_grad_norm": 0.0,
+            "p22_pattern_encoder_grad_norm": 0.0,
+            "p22_pattern_basis_grad_norm": 0.0,
+            "p22_pattern_token_update_norm": 0.0,
+        }
+
+    def grad_norm(parameters: list[torch.nn.Parameter]) -> float:
+        grads = [p.grad.detach().norm() for p in parameters if p.grad is not None]
+        if not grads:
+            return 0.0
+        return float(torch.stack(grads).norm().item())
+
+    token_params = [prompt_adapter_module.pattern_tokens]
+    encoder_params = [p for p in prompt_adapter_module.pattern_encoder.parameters()]
+    basis_params = [prompt_adapter_module.pattern_basis_logits]
+    update_norm = 0.0
+    if token_before is not None:
+        update_norm = float((prompt_adapter_module.pattern_tokens.detach() - token_before.to(prompt_adapter_module.pattern_tokens.device)).norm().item())
+    return {
+        "p22_pattern_token_grad_norm": grad_norm(token_params),
+        "p22_pattern_encoder_grad_norm": grad_norm(encoder_params),
+        "p22_pattern_basis_grad_norm": grad_norm(basis_params),
+        "p22_pattern_token_update_norm": update_norm,
     }
 
 
@@ -4568,7 +4750,7 @@ def _init_equivalence(
     edge_index: torch.Tensor,
     train_mask: torch.Tensor,
     labels: torch.Tensor | None = None,
-    prompt_adapter_module: HeterophilyAwarePromptAdapter | None = None,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter | P22ClassPatternEnrichmentBank | None = None,
 ) -> dict[str, float]:
     model.eval()
     input_aligner.eval()
@@ -4655,7 +4837,7 @@ def evaluate_prompt_graph(
     test_mask: torch.Tensor,
     num_classes: int,
     edge_scale_multiplier: float = 1.0,
-    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | P21LiteAdaptiveFilter | P21V2HeteroFilter | None = None,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | P21LiteAdaptiveFilter | P21V2HeteroFilter | P22ClassPatternEnrichmentBank | None = None,
 ) -> dict[str, Any]:
     model.eval()
     input_aligner.eval()
@@ -4727,6 +4909,33 @@ def evaluate_prompt_graph(
                 labels=labels,
                 mask=test_mask,
                 prefix="adapter_test",
+            )
+        )
+        adapter_diag.update(
+            _p22_pattern_only_metrics(
+                adapter_out=adapter_out,
+                labels=labels,
+                mask=train_mask,
+                num_classes=num_classes,
+                prefix="p22_pattern_only_train",
+            )
+        )
+        adapter_diag.update(
+            _p22_pattern_only_metrics(
+                adapter_out=adapter_out,
+                labels=labels,
+                mask=val_mask,
+                num_classes=num_classes,
+                prefix="p22_pattern_only_val",
+            )
+        )
+        adapter_diag.update(
+            _p22_pattern_only_metrics(
+                adapter_out=adapter_out,
+                labels=labels,
+                mask=test_mask,
+                num_classes=num_classes,
+                prefix="p22_pattern_only_test",
             )
         )
         for eval_mask, eval_prefix in (
@@ -5629,6 +5838,14 @@ def run_single(
     )
     lambda_p22_pattern_only = float(training_cfg.get("lambda_p22_pattern_only", 0.0))
     lambda_p22_pattern_reg = float(training_cfg.get("lambda_p22_pattern_reg", 0.0))
+    lambda_p22_basis_teacher = float(training_cfg.get("lambda_p22_basis_teacher", 0.0))
+    lambda_p22_basis_usage = float(training_cfg.get("lambda_p22_basis_usage", 0.0))
+    p22_stage1_epochs = int(training_cfg.get("p22_stage1_epochs", 0))
+    p22_stage1_pattern_only = bool(training_cfg.get("p22_stage1_pattern_only", False))
+    p22_support_source = str(training_cfg.get("p22_support_source", "episode"))
+    p22_loss_source = str(training_cfg.get("p22_loss_source", "episode"))
+    p22_basis_teacher_temperature = float(prompt_adapter_cfg.get("basis_teacher_temperature", 0.5))
+    p22_basis_teacher_scale = float(prompt_adapter_cfg.get("basis_teacher_scale", 1.0))
     lambda_prompt_router_deployment_utility = float(
         training_cfg.get("lambda_prompt_router_deployment_utility", 0.0)
     )
@@ -5874,6 +6091,19 @@ def run_single(
         prompt_adapter_class_pattern_reliability = z.new_tensor(0.0)
         p22_pattern_only = z.new_tensor(0.0)
         p22_pattern_reg = z.new_tensor(0.0)
+        p22_basis_teacher = z.new_tensor(0.0)
+        p22_basis_usage = z.new_tensor(0.0)
+        p22_basis_teacher_stats = {
+            "p22_basis_teacher_loss": 0.0,
+            "p22_basis_teacher_count": 0.0,
+            "p22_basis_teacher_entropy": 0.0,
+            "p22_basis_teacher_student_kl": 0.0,
+            "p22_basis_teacher_agreement": 0.0,
+        }
+        p22_pattern_only_stats = {
+            "p22_pattern_only_acc": 0.0,
+            "p22_pattern_only_macro_f1": 0.0,
+        }
         prompt_adapter_deployment_utility = z.new_tensor(0.0)
         prompt_adapter_expert_utility_supervision = z.new_tensor(0.0)
         prompt_adapter_pattern_supervision_stats = {
@@ -6006,6 +6236,8 @@ def run_single(
             deployment_utility_losses: list[torch.Tensor] = []
             p22_pattern_only_losses: list[torch.Tensor] = []
             p22_pattern_reg_losses: list[torch.Tensor] = []
+            p22_basis_teacher_losses: list[torch.Tensor] = []
+            p22_basis_usage_losses: list[torch.Tensor] = []
             p21_channel_expert_losses: list[torch.Tensor] = []
             p21_channel_utility_losses: list[torch.Tensor] = []
             p21_gate_utility_losses: list[torch.Tensor] = []
@@ -6022,6 +6254,8 @@ def run_single(
             message_help_stats_list: list[dict[str, Any]] = []
             utility_gate_stats_list: list[dict[str, Any]] = []
             support_query_stats_list: list[dict[str, Any]] = []
+            p22_basis_teacher_stats_list: list[dict[str, Any]] = []
+            p22_pattern_only_stats_list: list[dict[str, Any]] = []
             in_expert_warmup = epoch <= expert_warmup_epochs
             effective_lambda_p21_channel_expert = (
                 lambda_p21_channel_expert_utility
@@ -6049,7 +6283,17 @@ def run_single(
                         seed=seed,
                         epoch=epoch * 1009 + episode_idx,
                     )
+                if variant == "p22_class_pattern_enrichment_bank":
+                    if p22_support_source == "full_train":
+                        episode_support_mask = label_train_mask.bool()
+                    elif p22_support_source not in {"episode", "support"}:
+                        raise ValueError(f"Unsupported p22_support_source={p22_support_source!r}")
                 episode_loss_query_mask = episode_query_mask if support_query_enabled else label_train_mask
+                if variant == "p22_class_pattern_enrichment_bank":
+                    if p22_loss_source == "train":
+                        episode_loss_query_mask = label_train_mask.bool()
+                    elif p22_loss_source not in {"episode", "query"}:
+                        raise ValueError(f"Unsupported p22_loss_source={p22_loss_source!r}")
                 episode_update_mask = _adapter_mask(
                     prompt_adapter_update_mask_strategy,
                     train_mask=label_train_mask,
@@ -6093,9 +6337,40 @@ def run_single(
                         p22_pattern_reg_losses.append(p22_reg_value)
                     else:
                         p22_pattern_reg_losses.append(z.new_tensor(0.0))
+                    p22_usage_value = episode_adapter_out.get("basis_usage_loss")
+                    if isinstance(p22_usage_value, torch.Tensor):
+                        p22_basis_usage_losses.append(p22_usage_value)
+                    else:
+                        p22_basis_usage_losses.append(z.new_tensor(0.0))
+                    if bool(prompt_adapter_cfg.get("use_basis_teacher", True)):
+                        episode_p22_basis_teacher, episode_p22_basis_teacher_stats = _p22_basis_teacher_loss(
+                            adapter_out=episode_adapter_out,
+                            base_logits=episode_no_prompt_out["logits"],
+                            labels=graph.y,
+                            mask=episode_loss_mask,
+                            temperature=p22_basis_teacher_temperature,
+                            scale=p22_basis_teacher_scale,
+                        )
+                    else:
+                        episode_p22_basis_teacher = z.new_tensor(0.0)
+                        episode_p22_basis_teacher_stats = dict(p22_basis_teacher_stats)
+                    p22_basis_teacher_losses.append(episode_p22_basis_teacher)
+                    p22_pattern_only_stats_list.append(
+                        _p22_pattern_only_metrics(
+                            adapter_out=episode_adapter_out,
+                            labels=graph.y,
+                            mask=episode_loss_mask,
+                            num_classes=loaded.num_classes,
+                        )
+                    )
+                    p22_basis_teacher_stats_list.append(episode_p22_basis_teacher_stats)
                 else:
                     p22_pattern_only_losses.append(z.new_tensor(0.0))
                     p22_pattern_reg_losses.append(z.new_tensor(0.0))
+                    p22_basis_teacher_losses.append(z.new_tensor(0.0))
+                    p22_basis_usage_losses.append(z.new_tensor(0.0))
+                    p22_basis_teacher_stats_list.append(dict(p22_basis_teacher_stats))
+                    p22_pattern_only_stats_list.append(dict(p22_pattern_only_stats))
                 update_losses.append(prompt_adapter_update_norm_loss(episode_adapter_out, episode_update_mask))
                 budget_losses.append(
                     prompt_adapter_gate_budget_loss(
@@ -6355,6 +6630,8 @@ def run_single(
             prompt_adapter_class_pattern_reliability = torch.stack(class_pattern_reliability_losses).mean()
             p22_pattern_only = torch.stack(p22_pattern_only_losses).mean()
             p22_pattern_reg = torch.stack(p22_pattern_reg_losses).mean()
+            p22_basis_teacher = torch.stack(p22_basis_teacher_losses).mean()
+            p22_basis_usage = torch.stack(p22_basis_usage_losses).mean()
             prompt_adapter_deployment_utility = torch.stack(deployment_utility_losses).mean()
             p21_channel_expert_utility = torch.stack(p21_channel_expert_losses).mean()
             p21_channel_utility = torch.stack(p21_channel_utility_losses).mean()
@@ -6363,6 +6640,8 @@ def run_single(
             prompt_adapter_pattern_supervision_stats = _mean_float_stats(pattern_supervision_stats_list)
             prompt_adapter_pattern_utility_stats = _mean_float_stats(pattern_utility_stats_list)
             prompt_adapter_class_pattern_reliability_stats = _mean_float_stats(class_pattern_reliability_stats_list)
+            p22_basis_teacher_stats = _mean_float_stats(p22_basis_teacher_stats_list)
+            p22_pattern_only_stats = _mean_float_stats(p22_pattern_only_stats_list)
             prompt_adapter_deployment_utility_stats = _mean_float_stats(deployment_utility_stats_list)
             p21_channel_expert_stats = _mean_float_stats(p21_channel_expert_stats_list)
             p21_channel_utility_stats = _mean_float_stats(p21_channel_utility_stats_list)
@@ -6387,6 +6666,8 @@ def run_single(
             adapter_train_stats.update(prompt_adapter_pattern_supervision_stats)
             adapter_train_stats.update(prompt_adapter_pattern_utility_stats)
             adapter_train_stats.update(prompt_adapter_class_pattern_reliability_stats)
+            adapter_train_stats.update(p22_basis_teacher_stats)
+            adapter_train_stats.update(p22_pattern_only_stats)
             adapter_train_stats.update(prompt_adapter_deployment_utility_stats)
             adapter_train_stats.update(p21_channel_expert_stats)
             adapter_train_stats.update(p21_channel_utility_stats)
@@ -6895,7 +7176,13 @@ def run_single(
             if prompt_graph_module is not None
             else z.new_tensor(0.0)
         )
-        loss = (
+        p22_aux_loss = (
+            lambda_p22_pattern_only * p22_pattern_only
+            + lambda_p22_pattern_reg * p22_pattern_reg
+            + lambda_p22_basis_teacher * p22_basis_teacher
+            + lambda_p22_basis_usage * p22_basis_usage
+        )
+        full_loss = (
             cls_loss
             + lambda_edge_l1 * edge_l1
             + lambda_prompt_balance * prompt_balance
@@ -6931,19 +7218,31 @@ def run_single(
             + lambda_prompt_router_pattern_supervision * prompt_adapter_pattern_supervision
             + lambda_prompt_router_pattern_utility * prompt_adapter_pattern_utility
             + lambda_prompt_router_class_pattern_reliability * prompt_adapter_class_pattern_reliability
-            + lambda_p22_pattern_only * p22_pattern_only
-            + lambda_p22_pattern_reg * p22_pattern_reg
+            + p22_aux_loss
             + effective_lambda_deployment_utility * prompt_adapter_deployment_utility
             + effective_lambda_p21_channel_expert * p21_channel_expert_utility
             + effective_lambda_p21_channel_utility * p21_channel_utility
             + effective_lambda_p21_gate_utility * p21_gate_utility
             + lambda_prompt_router_expert_utility_supervision * prompt_adapter_expert_utility_supervision
         )
+        p22_stage1_active = (
+            variant == "p22_class_pattern_enrichment_bank"
+            and p22_stage1_pattern_only
+            and epoch <= p22_stage1_epochs
+        )
+        loss = p22_aux_loss if p22_stage1_active else full_loss
         if not torch.isfinite(loss):
             raise RuntimeError(f"Non-finite loss at epoch {epoch}: {loss.item()}")
+        p22_token_before = (
+            prompt_adapter_module.pattern_tokens.detach().clone()
+            if isinstance(prompt_adapter_module, P22ClassPatternEnrichmentBank)
+            else None
+        )
         loss.backward()
+        p22_grad_stats = _p22_grad_diagnostics(prompt_adapter_module)
         torch.nn.utils.clip_grad_norm_(trainable_params, float(training_cfg.get("grad_clip", 1.0)))
         optimizer.step()
+        p22_grad_stats.update(_p22_grad_diagnostics(prompt_adapter_module, token_before=p22_token_before))
 
         prompt_log = _prompt_graph_diagnostics(
             prompt_out,
@@ -6959,6 +7258,9 @@ def run_single(
             "test_label_cheat_count": float(cheat_test_label_count),
             "label_train_count": float(label_train_mask.sum().item()),
             "total": float(loss.detach().item()),
+            "full_loss": float(full_loss.detach().item()),
+            "p22_aux_loss": float(p22_aux_loss.detach().item()),
+            "p22_stage1_active": float(p22_stage1_active),
             "cls": float(cls_loss.detach().item()),
             "edge_l1": float(edge_l1.detach().item()),
             "prompt_balance": float(prompt_balance.detach().item()),
@@ -6998,6 +7300,8 @@ def run_single(
             ),
             "p22_pattern_only_loss": float(p22_pattern_only.detach().item()),
             "p22_pattern_reg_loss": float(p22_pattern_reg.detach().item()),
+            "p22_basis_teacher_loss": float(p22_basis_teacher.detach().item()),
+            "p22_basis_usage_loss": float(p22_basis_usage.detach().item()),
             "prompt_router_deployment_utility_loss": float(prompt_adapter_deployment_utility.detach().item()),
             "p21_channel_expert_utility_loss": float(p21_channel_expert_utility.detach().item()),
             "p21_channel_utility_loss": float(p21_channel_utility.detach().item()),
@@ -7042,6 +7346,11 @@ def run_single(
             "lambda_prompt_router_class_pattern_reliability": lambda_prompt_router_class_pattern_reliability,
             "lambda_p22_pattern_only": lambda_p22_pattern_only,
             "lambda_p22_pattern_reg": lambda_p22_pattern_reg,
+            "lambda_p22_basis_teacher": lambda_p22_basis_teacher,
+            "lambda_p22_basis_usage": lambda_p22_basis_usage,
+            "p22_stage1_epochs": float(p22_stage1_epochs),
+            "p22_support_source": p22_support_source,
+            "p22_loss_source": p22_loss_source,
             "lambda_prompt_router_deployment_utility": lambda_prompt_router_deployment_utility,
             "lambda_p21_channel_expert_utility": lambda_p21_channel_expert_utility,
             "lambda_p21_channel_expert_utility_after_warmup": lambda_p21_channel_expert_utility_after_warmup,
@@ -7175,6 +7484,7 @@ def run_single(
             **edge_utility_stats,
             **correction_alignment_stats,
             **adapter_train_stats,
+            **p22_grad_stats,
             **prompt_adapter_message_help_stats,
             **prompt_adapter_utility_gate_stats,
             **p21_channel_expert_stats,
@@ -7207,6 +7517,10 @@ def run_single(
                 "cls": float(cls_loss.detach().item()),
                 "edge_l1": float(edge_l1.detach().item()),
                 "prompt_balance": float(prompt_balance.detach().item()),
+                "p22_pattern_only_loss": float(p22_pattern_only.detach().item()),
+                "p22_basis_teacher_loss": float(p22_basis_teacher.detach().item()),
+                "p22_basis_usage_loss": float(p22_basis_usage.detach().item()),
+                "p22_aux_loss": float(p22_aux_loss.detach().item()),
             }
             monitor_value = float(monitor_lookup.get(monitor, metrics["val_acc"]))
             if _monitor_improved(monitor, monitor_value, best_val, bool(best_metrics)):
@@ -7221,6 +7535,9 @@ def run_single(
                     "label_train_count": float(label_train_mask.sum().item()),
                     **metrics,
                     "total": float(loss.detach().item()),
+                    "full_loss": float(full_loss.detach().item()),
+                    "p22_aux_loss": float(p22_aux_loss.detach().item()),
+                    "p22_stage1_active": float(p22_stage1_active),
                     "cls": float(cls_loss.detach().item()),
                     "edge_l1": float(edge_l1.detach().item()),
                     "prompt_balance": float(prompt_balance.detach().item()),
@@ -7258,6 +7575,10 @@ def run_single(
                     "prompt_router_class_pattern_reliability_loss": float(
                         prompt_adapter_class_pattern_reliability.detach().item()
                     ),
+                    "p22_pattern_only_loss": float(p22_pattern_only.detach().item()),
+                    "p22_pattern_reg_loss": float(p22_pattern_reg.detach().item()),
+                    "p22_basis_teacher_loss": float(p22_basis_teacher.detach().item()),
+                    "p22_basis_usage_loss": float(p22_basis_usage.detach().item()),
                     "prompt_router_expert_utility_supervision_loss": float(
                         prompt_adapter_expert_utility_supervision.detach().item()
                     ),
@@ -7278,6 +7599,7 @@ def run_single(
                     **edge_utility_stats,
                     **correction_alignment_stats,
                     **adapter_train_stats,
+                    **p22_grad_stats,
                     **prompt_adapter_message_help_stats,
                     **prompt_adapter_utility_gate_stats,
                     "edge_scale_multiplier": current_edge_scale_multiplier,

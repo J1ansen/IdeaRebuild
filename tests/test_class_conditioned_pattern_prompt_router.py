@@ -10,7 +10,7 @@ from models.class_conditioned_pattern_prompt_router import (
 from models.hetero_prompt_adapter import prompt_adapter_message_help_loss
 from models.p21_adaptive_filter import P21LiteAdaptiveFilter
 from models.p21_v2_hetero_filter import P21V2HeteroFilter
-from models.p22_class_pattern_enrichment import P22ClassPatternEnrichmentBank
+from models.p22_class_pattern_enrichment import P22ClassPatternEnrichmentBank, estimate_class_transition_from_support
 from models.utility_supervised_pattern_prompt_router import UtilitySupervisedPatternPromptRouter
 
 
@@ -261,6 +261,12 @@ def test_p22_pattern_enrichment_outputs_logits_without_hidden_update() -> None:
     assert torch.allclose(out["pattern_weights"].sum(dim=-1), torch.ones(5), atol=1e-5)
     assert out["prompt_update_norm"].item() == 0.0
     assert torch.allclose(out["logits"], base_logits.detach() + out["logit_bias"], atol=1e-6)
+    assert out["basis_evidence"].shape == (5, 6, 3)
+    assert out["student_basis"].shape == (5, 6)
+    assert out["pattern_basis_weight"].shape == (4, 6)
+    assert torch.allclose(out["pattern_basis_weight"].sum(dim=-1), torch.ones(4), atol=1e-5)
+    assert torch.allclose(out["student_basis"].sum(dim=-1), torch.ones(5), atol=1e-5)
+    assert out["basis_usage_loss"].item() >= 0.0
 
 
 def test_p22_detaches_base_logits_but_trains_pattern_branch() -> None:
@@ -283,6 +289,24 @@ def test_p22_detaches_base_logits_but_trains_pattern_branch() -> None:
     assert base_logits.grad is None
     grads = [p.grad for p in bank.parameters() if p.requires_grad]
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum().item() > 0 for g in grads)
+
+
+def test_p22_support_class_transition_estimate() -> None:
+    labels = torch.tensor([0, 1, 1, 2])
+    support_mask = torch.tensor([True, True, True, False])
+    edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 0, 0]], dtype=torch.long)
+    transition = estimate_class_transition_from_support(
+        labels=labels,
+        support_mask=support_mask,
+        edge_index=edge_index,
+        num_classes=3,
+        smoothing=0.5,
+    )
+
+    assert transition.shape == (3, 3)
+    assert torch.allclose(transition.sum(dim=-1), torch.ones(3), atol=1e-6)
+    # Support edge 0 -> 1 makes class 0 prefer class 1 neighbors over class 2.
+    assert transition[0, 1] > transition[0, 2]
 
 
 def test_pattern_supervision_trains_router_toward_helpful_pattern() -> None:
