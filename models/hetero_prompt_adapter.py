@@ -443,6 +443,8 @@ def prompt_adapter_message_help_loss(
     labels: torch.Tensor,
     mask: torch.Tensor,
     margin: float = 0.0,
+    anti_harm_weight: float = 0.0,
+    anti_harm_margin: float = 0.0,
     class_balanced: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     mask = mask.to(device=logits_prompt.device, dtype=torch.bool)
@@ -454,26 +456,35 @@ def prompt_adapter_message_help_loss(
             "prompt_adapter_message_help_mean_delta_ce": 0.0,
             "prompt_adapter_message_help_positive_ratio": 0.0,
             "prompt_adapter_message_help_count": 0.0,
+            "prompt_adapter_message_help_anti_harm_loss": 0.0,
         }
     y = labels.to(device=logits_prompt.device)[idx]
     ce_no = F.cross_entropy(logits_no_prompt.detach()[idx], y, reduction="none")
     ce_prompt = F.cross_entropy(logits_prompt[idx], y, reduction="none")
     delta = ce_no - ce_prompt
     losses = F.relu(float(margin) - delta)
+    anti_harm_losses = F.relu(float(anti_harm_margin) - delta).pow(2)
     if class_balanced:
         per_class = []
+        per_class_anti_harm = []
         for class_id in torch.unique(y.detach()).tolist():
             class_mask = y == int(class_id)
             if bool(class_mask.any()):
                 per_class.append(losses[class_mask].mean())
+                per_class_anti_harm.append(anti_harm_losses[class_mask].mean())
         loss = torch.stack(per_class).mean() if per_class else losses.mean()
+        anti_harm_loss = torch.stack(per_class_anti_harm).mean() if per_class_anti_harm else anti_harm_losses.mean()
     else:
         loss = losses.mean()
+        anti_harm_loss = anti_harm_losses.mean()
+    if float(anti_harm_weight) > 0.0:
+        loss = loss + float(anti_harm_weight) * anti_harm_loss
     stats = {
         "prompt_adapter_message_help_loss": float(loss.detach().item()),
         "prompt_adapter_message_help_mean_delta_ce": float(delta.detach().mean().item()),
         "prompt_adapter_message_help_positive_ratio": float((delta.detach() > 0.0).float().mean().item()),
         "prompt_adapter_message_help_count": float(idx.numel()),
+        "prompt_adapter_message_help_anti_harm_loss": float(anti_harm_loss.detach().item()),
     }
     return loss, stats
 

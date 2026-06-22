@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch_geometric.transforms as T
 from torch_geometric.data import Data
-from torch_geometric.datasets import Actor, Planetoid, WikipediaNetwork
+from torch_geometric.datasets import Actor, HeterophilousGraphDataset, Planetoid, WikipediaNetwork
 
 
 DATASET_ALIASES: dict[str, str] = {
@@ -27,6 +27,8 @@ DATASET_ALIASES: dict[str, str] = {
     "CiteSeer": "CiteSeer",
     "pubmed": "PubMed",
     "PubMed": "PubMed",
+    "minesweeper": "minesweeper",
+    "Minesweeper": "minesweeper",
 }
 
 
@@ -44,7 +46,7 @@ def resolve_dataset_name(name: str) -> str:
         return DATASET_ALIASES[key]
     raise ValueError(
         f"Unsupported dataset {name!r}. Supported names: "
-        "Actor, chameleon, squirrel, Cora, CiteSeer, PubMed."
+        "Actor, chameleon, squirrel, minesweeper, Cora, CiteSeer, PubMed."
     )
 
 
@@ -82,6 +84,14 @@ def load_node_dataset(
         _require_processed(processed, download_if_missing=download_if_missing)
         dataset = WikipediaNetwork(
             root=str(root_path / "WikipediaNetwork"),
+            name=canonical,
+            transform=transform,
+        )
+    elif canonical == "minesweeper":
+        processed = root_path / "HeterophilousGraphDataset" / canonical / "processed"
+        _require_processed(processed, download_if_missing=download_if_missing)
+        dataset = HeterophilousGraphDataset(
+            root=str(root_path / "HeterophilousGraphDataset"),
             name=canonical,
             transform=transform,
         )
