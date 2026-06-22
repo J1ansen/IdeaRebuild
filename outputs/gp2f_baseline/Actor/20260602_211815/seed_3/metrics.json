@@ -1,0 +1,86 @@
+{
+  "adapter_style": "stable_zero_init",
+  "aligner_style": "identity_if_same_dim",
+  "best": {
+    "adapter_beta_mean": 0.015484269708395004,
+    "adapter_beta_std": 0.00011058806213652208,
+    "alpha": 0.49866166710853577,
+    "best_epoch": 9.0,
+    "branch_cosine": 1.0,
+    "cls": 1.5262771844863892,
+    "contrastive": 0.0,
+    "monitor_value": 0.2199999988079071,
+    "test_acc": 0.21265992522239685,
+    "test_macro_f1": 0.10507113449275493,
+    "topology_fusion": 0.0,
+    "total": 1.5262771844863892,
+    "train_acc": 0.7599999904632568,
+    "train_macro_f1": 0.775,
+    "val_acc": 0.2199999988079071,
+    "val_macro_f1": 0.10444139391183853
+  },
+  "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Actor/20260602_211815/seed_3/best_model.pt",
+  "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+  "dataset": "Actor",
+  "early_stop_metric": "val_acc",
+  "early_stopped": true,
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final": {
+    "alpha": 0.48640066385269165,
+    "branch_cosine": 0.9987272620201111,
+    "test_acc": 0.192592591047287,
+    "test_macro_f1": 0.18493458926677703,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "val_acc": 0.13333334028720856,
+    "val_macro_f1": 0.12607318460941314
+  },
+  "fusion_alpha_style": "sigmoid",
+  "hidden_dim": 128,
+  "num_classes": 5,
+  "num_features": 932,
+  "num_nodes": 7600,
+  "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Actor/20260602_211815/seed_3",
+  "seed": 3,
+  "source_dim": 1433,
+  "split_counts": {
+    "test": {
+      "per_class": [
+        818,
+        1302,
+        1595,
+        1780,
+        1930
+      ],
+      "total": 7425
+    },
+    "train": {
+      "per_class": [
+        5,
+        5,
+        5,
+        5,
+        5
+      ],
+      "total": 25
+    },
+    "val": {
+      "per_class": [
+        30,
+        30,
+        30,
+        30,
+        30
+      ],
+      "total": 150
+    }
+  },
+  "split_seed": 3,
+  "stopped_epoch": 49
+}

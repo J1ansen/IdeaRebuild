@@ -1,0 +1,454 @@
+{
+  "best_test_acc_mean_std": "28.17+-3.23",
+  "best_test_macro_f1_mean_std": "25.12+-6.77",
+  "dataset": "chameleon",
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final_test_acc_mean_std": "27.98+-3.70",
+  "final_test_macro_f1_mean_std": "26.43+-3.76",
+  "num_runs": 5,
+  "runs": [
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "best": {
+        "adapter_beta_mean": 0.09635033458471298,
+        "adapter_beta_std": 0.0005559063951465646,
+        "alpha": 0.47819262742996216,
+        "best_epoch": 67.0,
+        "branch_cosine": 0.9898449778556824,
+        "cls": 0.21604639291763306,
+        "contrastive": 0.0,
+        "monitor_value": 0.3400000035762787,
+        "test_acc": 0.31303519010543823,
+        "test_macro_f1": 0.29901023805141447,
+        "topology_fusion": 0.0,
+        "total": 0.21604639291763306,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.3400000035762787,
+        "val_macro_f1": 0.3283532321453094
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_0/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "chameleon",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.4617495536804199,
+        "branch_cosine": 0.9097895622253418,
+        "test_acc": 0.3111322522163391,
+        "test_macro_f1": 0.2989304780960083,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.3199999928474426,
+        "val_macro_f1": 0.31502349078655245
+      },
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "num_classes": 5,
+      "num_features": 2325,
+      "num_nodes": 2277,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_0",
+      "seed": 0,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            421,
+            425,
+            418,
+            486,
+            352
+          ],
+          "total": 2102
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 25
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 150
+        }
+      },
+      "split_seed": 0,
+      "stopped_epoch": 107
+    },
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "best": {
+        "adapter_beta_mean": 0.06873833015561104,
+        "adapter_beta_std": 0.00013414815045411185,
+        "alpha": 0.4853361248970032,
+        "best_epoch": 50.0,
+        "branch_cosine": 0.9990255832672119,
+        "cls": 0.36063724756240845,
+        "contrastive": 0.0,
+        "monitor_value": 0.31333333253860474,
+        "test_acc": 0.3049476742744446,
+        "test_macro_f1": 0.2952312111854553,
+        "topology_fusion": 0.0,
+        "total": 0.36063724756240845,
+        "train_acc": 0.9599999785423279,
+        "train_macro_f1": 0.9595959782600403,
+        "val_acc": 0.31333333253860474,
+        "val_macro_f1": 0.31589707136154177
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_1/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "chameleon",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.4681054949760437,
+        "branch_cosine": 0.9485356211662292,
+        "test_acc": 0.31208372116088867,
+        "test_macro_f1": 0.29806326031684877,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.2866666615009308,
+        "val_macro_f1": 0.2781643897294998
+      },
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "num_classes": 5,
+      "num_features": 2325,
+      "num_nodes": 2277,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_1",
+      "seed": 1,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            421,
+            425,
+            418,
+            486,
+            352
+          ],
+          "total": 2102
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 25
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 150
+        }
+      },
+      "split_seed": 1,
+      "stopped_epoch": 90
+    },
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "best": {
+        "adapter_beta_mean": 0.00900199543684721,
+        "adapter_beta_std": 0.0,
+        "alpha": 0.5,
+        "best_epoch": 1.0,
+        "branch_cosine": 1.0,
+        "cls": 1.6186245679855347,
+        "contrastive": 0.0,
+        "monitor_value": 0.2133333384990692,
+        "test_acc": 0.24167460203170776,
+        "test_macro_f1": 0.13493834733963012,
+        "topology_fusion": 0.0,
+        "total": 1.6186245679855347,
+        "train_acc": 0.4000000059604645,
+        "train_macro_f1": 0.22875816822052003,
+        "val_acc": 0.2133333384990692,
+        "val_macro_f1": 0.12190476655960084
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_2/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "chameleon",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.48872849345207214,
+        "branch_cosine": 0.9996758699417114,
+        "test_acc": 0.222645103931427,
+        "test_macro_f1": 0.20907174050807953,
+        "train_acc": 0.9599999785423279,
+        "train_macro_f1": 0.9595959782600403,
+        "val_acc": 0.18666666746139526,
+        "val_macro_f1": 0.14305682703852654
+      },
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "num_classes": 5,
+      "num_features": 2325,
+      "num_nodes": 2277,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_2",
+      "seed": 2,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            421,
+            425,
+            418,
+            486,
+            352
+          ],
+          "total": 2102
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 25
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 150
+        }
+      },
+      "split_seed": 2,
+      "stopped_epoch": 41
+    },
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "best": {
+        "adapter_beta_mean": 0.0749955028295517,
+        "adapter_beta_std": 0.00017559430760851226,
+        "alpha": 0.48369866609573364,
+        "best_epoch": 54.0,
+        "branch_cosine": 0.9985035061836243,
+        "cls": 0.24575871229171753,
+        "contrastive": 0.0,
+        "monitor_value": 0.41333332657814026,
+        "test_acc": 0.29638439416885376,
+        "test_macro_f1": 0.27573026418685914,
+        "topology_fusion": 0.0,
+        "total": 0.24575871229171753,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.41333332657814026,
+        "val_macro_f1": 0.39734080731868743
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_3/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "chameleon",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.46647220849990845,
+        "branch_cosine": 0.9536874890327454,
+        "test_acc": 0.26736441254615784,
+        "test_macro_f1": 0.24853007197380067,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.3466666638851166,
+        "val_macro_f1": 0.33103529214859007
+      },
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "num_classes": 5,
+      "num_features": 2325,
+      "num_nodes": 2277,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_3",
+      "seed": 3,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            421,
+            425,
+            418,
+            486,
+            352
+          ],
+          "total": 2102
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 25
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 150
+        }
+      },
+      "split_seed": 3,
+      "stopped_epoch": 94
+    },
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "best": {
+        "adapter_beta_mean": 0.031019014306366444,
+        "adapter_beta_std": 0.00019067365975230057,
+        "alpha": 0.4947778284549713,
+        "best_epoch": 24.0,
+        "branch_cosine": 0.9999986886978149,
+        "cls": 1.0823932886123657,
+        "contrastive": 0.0,
+        "monitor_value": 0.273333340883255,
+        "test_acc": 0.2526165544986725,
+        "test_macro_f1": 0.25091383159160613,
+        "topology_fusion": 0.0,
+        "total": 1.0823932886123657,
+        "train_acc": 0.9200000166893005,
+        "train_macro_f1": 0.9222222566604614,
+        "val_acc": 0.273333340883255,
+        "val_macro_f1": 0.26422448456287384
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_4/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "chameleon",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.47987234592437744,
+        "branch_cosine": 0.9942092299461365,
+        "test_acc": 0.2859181761741638,
+        "test_macro_f1": 0.26680939495563505,
+        "train_acc": 0.9200000166893005,
+        "train_macro_f1": 0.9222222566604614,
+        "val_acc": 0.273333340883255,
+        "val_macro_f1": 0.25365320295095445
+      },
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "num_classes": 5,
+      "num_features": 2325,
+      "num_nodes": 2277,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/chameleon/20260602_212009/seed_4",
+      "seed": 4,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            421,
+            425,
+            418,
+            486,
+            352
+          ],
+          "total": 2102
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 25
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 150
+        }
+      },
+      "split_seed": 4,
+      "stopped_epoch": 64
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+}

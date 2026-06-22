@@ -1,0 +1,84 @@
+{
+  "best": {
+    "adapter_beta_mean": 0.23214907199144363,
+    "adapter_beta_std": 0.008182905468799226,
+    "alpha": 0.44340917468070984,
+    "best_epoch": 154.0,
+    "branch_cosine": 0.7210032343864441,
+    "test_acc": 0.5984571576118469,
+    "test_macro_f1": 0.6113572674138206,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "val_acc": 0.6619047522544861,
+    "val_macro_f1": 0.6529745800154549
+  },
+  "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_145244/seed_0/best_model.pt",
+  "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+  "dataset": "Cora",
+  "early_stop_metric": "val_acc",
+  "early_stopped": true,
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final": {
+    "alpha": 0.4341462254524231,
+    "branch_cosine": 0.7249699831008911,
+    "test_acc": 0.5968331098556519,
+    "test_macro_f1": 0.6052000394889286,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "val_acc": 0.6428571343421936,
+    "val_macro_f1": 0.6323422789573669
+  },
+  "hidden_dim": 128,
+  "num_classes": 7,
+  "num_features": 1433,
+  "num_nodes": 2708,
+  "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_145244/seed_0",
+  "seed": 0,
+  "source_dim": 1433,
+  "split_counts": {
+    "test": {
+      "per_class": [
+        316,
+        182,
+        383,
+        783,
+        391,
+        263,
+        145
+      ],
+      "total": 2463
+    },
+    "train": {
+      "per_class": [
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5
+      ],
+      "total": 35
+    },
+    "val": {
+      "per_class": [
+        30,
+        30,
+        30,
+        30,
+        30,
+        30,
+        30
+      ],
+      "total": 210
+    }
+  },
+  "split_seed": 0,
+  "stopped_epoch": 194
+}

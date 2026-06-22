@@ -7,7 +7,13 @@ __pycache__/
 venv/
 logs/
 checkpoints/
-outputs/
+outputs/*
+outputs/**/*
+!outputs/**/
+!outputs/**/*.json
+!outputs/**/*.csv
+!outputs/**/*.yaml
+!outputs/**/*.yml
 wandb/
 *.pt
 *.pth

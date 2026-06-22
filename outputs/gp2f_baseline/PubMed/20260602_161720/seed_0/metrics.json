@@ -1,0 +1,80 @@
+{
+  "adapter_style": "official_gp2f",
+  "aligner_style": "official_projector",
+  "best": {
+    "adapter_beta_mean": 0.24109262973070145,
+    "adapter_beta_std": 0.008292360834382017,
+    "alpha": 0.2782561480998993,
+    "best_epoch": 245.0,
+    "branch_cosine": 0.8058082461357117,
+    "cls": 0.005937079433351755,
+    "contrastive": 6.6966776847839355,
+    "monitor_value": 0.6525321006774902,
+    "test_acc": 0.39389148354530334,
+    "test_macro_f1": 0.38880335291226703,
+    "topology_fusion": 3.1176114082336426,
+    "total": 0.6525321006774902,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "val_acc": 0.4444444477558136,
+    "val_macro_f1": 0.4475308855374654
+  },
+  "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_161720/seed_0/best_model.pt",
+  "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+  "dataset": "PubMed",
+  "early_stop_metric": "train_loss",
+  "early_stopped": true,
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final": {
+    "alpha": 0.25378987193107605,
+    "branch_cosine": 0.8021435141563416,
+    "test_acc": 0.3795125484466553,
+    "test_macro_f1": 0.367071012655894,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "val_acc": 0.3888888955116272,
+    "val_macro_f1": 0.3906368712584178
+  },
+  "fusion_alpha_style": "raw",
+  "hidden_dim": 128,
+  "num_classes": 3,
+  "num_features": 500,
+  "num_nodes": 19717,
+  "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_161720/seed_0",
+  "seed": 0,
+  "source_dim": 1433,
+  "split_counts": {
+    "test": {
+      "per_class": [
+        4068,
+        7704,
+        7840
+      ],
+      "total": 19612
+    },
+    "train": {
+      "per_class": [
+        5,
+        5,
+        5
+      ],
+      "total": 15
+    },
+    "val": {
+      "per_class": [
+        30,
+        30,
+        30
+      ],
+      "total": 90
+    }
+  },
+  "split_seed": 0,
+  "stopped_epoch": 285
+}

@@ -1,0 +1,384 @@
+{
+  "best_test_acc_mean_std": "59.69+-7.72",
+  "best_test_macro_f1_mean_std": "57.91+-8.32",
+  "dataset": "PubMed",
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final_test_acc_mean_std": "58.97+-6.33",
+  "final_test_macro_f1_mean_std": "58.85+-5.96",
+  "num_runs": 5,
+  "runs": [
+    {
+      "best": {
+        "adapter_beta_mean": 0.01125378767028451,
+        "adapter_beta_std": 0.0009797304939605591,
+        "alpha": 0.4998714029788971,
+        "best_epoch": 5.0,
+        "branch_cosine": 1.0,
+        "test_acc": 0.49954110383987427,
+        "test_macro_f1": 0.49852866927782696,
+        "train_acc": 0.9333333373069763,
+        "train_macro_f1": 0.9326599637667338,
+        "val_acc": 0.5888888835906982,
+        "val_macro_f1": 0.5689376393953959
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_0/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "PubMed",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.4887145757675171,
+        "branch_cosine": 0.9996641874313354,
+        "test_acc": 0.5575668215751648,
+        "test_macro_f1": 0.560406506061554,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5333333611488342,
+        "val_macro_f1": 0.5377878546714783
+      },
+      "hidden_dim": 128,
+      "num_classes": 3,
+      "num_features": 500,
+      "num_nodes": 19717,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_0",
+      "seed": 0,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            4068,
+            7704,
+            7840
+          ],
+          "total": 19612
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5
+          ],
+          "total": 15
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30
+          ],
+          "total": 90
+        }
+      },
+      "split_seed": 0,
+      "stopped_epoch": 45
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.07640480250120163,
+        "adapter_beta_std": 0.0021816683928936632,
+        "alpha": 0.4837104380130768,
+        "best_epoch": 56.0,
+        "branch_cosine": 0.9949116706848145,
+        "test_acc": 0.5924434065818787,
+        "test_macro_f1": 0.5579419533411661,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6666666865348816,
+        "val_macro_f1": 0.6136305034160614
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_1/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "PubMed",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.46631085872650146,
+        "branch_cosine": 0.8728390336036682,
+        "test_acc": 0.5908117294311523,
+        "test_macro_f1": 0.567985604206721,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6555555462837219,
+        "val_macro_f1": 0.6091455022493998
+      },
+      "hidden_dim": 128,
+      "num_classes": 3,
+      "num_features": 500,
+      "num_nodes": 19717,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_1",
+      "seed": 1,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            4068,
+            7704,
+            7840
+          ],
+          "total": 19612
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5
+          ],
+          "total": 15
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30
+          ],
+          "total": 90
+        }
+      },
+      "split_seed": 1,
+      "stopped_epoch": 96
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.01602476555854082,
+        "adapter_beta_std": 0.0017363671820408283,
+        "alpha": 0.4985976219177246,
+        "best_epoch": 12.0,
+        "branch_cosine": 1.0,
+        "test_acc": 0.5535896420478821,
+        "test_macro_f1": 0.5095676978429159,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5888888835906982,
+        "val_macro_f1": 0.5359606047471365
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_2/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "PubMed",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.4861218333244324,
+        "branch_cosine": 0.9988737106323242,
+        "test_acc": 0.531970202922821,
+        "test_macro_f1": 0.5423991481463114,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5777778029441833,
+        "val_macro_f1": 0.5674399733543396
+      },
+      "hidden_dim": 128,
+      "num_classes": 3,
+      "num_features": 500,
+      "num_nodes": 19717,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_2",
+      "seed": 2,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            4068,
+            7704,
+            7840
+          ],
+          "total": 19612
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5
+          ],
+          "total": 15
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30
+          ],
+          "total": 90
+        }
+      },
+      "split_seed": 2,
+      "stopped_epoch": 52
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.03598378971219063,
+        "adapter_beta_std": 0.0006809824364587064,
+        "alpha": 0.49402815103530884,
+        "best_epoch": 31.0,
+        "branch_cosine": 0.9999966025352478,
+        "test_acc": 0.6387925744056702,
+        "test_macro_f1": 0.6393427650133768,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.7222222089767456,
+        "val_macro_f1": 0.7213318347930908
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_3/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "PubMed",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.47815510630607605,
+        "branch_cosine": 0.9768547415733337,
+        "test_acc": 0.5719967484474182,
+        "test_macro_f1": 0.5794287721316019,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6666666865348816,
+        "val_macro_f1": 0.6627155145009359
+      },
+      "hidden_dim": 128,
+      "num_classes": 3,
+      "num_features": 500,
+      "num_nodes": 19717,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_3",
+      "seed": 3,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            4068,
+            7704,
+            7840
+          ],
+          "total": 19612
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5
+          ],
+          "total": 15
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30
+          ],
+          "total": 90
+        }
+      },
+      "split_seed": 3,
+      "stopped_epoch": 71
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.028668854385614395,
+        "adapter_beta_std": 0.0017310632645735355,
+        "alpha": 0.4957095980644226,
+        "best_epoch": 23.0,
+        "branch_cosine": 0.9999992251396179,
+        "test_acc": 0.7002855539321899,
+        "test_macro_f1": 0.6900141835212708,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.7111111283302307,
+        "val_macro_f1": 0.695479691028595
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_4/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "PubMed",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.48106226325035095,
+        "branch_cosine": 0.9921810626983643,
+        "test_acc": 0.6962063908576965,
+        "test_macro_f1": 0.6924629211425781,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6666666865348816,
+        "val_macro_f1": 0.6597230235735575
+      },
+      "hidden_dim": 128,
+      "num_classes": 3,
+      "num_features": 500,
+      "num_nodes": 19717,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_143907/seed_4",
+      "seed": 4,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            4068,
+            7704,
+            7840
+          ],
+          "total": 19612
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5
+          ],
+          "total": 15
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30
+          ],
+          "total": 90
+        }
+      },
+      "split_seed": 4,
+      "stopped_epoch": 63
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+}

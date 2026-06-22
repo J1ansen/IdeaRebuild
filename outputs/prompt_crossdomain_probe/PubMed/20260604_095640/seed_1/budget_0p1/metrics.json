@@ -1,0 +1,178 @@
+{
+  "adapter_style": "stable_zero_init",
+  "aligner_style": "identity_if_same_dim",
+  "base_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/prompt_crossdomain_noprompt/PubMed/20260604_095409/seed_1/budget_0/best_model.pt",
+  "best": {
+    "adapter_beta_mean": 0.08325021713972092,
+    "adapter_beta_std": 0.0021811520939994046,
+    "alpha": 0.48198235034942627,
+    "best_epoch": 1.0,
+    "branch_cosine": 0.9909312725067139,
+    "budget": 0.20075969398021698,
+    "cls": 0.26312142610549927,
+    "connected_edge_count": 0.0,
+    "control_parameter_count": 828790,
+    "gamma": 0.010027032345533371,
+    "init_adapted_x_delta": 0.0,
+    "init_logit_delta": 0.0,
+    "lambda_budget_effective": 0.01,
+    "lambda_message_norm_effective": 0.05,
+    "message_norm": 0.0,
+    "monitor_value": 0.6666666865348816,
+    "non_null_ratio": 0.5394909977912903,
+    "prompt_message_norm": 0.0014133828226476908,
+    "prompt_parameter_count": 0,
+    "route_budget": 0.1,
+    "route_null": 0.46050897240638733,
+    "route_semantic": 0.27012813091278076,
+    "route_structural": 0.2693628966808319,
+    "semantic_allowed_ratio": 1.0,
+    "semantic_margin_mean": 0.0,
+    "test_acc": 0.5939220786094666,
+    "test_macro_f1": 0.5614055196444193,
+    "total": 0.265129029750824,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "u_prompt_norm": 0.14109589159488678,
+    "u_sem_norm": 0.27046042680740356,
+    "u_struct_norm": 0.25293469429016113,
+    "val_acc": 0.6666666865348816,
+    "val_macro_f1": 0.6136305034160614
+  },
+  "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/prompt_crossdomain_probe/PubMed/20260604_095640/seed_1/budget_0p1/best_model.pt",
+  "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+  "dataset": "PubMed",
+  "early_stop_metric": "val_acc",
+  "early_stopped": true,
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final": {
+    "alpha": 0.48198235034942627,
+    "branch_cosine": 0.9908884763717651,
+    "connected_edge_count": 0.0,
+    "control_parameter_count": 828790,
+    "gamma": 0.011118806898593903,
+    "init_adapted_x_delta": 0.0,
+    "init_logit_delta": 0.0,
+    "non_null_ratio": 0.11253846436738968,
+    "prompt_message_norm": 0.0002517546236049384,
+    "prompt_parameter_count": 0,
+    "route_null": 0.8874614834785461,
+    "route_semantic": 0.057596027851104736,
+    "route_structural": 0.05494243651628494,
+    "semantic_allowed_ratio": 1.0,
+    "semantic_margin_mean": 0.0,
+    "test_acc": 0.5938711166381836,
+    "test_macro_f1": 0.5613612532615662,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "u_prompt_norm": 0.02264142967760563,
+    "u_sem_norm": 0.19709433615207672,
+    "u_struct_norm": 0.1938510686159134,
+    "val_acc": 0.6666666865348816,
+    "val_macro_f1": 0.6136305034160614
+  },
+  "freeze_base_model": true,
+  "fusion_alpha_style": "sigmoid",
+  "hidden_dim": 128,
+  "model_variant": "StableDualBranch",
+  "num_classes": 3,
+  "num_features": 500,
+  "num_nodes": 19717,
+  "optimizer": {
+    "base_lr": 0.0,
+    "base_weight_decay": 0.0,
+    "prompt_lr": 0.003,
+    "prompt_weight_decay": 0.0005
+  },
+  "prompt_variant": "param_control",
+  "regularization_schedule": {
+    "budget_warmup_delay_epochs": 0,
+    "budget_warmup_epochs": 50,
+    "lambda_budget": 0.5,
+    "lambda_message_norm": 1.0,
+    "message_norm_target": 0.05,
+    "message_norm_warmup_delay_epochs": 0,
+    "message_norm_warmup_epochs": 20
+  },
+  "route_budget": 0.1,
+  "run_dir": "/Users/jackson/IdeaRebuild/outputs/prompt_crossdomain_probe/PubMed/20260604_095640/seed_1/budget_0p1",
+  "seed": 1,
+  "selected_route_budget": 0.1,
+  "selection_metric": "val_acc",
+  "source_dim": 1433,
+  "split_counts": {
+    "test": {
+      "per_class": [
+        4068,
+        7704,
+        7840
+      ],
+      "total": 19612
+    },
+    "train": {
+      "per_class": [
+        5,
+        5,
+        5
+      ],
+      "total": 15
+    },
+    "val": {
+      "per_class": [
+        30,
+        30,
+        30
+      ],
+      "total": 90
+    }
+  },
+  "split_seed": 1,
+  "stopped_epoch": 40,
+  "train_prompt_module": true,
+  "trainable_parameters": {
+    "actual_trainable_parameter_count": 828790,
+    "input_aligner_trainable_parameter_count": 0,
+    "model_trainable_parameter_count": 0,
+    "prompt_module_trainable_parameter_count": 828790,
+    "trainable_parameter_groups": {
+      "input_aligner": [],
+      "model": [],
+      "prompt_module": [
+        "prompt_module.gamma_logit",
+        "prompt_module.control_sem.0.weight",
+        "prompt_module.control_sem.0.bias",
+        "prompt_module.control_sem.3.weight",
+        "prompt_module.control_sem.3.bias",
+        "prompt_module.control_struct.0.weight",
+        "prompt_module.control_struct.0.bias",
+        "prompt_module.control_struct.3.weight",
+        "prompt_module.control_struct.3.bias",
+        "prompt_module.gate.0.weight",
+        "prompt_module.gate.0.bias",
+        "prompt_module.gate.3.weight",
+        "prompt_module.gate.3.bias"
+      ]
+    },
+    "trainable_parameter_names": [
+      "prompt_module.gamma_logit",
+      "prompt_module.control_sem.0.weight",
+      "prompt_module.control_sem.0.bias",
+      "prompt_module.control_sem.3.weight",
+      "prompt_module.control_sem.3.bias",
+      "prompt_module.control_struct.0.weight",
+      "prompt_module.control_struct.0.bias",
+      "prompt_module.control_struct.3.weight",
+      "prompt_module.control_struct.3.bias",
+      "prompt_module.gate.0.weight",
+      "prompt_module.gate.0.bias",
+      "prompt_module.gate.3.weight",
+      "prompt_module.gate.3.bias"
+    ]
+  }
+}

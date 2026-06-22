@@ -1,0 +1,1112 @@
+{
+  "best_test_acc_mean_std": "68.40+-1.83",
+  "best_test_macro_f1_mean_std": "65.96+-2.12",
+  "dataset": "Cora",
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final_test_acc_mean_std": "69.22+-2.35",
+  "final_test_macro_f1_mean_std": "66.63+-2.39",
+  "num_runs": 3,
+  "prompt_variant": "p1_graph",
+  "runs": [
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "base_checkpoint_path": "",
+      "best": {
+        "adapted_node_count": 2716,
+        "adapter_beta_mean": 0.032105188351124525,
+        "adapter_beta_std": 0.04715874692846757,
+        "alpha": 0.5075704455375671,
+        "best_epoch": 80.0,
+        "branch_cosine": 0.9999902844429016,
+        "cls": 1.9094253778457642,
+        "connected_edge_count": 2300,
+        "edge_l1": 0.00622761994600296,
+        "edge_scale": 0.012488692067563534,
+        "init_logit_delta": 0.00011050701141357422,
+        "init_original_x_delta": 0.0,
+        "mean_prompt_edge_weight": 0.006244346033781767,
+        "monitor_value": 0.6857143044471741,
+        "pool_label_distribution": [
+          0.11652173846960068,
+          0.07652173936367035,
+          0.16347825527191162,
+          0.321739137172699,
+          0.1599999964237213,
+          0.12521739304065704,
+          0.03652174025774002
+        ],
+        "pool_ratio": 0.2123338282108307,
+        "prompt_balance": 0.5,
+        "prompt_edge_count": 2300,
+        "prompt_mediated_same_label_reachability": 0.19088016967126192,
+        "prompt_node_count": 8,
+        "prompt_usage_by_true_class": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.4999966323375702,
+            0.5000033378601074,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.4999968707561493,
+            0.5000030994415283,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.499996542930603,
+            0.500003457069397,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.4999975264072418,
+            0.5000025033950806,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.4999965727329254,
+            0.500003457069397,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.4999966025352478,
+            0.5000033974647522,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.4999971389770508,
+            0.5000028610229492,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "prompt_usage_distribution": [
+          0.0,
+          0.0,
+          0.0,
+          0.49999919533729553,
+          0.5000007748603821,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "prompt_usage_entropy": 0.3333333432674408,
+        "test_acc": 0.684531033039093,
+        "test_macro_f1": 0.6590865424701146,
+        "total": 1.9099315404891968,
+        "train_acc": 0.800000011920929,
+        "train_macro_f1": 0.8074648039681571,
+        "train_pool_ratio": 0.012924667447805405,
+        "val_acc": 0.6857143044471741,
+        "val_macro_f1": 0.6833957859448024
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/prompt_graph_eval/Cora/20260605_222351/seed_0/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "val_acc",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "adapted_node_count": 2716,
+        "alpha": 0.5075992941856384,
+        "branch_cosine": 0.999967634677887,
+        "connected_edge_count": 2300,
+        "edge_scale": 0.013170115649700165,
+        "init_logit_delta": 0.00011050701141357422,
+        "init_original_x_delta": 0.0,
+        "mean_prompt_edge_weight": 0.00658505829051137,
+        "pool_label_distribution": [
+          0.11652173846960068,
+          0.07652173936367035,
+          0.16347825527191162,
+          0.321739137172699,
+          0.1599999964237213,
+          0.12521739304065704,
+          0.03652174025774002
+        ],
+        "pool_ratio": 0.2123338282108307,
+        "prompt_edge_count": 2300,
+        "prompt_mediated_same_label_reachability": 0.19088016967126192,
+        "prompt_node_count": 8,
+        "prompt_usage_by_true_class": [
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5000004768371582,
+            0.0,
+            0.0,
+            0.4999995529651642
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5000006556510925,
+            0.0,
+            0.0,
+            0.49999934434890747
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5000002980232239,
+            0.0,
+            0.0,
+            0.49999967217445374
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5000001788139343,
+            0.0,
+            0.0,
+            0.4999998211860657
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5000003576278687,
+            0.0,
+            0.0,
+            0.49999967217445374
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5000004172325134,
+            0.0,
+            0.0,
+            0.4999995827674866
+          ],
+          [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.5000008940696716,
+            0.0,
+            0.0,
+            0.49999913573265076
+          ]
+        ],
+        "prompt_usage_distribution": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.5000000596046448,
+          0.0,
+          0.0,
+          0.4999999403953552
+        ],
+        "prompt_usage_entropy": 0.3333333432674408,
+        "test_acc": 0.7092975974082947,
+        "test_macro_f1": 0.6790892354079655,
+        "train_acc": 0.7714285850524902,
+        "train_macro_f1": 0.7689755048070636,
+        "train_pool_ratio": 0.012924667447805405,
+        "val_acc": 0.6857143044471741,
+        "val_macro_f1": 0.68497462783541
+      },
+      "freeze_base_model": false,
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "model_variant": "StableDualBranch",
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "optimizer": {
+        "base_lr": 0.001,
+        "base_weight_decay": 0.0005,
+        "prompt_lr": 0.003,
+        "prompt_weight_decay": 0.0005
+      },
+      "prompt_graph_parameter_count": 946249,
+      "prompt_variant": "p1_graph",
+      "regularization": {
+        "lambda_edge_l1": 0.001,
+        "lambda_prompt_balance": 0.001
+      },
+      "rho": 0.2,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/prompt_graph_eval/Cora/20260605_222351/seed_0",
+      "seed": 0,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 0,
+      "stopped_epoch": 100,
+      "topk_prompt_per_node": 2,
+      "train_prompt_graph_module": true,
+      "trainable_parameters": {
+        "actual_trainable_parameter_count": 955347,
+        "input_aligner_trainable_parameter_count": 0,
+        "model_trainable_parameter_count": 9098,
+        "prompt_graph_module_trainable_parameter_count": 946249,
+        "trainable_parameter_groups": {
+          "input_aligner": [],
+          "model": [
+            "model.alpha_logit",
+            "model.adapters.0.beta",
+            "model.adapters.0.down.weight",
+            "model.adapters.0.up.weight",
+            "model.adapters.1.beta",
+            "model.adapters.1.down.weight",
+            "model.adapters.1.up.weight",
+            "model.classifier.weight",
+            "model.classifier.bias"
+          ],
+          "prompt_graph_module": [
+            "prompt_graph_module.prompt_node_x",
+            "prompt_graph_module.prompt_keys",
+            "prompt_graph_module.edge_scale_logit",
+            "prompt_graph_module.query_mlp.0.weight",
+            "prompt_graph_module.query_mlp.0.bias",
+            "prompt_graph_module.query_mlp.3.weight",
+            "prompt_graph_module.query_mlp.3.bias"
+          ]
+        },
+        "trainable_parameter_names": [
+          "model.alpha_logit",
+          "model.adapters.0.beta",
+          "model.adapters.0.down.weight",
+          "model.adapters.0.up.weight",
+          "model.adapters.1.beta",
+          "model.adapters.1.down.weight",
+          "model.adapters.1.up.weight",
+          "model.classifier.weight",
+          "model.classifier.bias",
+          "prompt_graph_module.prompt_node_x",
+          "prompt_graph_module.prompt_keys",
+          "prompt_graph_module.edge_scale_logit",
+          "prompt_graph_module.query_mlp.0.weight",
+          "prompt_graph_module.query_mlp.0.bias",
+          "prompt_graph_module.query_mlp.3.weight",
+          "prompt_graph_module.query_mlp.3.bias"
+        ]
+      }
+    },
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "base_checkpoint_path": "",
+      "best": {
+        "adapted_node_count": 2716,
+        "adapter_beta_mean": 0.06553695177353802,
+        "adapter_beta_std": 0.0927818534950347,
+        "alpha": 0.49803104996681213,
+        "best_epoch": 100.0,
+        "branch_cosine": 0.9999215602874756,
+        "cls": 1.886161208152771,
+        "connected_edge_count": 2300,
+        "edge_l1": 0.0065678698010742664,
+        "edge_scale": 0.013170293532311916,
+        "init_logit_delta": 0.00010263826698064804,
+        "init_original_x_delta": 0.0,
+        "mean_prompt_edge_weight": 0.0065851472318172455,
+        "monitor_value": 0.7476190328598022,
+        "pool_label_distribution": [
+          0.11652173846960068,
+          0.07652173936367035,
+          0.16521738469600677,
+          0.321739137172699,
+          0.15826086699962616,
+          0.12521739304065704,
+          0.03652174025774002
+        ],
+        "pool_ratio": 0.2123338282108307,
+        "prompt_balance": 0.5,
+        "prompt_edge_count": 2300,
+        "prompt_mediated_same_label_reachability": 0.19089834873504014,
+        "prompt_node_count": 8,
+        "prompt_usage_by_true_class": [
+          [
+            0.0,
+            0.0,
+            0.4999197721481323,
+            0.5000802278518677,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.49991971254348755,
+            0.5000802874565125,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999198019504547,
+            0.5000801682472229,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.499918669462204,
+            0.5000813007354736,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999198019504547,
+            0.5000801682472229,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999197721481323,
+            0.5000802278518677,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999195337295532,
+            0.500080406665802,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "prompt_usage_distribution": [
+          0.0,
+          0.0,
+          0.49991947412490845,
+          0.5000805258750916,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "prompt_usage_entropy": 0.3333333432674408,
+        "test_acc": 0.701989471912384,
+        "test_macro_f1": 0.6810207281793866,
+        "total": 1.8866677284240723,
+        "train_acc": 0.9142857193946838,
+        "train_macro_f1": 0.9158730506896973,
+        "train_pool_ratio": 0.012924667447805405,
+        "val_acc": 0.7476190328598022,
+        "val_macro_f1": 0.7475450379507882
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/prompt_graph_eval/Cora/20260605_222351/seed_1/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "val_acc",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "adapted_node_count": 2716,
+        "alpha": 0.49803104996681213,
+        "branch_cosine": 0.9999215602874756,
+        "connected_edge_count": 2300,
+        "edge_scale": 0.013170293532311916,
+        "init_logit_delta": 0.00010263826698064804,
+        "init_original_x_delta": 0.0,
+        "mean_prompt_edge_weight": 0.0065851472318172455,
+        "pool_label_distribution": [
+          0.11652173846960068,
+          0.07652173936367035,
+          0.16521738469600677,
+          0.321739137172699,
+          0.15826086699962616,
+          0.12521739304065704,
+          0.03652174025774002
+        ],
+        "pool_ratio": 0.2123338282108307,
+        "prompt_edge_count": 2300,
+        "prompt_mediated_same_label_reachability": 0.19089834873504014,
+        "prompt_node_count": 8,
+        "prompt_usage_by_true_class": [
+          [
+            0.0,
+            0.0,
+            0.4999197721481323,
+            0.5000802278518677,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.49991971254348755,
+            0.5000802874565125,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999198019504547,
+            0.5000801682472229,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.499918669462204,
+            0.5000813007354736,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999198019504547,
+            0.5000801682472229,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999197721481323,
+            0.5000802278518677,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.4999195337295532,
+            0.500080406665802,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        ],
+        "prompt_usage_distribution": [
+          0.0,
+          0.0,
+          0.49991947412490845,
+          0.5000805258750916,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "prompt_usage_entropy": 0.3333333432674408,
+        "test_acc": 0.701989471912384,
+        "test_macro_f1": 0.6810207281793866,
+        "train_acc": 0.9142857193946838,
+        "train_macro_f1": 0.9158730506896973,
+        "train_pool_ratio": 0.012924667447805405,
+        "val_acc": 0.7476190328598022,
+        "val_macro_f1": 0.7475450379507882
+      },
+      "freeze_base_model": false,
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "model_variant": "StableDualBranch",
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "optimizer": {
+        "base_lr": 0.001,
+        "base_weight_decay": 0.0005,
+        "prompt_lr": 0.003,
+        "prompt_weight_decay": 0.0005
+      },
+      "prompt_graph_parameter_count": 946249,
+      "prompt_variant": "p1_graph",
+      "regularization": {
+        "lambda_edge_l1": 0.001,
+        "lambda_prompt_balance": 0.001
+      },
+      "rho": 0.2,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/prompt_graph_eval/Cora/20260605_222351/seed_1",
+      "seed": 1,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 1,
+      "stopped_epoch": 100,
+      "topk_prompt_per_node": 2,
+      "train_prompt_graph_module": true,
+      "trainable_parameters": {
+        "actual_trainable_parameter_count": 955347,
+        "input_aligner_trainable_parameter_count": 0,
+        "model_trainable_parameter_count": 9098,
+        "prompt_graph_module_trainable_parameter_count": 946249,
+        "trainable_parameter_groups": {
+          "input_aligner": [],
+          "model": [
+            "model.alpha_logit",
+            "model.adapters.0.beta",
+            "model.adapters.0.down.weight",
+            "model.adapters.0.up.weight",
+            "model.adapters.1.beta",
+            "model.adapters.1.down.weight",
+            "model.adapters.1.up.weight",
+            "model.classifier.weight",
+            "model.classifier.bias"
+          ],
+          "prompt_graph_module": [
+            "prompt_graph_module.prompt_node_x",
+            "prompt_graph_module.prompt_keys",
+            "prompt_graph_module.edge_scale_logit",
+            "prompt_graph_module.query_mlp.0.weight",
+            "prompt_graph_module.query_mlp.0.bias",
+            "prompt_graph_module.query_mlp.3.weight",
+            "prompt_graph_module.query_mlp.3.bias"
+          ]
+        },
+        "trainable_parameter_names": [
+          "model.alpha_logit",
+          "model.adapters.0.beta",
+          "model.adapters.0.down.weight",
+          "model.adapters.0.up.weight",
+          "model.adapters.1.beta",
+          "model.adapters.1.down.weight",
+          "model.adapters.1.up.weight",
+          "model.classifier.weight",
+          "model.classifier.bias",
+          "prompt_graph_module.prompt_node_x",
+          "prompt_graph_module.prompt_keys",
+          "prompt_graph_module.edge_scale_logit",
+          "prompt_graph_module.query_mlp.0.weight",
+          "prompt_graph_module.query_mlp.0.bias",
+          "prompt_graph_module.query_mlp.3.weight",
+          "prompt_graph_module.query_mlp.3.bias"
+        ]
+      }
+    },
+    {
+      "adapter_style": "stable_zero_init",
+      "aligner_style": "identity_if_same_dim",
+      "base_checkpoint_path": "",
+      "best": {
+        "adapted_node_count": 2716,
+        "adapter_beta_mean": 0.07046618672757177,
+        "adapter_beta_std": 0.09956179873320223,
+        "alpha": 0.49691495299339294,
+        "best_epoch": 100.0,
+        "branch_cosine": 0.9995278716087341,
+        "cls": 1.8920120000839233,
+        "connected_edge_count": 2284,
+        "edge_l1": 0.006567910313606262,
+        "edge_scale": 0.013170339167118073,
+        "init_logit_delta": 0.00011741742491722107,
+        "init_original_x_delta": 0.0,
+        "mean_prompt_edge_weight": 0.0065851700492203236,
+        "monitor_value": 0.6761904954910278,
+        "pool_label_distribution": [
+          0.11558669060468674,
+          0.0753064826130867,
+          0.1646234691143036,
+          0.3222416937351227,
+          0.16112084686756134,
+          0.12434326112270355,
+          0.03677758201956749
+        ],
+        "pool_ratio": 0.21085672080516815,
+        "prompt_balance": 0.5,
+        "prompt_edge_count": 2284,
+        "prompt_mediated_same_label_reachability": 0.19132946200878728,
+        "prompt_node_count": 8,
+        "prompt_usage_by_true_class": [
+          [
+            0.0,
+            0.4999905824661255,
+            0.0,
+            0.0,
+            0.0,
+            0.5000094175338745,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.4999905526638031,
+            0.0,
+            0.0,
+            0.0,
+            0.5000094771385193,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.49999111890792847,
+            0.0,
+            0.0,
+            0.0,
+            0.5000088810920715,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.4999917149543762,
+            0.0,
+            0.0,
+            0.0,
+            0.5000082850456238,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.4999910891056061,
+            0.0,
+            0.0,
+            0.0,
+            0.5000089406967163,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.49999070167541504,
+            0.0,
+            0.0,
+            0.0,
+            0.500009298324585,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.49999064207077026,
+            0.0,
+            0.0,
+            0.0,
+            0.5000093579292297,
+            0.0,
+            0.0
+          ]
+        ],
+        "prompt_usage_distribution": [
+          0.0,
+          0.4999895393848419,
+          0.0,
+          0.0,
+          0.0,
+          0.5000104904174805,
+          0.0,
+          0.0
+        ],
+        "prompt_usage_entropy": 0.3333333432674408,
+        "test_acc": 0.6654486656188965,
+        "test_macro_f1": 0.638643958738872,
+        "total": 1.8925185203552246,
+        "train_acc": 0.7714285850524902,
+        "train_macro_f1": 0.7691253508840289,
+        "train_pool_ratio": 0.012924667447805405,
+        "val_acc": 0.6761904954910278,
+        "val_macro_f1": 0.6641335317066738
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/prompt_graph_eval/Cora/20260605_222351/seed_2/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "val_acc",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "adapted_node_count": 2716,
+        "alpha": 0.49691495299339294,
+        "branch_cosine": 0.9995278716087341,
+        "connected_edge_count": 2284,
+        "edge_scale": 0.013170339167118073,
+        "init_logit_delta": 0.00011741742491722107,
+        "init_original_x_delta": 0.0,
+        "mean_prompt_edge_weight": 0.0065851700492203236,
+        "pool_label_distribution": [
+          0.11558669060468674,
+          0.0753064826130867,
+          0.1646234691143036,
+          0.3222416937351227,
+          0.16112084686756134,
+          0.12434326112270355,
+          0.03677758201956749
+        ],
+        "pool_ratio": 0.21085672080516815,
+        "prompt_edge_count": 2284,
+        "prompt_mediated_same_label_reachability": 0.19132946200878728,
+        "prompt_node_count": 8,
+        "prompt_usage_by_true_class": [
+          [
+            0.0,
+            0.4999905824661255,
+            0.0,
+            0.0,
+            0.0,
+            0.5000094175338745,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.4999905526638031,
+            0.0,
+            0.0,
+            0.0,
+            0.5000094771385193,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.49999111890792847,
+            0.0,
+            0.0,
+            0.0,
+            0.5000088810920715,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.4999917149543762,
+            0.0,
+            0.0,
+            0.0,
+            0.5000082850456238,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.4999910891056061,
+            0.0,
+            0.0,
+            0.0,
+            0.5000089406967163,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.49999070167541504,
+            0.0,
+            0.0,
+            0.0,
+            0.500009298324585,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.49999064207077026,
+            0.0,
+            0.0,
+            0.0,
+            0.5000093579292297,
+            0.0,
+            0.0
+          ]
+        ],
+        "prompt_usage_distribution": [
+          0.0,
+          0.4999895393848419,
+          0.0,
+          0.0,
+          0.0,
+          0.5000104904174805,
+          0.0,
+          0.0
+        ],
+        "prompt_usage_entropy": 0.3333333432674408,
+        "test_acc": 0.6654486656188965,
+        "test_macro_f1": 0.638643958738872,
+        "train_acc": 0.7714285850524902,
+        "train_macro_f1": 0.7691253508840289,
+        "train_pool_ratio": 0.012924667447805405,
+        "val_acc": 0.6761904954910278,
+        "val_macro_f1": 0.6641335317066738
+      },
+      "freeze_base_model": false,
+      "fusion_alpha_style": "sigmoid",
+      "hidden_dim": 128,
+      "model_variant": "StableDualBranch",
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "optimizer": {
+        "base_lr": 0.001,
+        "base_weight_decay": 0.0005,
+        "prompt_lr": 0.003,
+        "prompt_weight_decay": 0.0005
+      },
+      "prompt_graph_parameter_count": 946249,
+      "prompt_variant": "p1_graph",
+      "regularization": {
+        "lambda_edge_l1": 0.001,
+        "lambda_prompt_balance": 0.001
+      },
+      "rho": 0.2,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/prompt_graph_eval/Cora/20260605_222351/seed_2",
+      "seed": 2,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 2,
+      "stopped_epoch": 100,
+      "topk_prompt_per_node": 2,
+      "train_prompt_graph_module": true,
+      "trainable_parameters": {
+        "actual_trainable_parameter_count": 955347,
+        "input_aligner_trainable_parameter_count": 0,
+        "model_trainable_parameter_count": 9098,
+        "prompt_graph_module_trainable_parameter_count": 946249,
+        "trainable_parameter_groups": {
+          "input_aligner": [],
+          "model": [
+            "model.alpha_logit",
+            "model.adapters.0.beta",
+            "model.adapters.0.down.weight",
+            "model.adapters.0.up.weight",
+            "model.adapters.1.beta",
+            "model.adapters.1.down.weight",
+            "model.adapters.1.up.weight",
+            "model.classifier.weight",
+            "model.classifier.bias"
+          ],
+          "prompt_graph_module": [
+            "prompt_graph_module.prompt_node_x",
+            "prompt_graph_module.prompt_keys",
+            "prompt_graph_module.edge_scale_logit",
+            "prompt_graph_module.query_mlp.0.weight",
+            "prompt_graph_module.query_mlp.0.bias",
+            "prompt_graph_module.query_mlp.3.weight",
+            "prompt_graph_module.query_mlp.3.bias"
+          ]
+        },
+        "trainable_parameter_names": [
+          "model.alpha_logit",
+          "model.adapters.0.beta",
+          "model.adapters.0.down.weight",
+          "model.adapters.0.up.weight",
+          "model.adapters.1.beta",
+          "model.adapters.1.down.weight",
+          "model.adapters.1.up.weight",
+          "model.classifier.weight",
+          "model.classifier.bias",
+          "prompt_graph_module.prompt_node_x",
+          "prompt_graph_module.prompt_keys",
+          "prompt_graph_module.edge_scale_logit",
+          "prompt_graph_module.query_mlp.0.weight",
+          "prompt_graph_module.query_mlp.0.bias",
+          "prompt_graph_module.query_mlp.3.weight",
+          "prompt_graph_module.query_mlp.3.bias"
+        ]
+      }
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    2
+  ]
+}

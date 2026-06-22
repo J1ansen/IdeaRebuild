@@ -1,0 +1,429 @@
+{
+  "best_test_acc_mean_std": "61.25+-2.68",
+  "best_test_macro_f1_mean_std": "56.12+-2.72",
+  "dataset": "CiteSeer",
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final_test_acc_mean_std": "59.57+-3.98",
+  "final_test_macro_f1_mean_std": "54.06+-5.08",
+  "num_runs": 5,
+  "runs": [
+    {
+      "best": {
+        "adapter_beta_mean": 0.14109986275434494,
+        "adapter_beta_std": 0.00504153226188825,
+        "alpha": 0.46732306480407715,
+        "best_epoch": 93.0,
+        "branch_cosine": 0.906612753868103,
+        "test_acc": 0.6368302702903748,
+        "test_macro_f1": 0.5916632289687792,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5611110925674438,
+        "val_macro_f1": 0.5322206827501456
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_0/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "CiteSeer",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.4507918059825897,
+        "branch_cosine": 0.7814672589302063,
+        "test_acc": 0.6349053382873535,
+        "test_macro_f1": 0.5905896748105685,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.550000011920929,
+        "val_macro_f1": 0.5193271171301603
+      },
+      "hidden_dim": 128,
+      "num_classes": 6,
+      "num_features": 3703,
+      "num_nodes": 3327,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_0",
+      "seed": 0,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            229,
+            555,
+            633,
+            666,
+            561,
+            473
+          ],
+          "total": 3117
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 30
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 180
+        }
+      },
+      "split_seed": 0,
+      "stopped_epoch": 133
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.06038576737046242,
+        "adapter_beta_std": 0.0020148300930632893,
+        "alpha": 0.48765555024147034,
+        "best_epoch": 48.0,
+        "branch_cosine": 0.9993905425071716,
+        "test_acc": 0.5925569534301758,
+        "test_macro_f1": 0.5668611576159795,
+        "train_acc": 0.9333333373069763,
+        "train_macro_f1": 0.9326599637667338,
+        "val_acc": 0.6111111044883728,
+        "val_macro_f1": 0.6009679188330969
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_1/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "CiteSeer",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.46925362944602966,
+        "branch_cosine": 0.9216277599334717,
+        "test_acc": 0.5383381247520447,
+        "test_macro_f1": 0.4742114742596944,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5555555820465088,
+        "val_macro_f1": 0.5170861010750135
+      },
+      "hidden_dim": 128,
+      "num_classes": 6,
+      "num_features": 3703,
+      "num_nodes": 3327,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_1",
+      "seed": 1,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            229,
+            555,
+            633,
+            666,
+            561,
+            473
+          ],
+          "total": 3117
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 30
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 180
+        }
+      },
+      "split_seed": 1,
+      "stopped_epoch": 88
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.03267986141145229,
+        "adapter_beta_std": 0.0005524740611709587,
+        "alpha": 0.4946679174900055,
+        "best_epoch": 28.0,
+        "branch_cosine": 0.9999939203262329,
+        "test_acc": 0.646454930305481,
+        "test_macro_f1": 0.5798781787355741,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6555555462837219,
+        "val_macro_f1": 0.622277153035005
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_2/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "CiteSeer",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.479244202375412,
+        "branch_cosine": 0.9882985949516296,
+        "test_acc": 0.6265640258789062,
+        "test_macro_f1": 0.5886229798197746,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6000000238418579,
+        "val_macro_f1": 0.5969528903563818
+      },
+      "hidden_dim": 128,
+      "num_classes": 6,
+      "num_features": 3703,
+      "num_nodes": 3327,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_2",
+      "seed": 2,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            229,
+            555,
+            633,
+            666,
+            561,
+            473
+          ],
+          "total": 3117
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 30
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 180
+        }
+      },
+      "split_seed": 2,
+      "stopped_epoch": 68
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.14811526238918304,
+        "adapter_beta_std": 0.00014026471184425533,
+        "alpha": 0.4651243984699249,
+        "best_epoch": 96.0,
+        "branch_cosine": 0.8889918327331543,
+        "test_acc": 0.5915944576263428,
+        "test_macro_f1": 0.5255217875043551,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5388888716697693,
+        "val_macro_f1": 0.5009273414810499
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_3/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "CiteSeer",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.4494497776031494,
+        "branch_cosine": 0.7873020172119141,
+        "test_acc": 0.5739493370056152,
+        "test_macro_f1": 0.5072165777285894,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5222222208976746,
+        "val_macro_f1": 0.47842931499083835
+      },
+      "hidden_dim": 128,
+      "num_classes": 6,
+      "num_features": 3703,
+      "num_nodes": 3327,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_3",
+      "seed": 3,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            229,
+            555,
+            633,
+            666,
+            561,
+            473
+          ],
+          "total": 3117
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 30
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 180
+        }
+      },
+      "split_seed": 3,
+      "stopped_epoch": 136
+    },
+    {
+      "best": {
+        "adapter_beta_mean": 0.05431170389056206,
+        "adapter_beta_std": 0.0007888783686465951,
+        "alpha": 0.4894298315048218,
+        "best_epoch": 44.0,
+        "branch_cosine": 0.9997528791427612,
+        "test_acc": 0.5951235294342041,
+        "test_macro_f1": 0.5419538567463557,
+        "train_acc": 0.9666666388511658,
+        "train_macro_f1": 0.9663299818833669,
+        "val_acc": 0.5888888835906982,
+        "val_macro_f1": 0.5755836019913355
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_4/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "CiteSeer",
+      "early_stop_metric": "val_acc",
+      "early_stopped": true,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.4715428650379181,
+        "branch_cosine": 0.9391579627990723,
+        "test_acc": 0.6047481298446655,
+        "test_macro_f1": 0.5425604904691378,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.5888888835906982,
+        "val_macro_f1": 0.5670337527990341
+      },
+      "hidden_dim": 128,
+      "num_classes": 6,
+      "num_features": 3703,
+      "num_nodes": 3327,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/CiteSeer/20260602_151520/seed_4",
+      "seed": 4,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            229,
+            555,
+            633,
+            666,
+            561,
+            473
+          ],
+          "total": 3117
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 30
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 180
+        }
+      },
+      "split_seed": 4,
+      "stopped_epoch": 84
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+}

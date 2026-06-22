@@ -1,0 +1,445 @@
+{
+  "adapter_style": "stable_zero_init",
+  "aligner_style": "identity_if_same_dim",
+  "base_checkpoint_path": "",
+  "best": {
+    "adapted_branch_delta_norm": 0.03957837074995041,
+    "adapted_node_count": 7608,
+    "adapter_beta_mean": 0.010913354810327291,
+    "adapter_beta_std": 0.0027863722775372394,
+    "alpha": 0.49884822964668274,
+    "best_epoch": 10.0,
+    "branch_cosine": 0.973440408706665,
+    "capacity_overflow_count": 0.0,
+    "capacity_routing_enabled": 0.0,
+    "cls": 1.5742509365081787,
+    "connected_edge_count": 6876,
+    "edge_l1": 0.0035144579596817493,
+    "edge_scale": 0.025708895176649094,
+    "edge_scale_multiplier": 0.5,
+    "edge_type_counts": [
+      30019,
+      3438,
+      3438
+    ],
+    "init_logit_delta": 0.0,
+    "init_logit_delta_full_edge_scale": 0.006534073501825333,
+    "init_original_x_delta": 0.0,
+    "mean_prompt_edge_weight": 0.003532067406922579,
+    "monitor_value": 0.30000001192092896,
+    "node_to_prompt_msg_norm": 0.1670238971710205,
+    "node_to_prompt_update_norm": 0.04296189546585083,
+    "pool_acceptance_max": 0.27480167150497437,
+    "pool_acceptance_mean": 0.2747739553451538,
+    "pool_acceptance_min": 0.27472320199012756,
+    "pool_label_distribution": [
+      0.12158231437206268,
+      0.17859220504760742,
+      0.2222222238779068,
+      0.22745782136917114,
+      0.25014543533325195
+    ],
+    "pool_only_prompt_update": 1.0,
+    "pool_ratio": 0.2261842042207718,
+    "prompt_acceptance": 0.2741684317588806,
+    "prompt_balance": 0.0009408514015376568,
+    "prompt_capacity": 0.0,
+    "prompt_edge_count": 6876,
+    "prompt_gate_by_layer": [
+      [
+        0.051444217562675476,
+        0.05146211385726929
+      ],
+      [
+        0.05144388973712921,
+        0.05145474523305893
+      ]
+    ],
+    "prompt_gate_mean": 0.051451243460178375,
+    "prompt_gate_node_to_prompt_mean": 0.051444053649902344,
+    "prompt_gate_prompt_to_node_mean": 0.05145842954516411,
+    "prompt_mediated_same_label_reachability": 0.21026997100390013,
+    "prompt_message_norm": "weighted_mean",
+    "prompt_message_scale": 5.0,
+    "prompt_msg_norm": 0.03958193212747574,
+    "prompt_node_count": 8,
+    "prompt_role_diversity": 0.005039223004132509,
+    "prompt_to_original_msg_norm": 0.1538248509168625,
+    "prompt_to_original_update_norm": 0.03957837074995041,
+    "prompt_usage_by_true_class": [
+      [
+        0.0,
+        0.5581765174865723,
+        0.013764516450464725,
+        0.10237384587526321,
+        0.0,
+        0.036021456122398376,
+        0.0,
+        0.2896636426448822
+      ],
+      [
+        0.0,
+        0.5564605593681335,
+        0.002676655538380146,
+        0.10104867070913315,
+        0.0,
+        0.03180675208568573,
+        0.0,
+        0.3080073893070221
+      ],
+      [
+        0.0,
+        0.5540153980255127,
+        0.0,
+        0.07549108564853668,
+        0.0,
+        0.026784347370266914,
+        0.0,
+        0.34370920062065125
+      ],
+      [
+        0.0,
+        0.5571361184120178,
+        0.0,
+        0.07851933687925339,
+        0.0,
+        0.02602623775601387,
+        0.0,
+        0.3383183777332306
+      ],
+      [
+        0.0,
+        0.5553111433982849,
+        0.00192115711979568,
+        0.07262855023145676,
+        0.0,
+        0.0009894692339003086,
+        0.0,
+        0.36914965510368347
+      ]
+    ],
+    "prompt_usage_distribution": [
+      0.0,
+      0.5559917688369751,
+      0.002632122253999114,
+      0.08329670876264572,
+      0.0,
+      0.022179480642080307,
+      0.0,
+      0.3358999490737915
+    ],
+    "prompt_usage_entropy": 0.48087137937545776,
+    "prompt_usage_full_distribution": [
+      0.11890122294425964,
+      0.15703999996185303,
+      0.11824406683444977,
+      0.12199947983026505,
+      0.11965984851121902,
+      0.12238585948944092,
+      0.11696189641952515,
+      0.12480761855840683
+    ],
+    "prompt_usage_full_entropy": 0.9977996349334717,
+    "raw_edge_scale": 0.05141779035329819,
+    "raw_prompt_update_norm": 0.007916385307908058,
+    "test_acc": 0.16013889014720917,
+    "test_macro_f1": 0.12211397960782051,
+    "total": 1.5745943784713745,
+    "train_acc": 0.5,
+    "train_macro_f1": 0.47087332606315613,
+    "train_pool_ratio": 0.032894738018512726,
+    "val_acc": 0.30000001192092896,
+    "val_macro_f1": 0.2138679265975952
+  },
+  "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/p2_shot_relaxation/shots50/Actor/20260608_120105/scale_5p0/seed_0/best_model.pt",
+  "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+  "dataset": "Actor",
+  "early_stop_metric": "val_acc",
+  "early_stopped": true,
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final": {
+    "adapted_branch_delta_norm": 1.310980200767517,
+    "adapted_node_count": 7608,
+    "alpha": 0.48818933963775635,
+    "branch_cosine": 0.8675175309181213,
+    "capacity_overflow_count": 0.0,
+    "capacity_routing_enabled": 0.0,
+    "connected_edge_count": 6860,
+    "edge_scale": 0.05741611123085022,
+    "edge_scale_multiplier": 1.0,
+    "edge_type_counts": [
+      30019,
+      3430,
+      3430
+    ],
+    "init_logit_delta": 0.0,
+    "init_logit_delta_full_edge_scale": 0.006534073501825333,
+    "init_original_x_delta": 0.0,
+    "mean_prompt_edge_weight": 0.008568917401134968,
+    "node_to_prompt_msg_norm": 0.6669419407844543,
+    "node_to_prompt_update_norm": 0.1931898295879364,
+    "pool_acceptance_max": 0.29848513007164,
+    "pool_acceptance_mean": 0.29848477244377136,
+    "pool_acceptance_min": 0.29848411679267883,
+    "pool_label_distribution": [
+      0.12011662125587463,
+      0.17492711544036865,
+      0.22448979318141937,
+      0.22740525007247925,
+      0.2530612349510193
+    ],
+    "pool_only_prompt_update": 1.0,
+    "pool_ratio": 0.2256578952074051,
+    "prompt_capacity": 0.0,
+    "prompt_edge_count": 6860,
+    "prompt_gate_by_layer": [
+      [
+        0.05800055339932442,
+        0.058315522968769073
+      ],
+      [
+        0.05757463723421097,
+        0.057959675788879395
+      ]
+    ],
+    "prompt_gate_mean": 0.05796259641647339,
+    "prompt_gate_node_to_prompt_mean": 0.05778759717941284,
+    "prompt_gate_prompt_to_node_mean": 0.058137599378824234,
+    "prompt_mediated_same_label_reachability": 0.2176762663900954,
+    "prompt_message_norm": "weighted_mean",
+    "prompt_message_scale": 5.0,
+    "prompt_msg_norm": 1.3098047971725464,
+    "prompt_node_count": 8,
+    "prompt_to_original_msg_norm": 4.5084381103515625,
+    "prompt_to_original_update_norm": 1.310980200767517,
+    "prompt_usage_by_true_class": [
+      [
+        0.011730031110346317,
+        0.6784182190895081,
+        0.00042086729081347585,
+        0.0014097675448283553,
+        0.030317755416035652,
+        0.0008817167836241424,
+        0.012424791231751442,
+        0.26439669728279114
+      ],
+      [
+        0.014875143766403198,
+        0.5116863250732422,
+        0.0006178932380862534,
+        0.0,
+        0.009677225723862648,
+        0.0020787937100976706,
+        0.011406083591282368,
+        0.4496586322784424
+      ],
+      [
+        0.02246350236237049,
+        0.4955520033836365,
+        0.0012440943391993642,
+        0.0,
+        0.007261653896421194,
+        0.0016772773815318942,
+        0.009495395235717297,
+        0.46230608224868774
+      ],
+      [
+        0.010348064824938774,
+        0.6130008101463318,
+        0.0007229578914120793,
+        0.00022690311016049236,
+        0.011960569769144058,
+        0.0007153285550884902,
+        0.01164258923381567,
+        0.3513827919960022
+      ],
+      [
+        0.005414341576397419,
+        0.623771071434021,
+        0.0008739791228435934,
+        0.00031296018278226256,
+        0.006812708452343941,
+        0.0013487724354490638,
+        0.013851054944097996,
+        0.347615122795105
+      ]
+    ],
+    "prompt_usage_distribution": [
+      0.012777227908372879,
+      0.5794953107833862,
+      0.0008235002169385552,
+      0.00030013336800038815,
+      0.011408567428588867,
+      0.0013500688364729285,
+      0.01177202258259058,
+      0.3820732533931732
+    ],
+    "prompt_usage_entropy": 0.413582444190979,
+    "prompt_usage_full_distribution": [
+      0.07032311707735062,
+      0.35815468430519104,
+      0.06821936368942261,
+      0.0644722506403923,
+      0.06809861212968826,
+      0.0690423995256424,
+      0.06881190836429596,
+      0.2328776866197586
+    ],
+    "prompt_usage_full_entropy": 0.8682148456573486,
+    "raw_edge_scale": 0.05741611123085022,
+    "raw_prompt_update_norm": 0.2619609832763672,
+    "test_acc": 0.20749999582767487,
+    "test_macro_f1": 0.19235952645540239,
+    "train_acc": 0.8240000009536743,
+    "train_macro_f1": 0.8235162615776062,
+    "train_pool_ratio": 0.032894738018512726,
+    "val_acc": 0.24666666984558105,
+    "val_macro_f1": 0.22178959473967552
+  },
+  "freeze_base_model": false,
+  "fusion_alpha_style": "sigmoid",
+  "hidden_dim": 128,
+  "model_variant": "StableDualBranch",
+  "num_classes": 5,
+  "num_features": 932,
+  "num_nodes": 7600,
+  "optimizer": {
+    "base_lr": 0.001,
+    "base_weight_decay": 0.0005,
+    "prompt_aware_parameter_count": 400132,
+    "prompt_lr": 0.003,
+    "prompt_weight_decay": 0.0005
+  },
+  "prompt_graph_parameter_count": 1863626,
+  "prompt_variant": "p2_strength",
+  "regularization": {
+    "edge_scale_warmup_epochs": 20,
+    "edge_scale_warmup_start": 0.0,
+    "lambda_edge_l1": 0.0,
+    "lambda_prompt_acceptance": 0.001,
+    "lambda_prompt_balance": 0.02,
+    "lambda_prompt_role_diversity": 0.01
+  },
+  "rho": 0.2,
+  "run_dir": "/Users/jackson/IdeaRebuild/outputs/p2_shot_relaxation/shots50/Actor/20260608_120105/scale_5p0/seed_0",
+  "seed": 0,
+  "source_dim": 1433,
+  "split_counts": {
+    "test": {
+      "per_class": [
+        773,
+        1257,
+        1550,
+        1735,
+        1885
+      ],
+      "total": 7200
+    },
+    "train": {
+      "per_class": [
+        50,
+        50,
+        50,
+        50,
+        50
+      ],
+      "total": 250
+    },
+    "val": {
+      "per_class": [
+        30,
+        30,
+        30,
+        30,
+        30
+      ],
+      "total": 150
+    }
+  },
+  "split_seed": 0,
+  "stopped_epoch": 50,
+  "topk_prompt_per_node": 2,
+  "train_prompt_graph_module": true,
+  "trainable_parameters": {
+    "actual_trainable_parameter_count": 3608154,
+    "input_aligner_trainable_parameter_count": 1335556,
+    "model_trainable_parameter_count": 408972,
+    "prompt_graph_module_trainable_parameter_count": 1863626,
+    "trainable_parameter_groups": {
+      "input_aligner": [
+        "input_aligner.proj.weight"
+      ],
+      "model": [
+        "model.alpha_logit",
+        "model.prompt_gate_logit",
+        "model.adapters.0.beta",
+        "model.adapters.0.down.weight",
+        "model.adapters.0.up.weight",
+        "model.adapters.1.beta",
+        "model.adapters.1.down.weight",
+        "model.adapters.1.up.weight",
+        "model.classifier.weight",
+        "model.classifier.bias",
+        "model.node_to_prompt_msgs.0.weight",
+        "model.node_to_prompt_msgs.0.bias",
+        "model.node_to_prompt_msgs.1.weight",
+        "model.node_to_prompt_msgs.1.bias",
+        "model.prompt_to_node_msgs.0.weight",
+        "model.prompt_to_node_msgs.0.bias",
+        "model.prompt_to_node_msgs.1.weight",
+        "model.prompt_to_node_msgs.1.bias"
+      ],
+      "prompt_graph_module": [
+        "prompt_graph_module.prompt_node_x",
+        "prompt_graph_module.prompt_keys",
+        "prompt_graph_module.edge_scale_logit",
+        "prompt_graph_module.query_mlp.0.weight",
+        "prompt_graph_module.query_mlp.0.bias",
+        "prompt_graph_module.query_mlp.3.weight",
+        "prompt_graph_module.query_mlp.3.bias",
+        "prompt_graph_module.rejection_gate_mlp.0.weight",
+        "prompt_graph_module.rejection_gate_mlp.0.bias",
+        "prompt_graph_module.rejection_gate_mlp.3.weight",
+        "prompt_graph_module.rejection_gate_mlp.3.bias"
+      ]
+    },
+    "trainable_parameter_names": [
+      "input_aligner.proj.weight",
+      "model.alpha_logit",
+      "model.prompt_gate_logit",
+      "model.adapters.0.beta",
+      "model.adapters.0.down.weight",
+      "model.adapters.0.up.weight",
+      "model.adapters.1.beta",
+      "model.adapters.1.down.weight",
+      "model.adapters.1.up.weight",
+      "model.classifier.weight",
+      "model.classifier.bias",
+      "model.node_to_prompt_msgs.0.weight",
+      "model.node_to_prompt_msgs.0.bias",
+      "model.node_to_prompt_msgs.1.weight",
+      "model.node_to_prompt_msgs.1.bias",
+      "model.prompt_to_node_msgs.0.weight",
+      "model.prompt_to_node_msgs.0.bias",
+      "model.prompt_to_node_msgs.1.weight",
+      "model.prompt_to_node_msgs.1.bias",
+      "prompt_graph_module.prompt_node_x",
+      "prompt_graph_module.prompt_keys",
+      "prompt_graph_module.edge_scale_logit",
+      "prompt_graph_module.query_mlp.0.weight",
+      "prompt_graph_module.query_mlp.0.bias",
+      "prompt_graph_module.query_mlp.3.weight",
+      "prompt_graph_module.query_mlp.3.bias",
+      "prompt_graph_module.rejection_gate_mlp.0.weight",
+      "prompt_graph_module.rejection_gate_mlp.0.bias",
+      "prompt_graph_module.rejection_gate_mlp.3.weight",
+      "prompt_graph_module.rejection_gate_mlp.3.bias"
+    ]
+  }
+}

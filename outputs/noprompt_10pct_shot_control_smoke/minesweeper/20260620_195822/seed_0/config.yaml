@@ -1,0 +1,113 @@
+experiment:
+  name: gp2f_prompt_p21_lite_adaptive_filter
+  seed: 0
+  runs: 1
+  source_dataset: Cora
+  target_dataset: minesweeper
+  prompt_variant: noprompt
+  seeds:
+  - 0
+data:
+  root: /Users/jackson/MyIdea/data
+  download_if_missing: false
+  shots: 5
+  val_per_class: 30
+  shot_ratio: 0.1
+pretrained:
+  checkpoint_path: pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl
+  freeze_backbone: true
+model:
+  hidden_dim: 128
+  input_aligner: identity_if_same_dim
+  adapter_style: stable_zero_init
+  adapter_bottleneck_dim: 16
+  adapter_beta_init: 0.01
+  adapter_alpha_init: 0.1
+  fusion_alpha_style: sigmoid
+  alpha_init: 0.5
+loss:
+  use_cls: true
+  use_original_contrastive: false
+  use_original_topology_fusion: false
+  lambda_ctr: 0.0
+  lambda_fus: 0.0
+prompt_graph:
+  enabled: false
+  support_query_split:
+    enabled: true
+    support_ratio: 0.55
+    min_query_per_class: 2
+    resample_each_epoch: true
+prompt_aware:
+  enabled: false
+prompt_adapter:
+  enabled: false
+  module_type: p21_lite_adaptive_filter
+  hidden_dim: 128
+  dropout: 0.1
+  context_detach: true
+  residual_scale: 0.1
+  channel_prior:
+  - 0.45
+  - 0.15
+  - 0.25
+  - 0.15
+  beta_init: 0.05
+  beta_max: 0.2
+  max_update_norm: 0.05
+  use_candidate_pool: true
+  candidate_pool_strategy: utility_structural
+  candidate_pool_ratio: 0.3
+  candidate_pool_include_train: true
+  candidate_pool_structural_weight: 0.35
+  candidate_pool_uncertainty_weight: 0.35
+  candidate_pool_disagreement_weight: 0.3
+training:
+  epochs: 1
+  lr: 0.001
+  prompt_lr: 0.003
+  prompt_lr_multiplier: 1.0
+  weight_decay: 0.0005
+  prompt_weight_decay: 0.0005
+  grad_clip: 1.0
+  log_every: 5
+  eval_every: 5
+  output_dir: outputs/noprompt_10pct_shot_control_smoke
+  early_stop_patience: 0
+  early_stop_min_epochs: 20
+  early_stop_metric: train_loss
+  keep_best_checkpoint: true
+  freeze_base_model: false
+  train_prompt_adapter: true
+  train_prompt_graph_module: false
+  train_prompt_aware_module: false
+  prompt_adapter_update_mask: candidate_pool
+  prompt_adapter_loss_mask: query
+  lambda_prompt_adapter_update_norm: 0.02
+  lambda_prompt_adapter_gate_budget: 0.0
+  lambda_prompt_adapter_message_help: 0.05
+  prompt_adapter_message_help_margin: 0.005
+  prompt_adapter_message_help_anti_harm_weight: 0.5
+  prompt_adapter_message_help_anti_harm_margin: 0.0
+  prompt_adapter_message_help_class_balanced: true
+  lambda_prompt_adapter_utility_gate: 0.0
+  prompt_adapter_episode_count_per_epoch: 1
+  lambda_prompt_adapter_gate_consistency: 0.0
+  lambda_prompt_adapter_delta_consistency: 0.0
+  lambda_prompt_router_pattern_balance: 0.0
+  lambda_prompt_router_pattern_supervision: 0.0
+  lambda_prompt_router_pattern_utility: 0.0
+  lambda_prompt_router_class_pattern_reliability: 0.0
+  lambda_prompt_router_deployment_utility: 0.05
+  prompt_router_deployment_utility_margin: 0.0005
+  prompt_router_deployment_utility_anti_harm_weight: 0.5
+  prompt_router_deployment_utility_anti_harm_margin: 0.0
+  prompt_router_deployment_utility_gain_reward_weight: 0.1
+  prompt_router_deployment_utility_gain_reward_cap: 0.02
+  prompt_router_deployment_utility_class_balanced: true
+  diagnose_prompt_message_utility: false
+  base_checkpoint_path: null
+  base_checkpoint_root: null
+  load_prompt_from_base_checkpoint: false
+  enable_test_label_cheat: false
+  test_label_cheat_fraction: 0.1

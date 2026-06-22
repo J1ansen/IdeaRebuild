@@ -1,0 +1,484 @@
+{
+  "best_test_acc_mean_std": "69.14+-2.02",
+  "best_test_macro_f1_mean_std": "65.04+-3.04",
+  "dataset": "Cora",
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final_test_acc_mean_std": "69.11+-1.97",
+  "final_test_macro_f1_mean_std": "64.78+-3.07",
+  "num_runs": 5,
+  "runs": [
+    {
+      "adapter_style": "official_gp2f",
+      "aligner_style": "official_projector",
+      "best": {
+        "adapter_beta_mean": 0.3119170516729355,
+        "adapter_beta_std": 0.006037683563155359,
+        "alpha": 0.13037431240081787,
+        "best_epoch": 499.0,
+        "branch_cosine": 0.8737897276878357,
+        "cls": 0.003595635760575533,
+        "contrastive": 5.425858497619629,
+        "monitor_value": 0.2810553014278412,
+        "test_acc": 0.6910272240638733,
+        "test_macro_f1": 0.6444690099784306,
+        "topology_fusion": 0.06166718900203705,
+        "total": 0.2810553014278412,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6761904954910278,
+        "val_macro_f1": 0.6606188757078988
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_0/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "train_loss",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.1300322413444519,
+        "branch_cosine": 0.8741350769996643,
+        "test_acc": 0.6918392181396484,
+        "test_macro_f1": 0.6353222387177604,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6714285612106323,
+        "val_macro_f1": 0.6531092652252742
+      },
+      "fusion_alpha_style": "raw",
+      "hidden_dim": 128,
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_0",
+      "seed": 0,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 0,
+      "stopped_epoch": 500
+    },
+    {
+      "adapter_style": "official_gp2f",
+      "aligner_style": "official_projector",
+      "best": {
+        "adapter_beta_mean": 0.3091690093278885,
+        "adapter_beta_std": 0.023673610854053857,
+        "alpha": 0.12584713101387024,
+        "best_epoch": 494.0,
+        "branch_cosine": 0.8924544453620911,
+        "cls": 0.0036519314162433147,
+        "contrastive": 5.396385192871094,
+        "monitor_value": 0.2792021632194519,
+        "test_acc": 0.7023954391479492,
+        "test_macro_f1": 0.6613815001079014,
+        "topology_fusion": 0.057309988886117935,
+        "total": 0.2792021632194519,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6666666865348816,
+        "val_macro_f1": 0.6508311373846871
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_1/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "train_loss",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.12362386286258698,
+        "branch_cosine": 0.8937075734138489,
+        "test_acc": 0.699553370475769,
+        "test_macro_f1": 0.6565525659493038,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6666666865348816,
+        "val_macro_f1": 0.6513290022100721
+      },
+      "fusion_alpha_style": "raw",
+      "hidden_dim": 128,
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_1",
+      "seed": 1,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 1,
+      "stopped_epoch": 500
+    },
+    {
+      "adapter_style": "official_gp2f",
+      "aligner_style": "official_projector",
+      "best": {
+        "adapter_beta_mean": 0.3135640472173691,
+        "adapter_beta_std": 0.012972610310834885,
+        "alpha": 0.12156446278095245,
+        "best_epoch": 497.0,
+        "branch_cosine": 0.8887417316436768,
+        "cls": 0.003827115520834923,
+        "contrastive": 5.405776023864746,
+        "monitor_value": 0.27972427010536194,
+        "test_acc": 0.6577344536781311,
+        "test_macro_f1": 0.6006077485425132,
+        "topology_fusion": 0.05608346313238144,
+        "total": 0.27972427010536194,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.699999988079071,
+        "val_macro_f1": 0.6840393415519169
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_2/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "train_loss",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.12047860026359558,
+        "branch_cosine": 0.8897826075553894,
+        "test_acc": 0.6581404805183411,
+        "test_macro_f1": 0.6012130422251565,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6904761791229248,
+        "val_macro_f1": 0.6741464606353215
+      },
+      "fusion_alpha_style": "raw",
+      "hidden_dim": 128,
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_2",
+      "seed": 2,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 2,
+      "stopped_epoch": 500
+    },
+    {
+      "adapter_style": "official_gp2f",
+      "aligner_style": "official_projector",
+      "best": {
+        "adapter_beta_mean": 0.3233894109725952,
+        "adapter_beta_std": 0.029771437970034263,
+        "alpha": 0.12387201189994812,
+        "best_epoch": 500.0,
+        "branch_cosine": 0.9051939249038696,
+        "cls": 0.003875160589814186,
+        "contrastive": 5.3496928215026855,
+        "monitor_value": 0.2779410779476166,
+        "test_acc": 0.6954932808876038,
+        "test_macro_f1": 0.6665256023406982,
+        "topology_fusion": 0.06581289321184158,
+        "total": 0.2779410779476166,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6952381134033203,
+        "val_macro_f1": 0.6869697655950274
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_3/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "train_loss",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.12387201189994812,
+        "branch_cosine": 0.9051939249038696,
+        "test_acc": 0.6954932808876038,
+        "test_macro_f1": 0.6665256023406982,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.6952381134033203,
+        "val_macro_f1": 0.6869697655950274
+      },
+      "fusion_alpha_style": "raw",
+      "hidden_dim": 128,
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_3",
+      "seed": 3,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 3,
+      "stopped_epoch": 500
+    },
+    {
+      "adapter_style": "official_gp2f",
+      "aligner_style": "official_projector",
+      "best": {
+        "adapter_beta_mean": 0.33068862557411194,
+        "adapter_beta_std": 0.022786187885232727,
+        "alpha": 0.12679578363895416,
+        "best_epoch": 499.0,
+        "branch_cosine": 0.8817596435546875,
+        "cls": 0.0035696181003004313,
+        "contrastive": 5.407926559448242,
+        "monitor_value": 0.27930885553359985,
+        "test_acc": 0.7105156183242798,
+        "test_macro_f1": 0.6788490755217416,
+        "topology_fusion": 0.053429123014211655,
+        "total": 0.27930885553359985,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.7428571581840515,
+        "val_macro_f1": 0.7398808555943626
+      },
+      "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_4/best_model.pt",
+      "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+      "dataset": "Cora",
+      "early_stop_metric": "train_loss",
+      "early_stopped": false,
+      "environment": {
+        "cuda_available": "False",
+        "cuda_device": "cpu",
+        "python": "3.14.0",
+        "torch": "2.12.0",
+        "torch_geometric": "2.7.0"
+      },
+      "final": {
+        "alpha": 0.1264335960149765,
+        "branch_cosine": 0.882256269454956,
+        "test_acc": 0.7105156183242798,
+        "test_macro_f1": 0.6795740297862461,
+        "train_acc": 1.0,
+        "train_macro_f1": 1.0,
+        "val_acc": 0.738095223903656,
+        "val_macro_f1": 0.73501027907644
+      },
+      "fusion_alpha_style": "raw",
+      "hidden_dim": 128,
+      "num_classes": 7,
+      "num_features": 1433,
+      "num_nodes": 2708,
+      "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/Cora/20260602_154501/seed_4",
+      "seed": 4,
+      "source_dim": 1433,
+      "split_counts": {
+        "test": {
+          "per_class": [
+            316,
+            182,
+            383,
+            783,
+            391,
+            263,
+            145
+          ],
+          "total": 2463
+        },
+        "train": {
+          "per_class": [
+            5,
+            5,
+            5,
+            5,
+            5,
+            5,
+            5
+          ],
+          "total": 35
+        },
+        "val": {
+          "per_class": [
+            30,
+            30,
+            30,
+            30,
+            30,
+            30,
+            30
+          ],
+          "total": 210
+        }
+      },
+      "split_seed": 4,
+      "stopped_epoch": 500
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+}

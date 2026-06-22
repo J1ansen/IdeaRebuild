@@ -1,0 +1,50 @@
+experiment:
+  name: faithful_gp2f_baseline
+  seed: 1
+  runs: 1
+  source_dataset: Cora
+  target_dataset: PubMed
+  preset: B0
+  seeds:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+data:
+  root: /Users/jackson/MyIdea/data
+  download_if_missing: false
+  shots: 5
+  val_per_class: 30
+pretrained:
+  checkpoint_path: pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl
+  freeze_backbone: true
+model:
+  hidden_dim: 128
+  adapter_bottleneck_dim: 16
+  adapter_beta_init: 0.01
+  alpha_init: 0.5
+loss:
+  use_cls: true
+  use_original_contrastive: false
+  use_original_topology_fusion: false
+  lambda_ctr: 0.0
+  lambda_fus: 0.0
+  tau_ctr: 0.5
+  tau_fus: 0.05
+  topology_percentile: 70.0
+  dense_contrastive_max_nodes: 5000
+  contrastive_sample_size: 2048
+  dense_topology_max_nodes: 5000
+  topology_sample_size: 20000
+training:
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0.0005
+  grad_clip: 1.0
+  log_every: 20
+  output_dir: outputs/gp2f_baseline
+  early_stop_patience: 40
+  early_stop_min_epochs: 20
+  early_stop_metric: val_acc
+  keep_best_checkpoint: true

@@ -1,0 +1,189 @@
+{
+  "adapter_style": "stable_zero_init",
+  "aligner_style": "identity_if_same_dim",
+  "base_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/prompt_crossdomain_noprompt/Actor/20260604_100848/seed_1/budget_0/best_model.pt",
+  "best": {
+    "adapter_beta_mean": 0.010789384134113789,
+    "adapter_beta_std": 0.0018359127698674962,
+    "alpha": 0.4996044337749481,
+    "best_epoch": 10.0,
+    "branch_cosine": 0.975966215133667,
+    "budget": 0.07357224822044373,
+    "cls": 1.5616034269332886,
+    "connected_edge_count": 0.0,
+    "control_parameter_count": 828790,
+    "gamma": 0.05214568227529526,
+    "init_adapted_x_delta": 0.0,
+    "init_logit_delta": 0.0,
+    "lambda_budget_effective": 0.020000000000000004,
+    "lambda_message_norm_effective": 0.025,
+    "message_norm": 1.8636355036960595e-07,
+    "monitor_value": 0.23333333432674408,
+    "non_null_ratio": 0.6134567260742188,
+    "prompt_message_norm": 0.07970153540372849,
+    "prompt_parameter_count": 0,
+    "route_budget": 0.35,
+    "route_null": 0.38654330372810364,
+    "route_semantic": 0.30599236488342285,
+    "route_structural": 0.3074643313884735,
+    "semantic_allowed_ratio": 1.0,
+    "semantic_margin_mean": 0.0,
+    "test_acc": 0.16579124331474304,
+    "test_macro_f1": 0.08501121057197451,
+    "total": 1.5630748271942139,
+    "train_acc": 0.6000000238418579,
+    "train_macro_f1": 0.6087301731109619,
+    "u_prompt_norm": 1.5271923542022705,
+    "u_sem_norm": 2.492917060852051,
+    "u_struct_norm": 2.4879069328308105,
+    "val_acc": 0.23333333432674408,
+    "val_macro_f1": 0.1381766378879547
+  },
+  "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/prompt_activation_probe/Actor/20260605_210430/seed_1/budget_0p35/best_model.pt",
+  "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+  "dataset": "Actor",
+  "early_stop_metric": "val_acc",
+  "early_stopped": true,
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final": {
+    "alpha": 0.4996044337749481,
+    "branch_cosine": 0.9885337352752686,
+    "connected_edge_count": 0.0,
+    "control_parameter_count": 828790,
+    "gamma": 0.06118202209472656,
+    "init_adapted_x_delta": 0.0,
+    "init_logit_delta": 0.0,
+    "non_null_ratio": 0.3747839331626892,
+    "prompt_message_norm": 0.040936943143606186,
+    "prompt_parameter_count": 0,
+    "route_null": 0.6252160668373108,
+    "route_semantic": 0.18578459322452545,
+    "route_structural": 0.18899933993816376,
+    "semantic_allowed_ratio": 1.0,
+    "semantic_margin_mean": 0.0,
+    "test_acc": 0.1667340099811554,
+    "test_macro_f1": 0.08448306573554873,
+    "train_acc": 0.6000000238418579,
+    "train_macro_f1": 0.6087301731109619,
+    "u_prompt_norm": 0.6690762042999268,
+    "u_sem_norm": 1.7610681056976318,
+    "u_struct_norm": 1.8072444200515747,
+    "val_acc": 0.2266666740179062,
+    "val_macro_f1": 0.13161880373954774
+  },
+  "freeze_base_model": true,
+  "fusion_alpha_style": "sigmoid",
+  "hidden_dim": 128,
+  "model_variant": "StableDualBranch",
+  "num_classes": 5,
+  "num_features": 932,
+  "num_nodes": 7600,
+  "optimizer": {
+    "base_lr": 0.0,
+    "base_weight_decay": 0.0,
+    "prompt_lr": 0.005,
+    "prompt_weight_decay": 0.0005
+  },
+  "prompt_variant": "param_control",
+  "regularization_schedule": {
+    "budget_warmup_delay_epochs": 0,
+    "budget_warmup_epochs": 50,
+    "lambda_budget": 0.1,
+    "lambda_message_norm": 0.05,
+    "message_norm_target": 0.2,
+    "message_norm_warmup_delay_epochs": 0,
+    "message_norm_warmup_epochs": 20
+  },
+  "route_budget": 0.35,
+  "run_dir": "/Users/jackson/IdeaRebuild/outputs/prompt_activation_probe/Actor/20260605_210430/seed_1/budget_0p35",
+  "seed": 1,
+  "selected_route_budget": 0.35,
+  "selection_metric": "val_acc",
+  "source_dim": 1433,
+  "split_counts": {
+    "test": {
+      "per_class": [
+        818,
+        1302,
+        1595,
+        1780,
+        1930
+      ],
+      "total": 7425
+    },
+    "train": {
+      "per_class": [
+        5,
+        5,
+        5,
+        5,
+        5
+      ],
+      "total": 25
+    },
+    "val": {
+      "per_class": [
+        30,
+        30,
+        30,
+        30,
+        30
+      ],
+      "total": 150
+    }
+  },
+  "split_seed": 1,
+  "stopped_epoch": 50,
+  "structural_cache": {
+    "structural_cache_enabled": true,
+    "structural_cache_reason": "unsupported_prompt_variant",
+    "structural_cache_used": false
+  },
+  "train_prompt_module": true,
+  "trainable_parameters": {
+    "actual_trainable_parameter_count": 828790,
+    "input_aligner_trainable_parameter_count": 0,
+    "model_trainable_parameter_count": 0,
+    "prompt_module_trainable_parameter_count": 828790,
+    "trainable_parameter_groups": {
+      "input_aligner": [],
+      "model": [],
+      "prompt_module": [
+        "prompt_module.gamma_logit",
+        "prompt_module.control_sem.0.weight",
+        "prompt_module.control_sem.0.bias",
+        "prompt_module.control_sem.3.weight",
+        "prompt_module.control_sem.3.bias",
+        "prompt_module.control_struct.0.weight",
+        "prompt_module.control_struct.0.bias",
+        "prompt_module.control_struct.3.weight",
+        "prompt_module.control_struct.3.bias",
+        "prompt_module.gate.0.weight",
+        "prompt_module.gate.0.bias",
+        "prompt_module.gate.3.weight",
+        "prompt_module.gate.3.bias"
+      ]
+    },
+    "trainable_parameter_names": [
+      "prompt_module.gamma_logit",
+      "prompt_module.control_sem.0.weight",
+      "prompt_module.control_sem.0.bias",
+      "prompt_module.control_sem.3.weight",
+      "prompt_module.control_sem.3.bias",
+      "prompt_module.control_struct.0.weight",
+      "prompt_module.control_struct.0.bias",
+      "prompt_module.control_struct.3.weight",
+      "prompt_module.control_struct.3.bias",
+      "prompt_module.gate.0.weight",
+      "prompt_module.gate.0.bias",
+      "prompt_module.gate.3.weight",
+      "prompt_module.gate.3.bias"
+    ]
+  }
+}

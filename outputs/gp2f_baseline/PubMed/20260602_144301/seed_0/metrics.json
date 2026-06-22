@@ -1,0 +1,72 @@
+{
+  "best": {
+    "adapter_beta_mean": 0.019259772263467312,
+    "adapter_beta_std": 0.00013312213811067476,
+    "alpha": 0.4973967969417572,
+    "best_epoch": 13.0,
+    "branch_cosine": 1.0,
+    "test_acc": 0.5094329714775085,
+    "test_macro_f1": 0.5001755058765411,
+    "train_acc": 0.8666666746139526,
+    "train_macro_f1": 0.8703704277674357,
+    "val_acc": 0.5777778029441833,
+    "val_macro_f1": 0.5203379988670349
+  },
+  "best_checkpoint_path": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_144301/seed_0/best_model.pt",
+  "checkpoint_path": "/Users/jackson/IdeaRebuild/pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl",
+  "dataset": "PubMed",
+  "early_stop_metric": "val_acc",
+  "early_stopped": true,
+  "environment": {
+    "cuda_available": "False",
+    "cuda_device": "cpu",
+    "python": "3.14.0",
+    "torch": "2.12.0",
+    "torch_geometric": "2.7.0"
+  },
+  "final": {
+    "alpha": 0.4839186668395996,
+    "branch_cosine": 0.999107301235199,
+    "test_acc": 0.515959620475769,
+    "test_macro_f1": 0.5287437736988068,
+    "train_acc": 1.0,
+    "train_macro_f1": 1.0,
+    "val_acc": 0.5444444417953491,
+    "val_macro_f1": 0.5345163146654764
+  },
+  "hidden_dim": 128,
+  "num_classes": 3,
+  "num_features": 500,
+  "num_nodes": 19717,
+  "run_dir": "/Users/jackson/IdeaRebuild/outputs/gp2f_baseline/PubMed/20260602_144301/seed_0",
+  "seed": 0,
+  "source_dim": 1433,
+  "split_counts": {
+    "test": {
+      "per_class": [
+        4068,
+        7704,
+        7840
+      ],
+      "total": 19612
+    },
+    "train": {
+      "per_class": [
+        5,
+        5,
+        5
+      ],
+      "total": 15
+    },
+    "val": {
+      "per_class": [
+        30,
+        30,
+        30
+      ],
+      "total": 90
+    }
+  },
+  "split_seed": 0,
+  "stopped_epoch": 53
+}
