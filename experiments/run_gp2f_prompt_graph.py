@@ -37,6 +37,7 @@ from models import (
     HeterophilyAwarePromptAdapter,
     P21LiteAdaptiveFilter,
     P21V2HeteroFilter,
+    P22ClassPatternEnrichmentBank,
     PromptAwareGP2F,
     PromptGraphModuleP1,
     UtilitySupervisedPatternPromptRouter,
@@ -98,6 +99,7 @@ PROMPT_GRAPH_VARIANTS = {
     "p20_utility_supervised_pattern_prompt_router",
     "p21_lite_adaptive_filter",
     "p21_v2_hetero_filter",
+    "p22_class_pattern_enrichment_bank",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -128,6 +130,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         "p20_utility_supervised_pattern_prompt_router",
         "p21_lite_adaptive_filter",
         "p21_v2_hetero_filter",
+        "p22_class_pattern_enrichment_bank",
     }
     if variant == "noprompt" or variant in adapter_variants:
         prompt_graph["enabled"] = False
@@ -237,11 +240,46 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
             "p20_utility_supervised_pattern_prompt_router",
             "p21_lite_adaptive_filter",
             "p21_v2_hetero_filter",
+            "p22_class_pattern_enrichment_bank",
         }:
             training.setdefault("freeze_base_model", False)
             training.setdefault("log_every", 5)
             training["train_prompt_adapter"] = True
-            if variant in {"p21_lite_adaptive_filter", "p21_v2_hetero_filter"}:
+            if variant == "p22_class_pattern_enrichment_bank":
+                prompt_adapter.setdefault("module_type", "p22_class_pattern_enrichment_bank")
+                prompt_adapter.setdefault("num_patterns", 6)
+                prompt_adapter.setdefault("pattern_dim", 32)
+                prompt_adapter.setdefault("dropout", 0.0)
+                prompt_adapter.setdefault("pattern_init", "kmeans_all_signature")
+                prompt_adapter.setdefault("pattern_init_use_labels", False)
+                prompt_adapter.setdefault("class_pattern_smoothing", 0.5)
+                prompt_adapter.setdefault("pattern_temperature_init", 0.70)
+                prompt_adapter.setdefault("pattern_temperature_final", 0.25)
+                prompt_adapter.setdefault("pattern_temperature_warmdown_epochs", 50)
+                prompt_adapter.setdefault("pattern_scale_init", 0.10)
+                prompt_adapter.setdefault("pattern_scale_max", 1.0)
+                prompt_adapter.setdefault("pattern_scale_warmup_epochs", 20)
+                prompt_adapter.setdefault("use_pattern_gate", False)
+                prompt_adapter["use_candidate_pool"] = False
+                prompt_adapter["candidate_pool_ratio"] = 1.0
+                training["freeze_base_model"] = True
+                training["train_prompt_adapter"] = True
+                training["prompt_adapter_update_mask"] = "all"
+                training["prompt_adapter_loss_mask"] = "query"
+                training["lambda_prompt_adapter_update_norm"] = 0.0
+                training["lambda_prompt_adapter_gate_budget"] = 0.0
+                training["lambda_prompt_adapter_message_help"] = 0.0
+                training["lambda_prompt_adapter_utility_gate"] = 0.0
+                training["lambda_prompt_router_pattern_balance"] = 0.0
+                training["lambda_prompt_router_pattern_supervision"] = 0.0
+                training["lambda_prompt_router_pattern_utility"] = 0.0
+                training["lambda_prompt_router_class_pattern_reliability"] = 0.0
+                training.setdefault("lambda_p22_pattern_only", 0.2)
+                training.setdefault("lambda_p22_pattern_reg", 0.005)
+                training.setdefault("prompt_adapter_episode_count_per_epoch", 3)
+                training.setdefault("lambda_prompt_adapter_gate_consistency", 0.0)
+                training.setdefault("lambda_prompt_adapter_delta_consistency", 0.0)
+            elif variant in {"p21_lite_adaptive_filter", "p21_v2_hetero_filter"}:
                 prompt_adapter.setdefault(
                     "module_type",
                     "p21_v2_hetero_filter" if variant == "p21_v2_hetero_filter" else "p21_lite_adaptive_filter",
@@ -478,6 +516,20 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                         "prompt_router_expert_utility_probe_norm",
                         training["prompt_router_expert_utility_probe_norm"],
                     )
+            if variant == "p22_class_pattern_enrichment_bank":
+                prompt_adapter["use_candidate_pool"] = False
+                prompt_adapter["candidate_pool_ratio"] = 1.0
+                training["freeze_base_model"] = True
+                training["prompt_adapter_update_mask"] = "all"
+                training["prompt_adapter_loss_mask"] = "query"
+                training["lambda_prompt_adapter_update_norm"] = 0.0
+                training["lambda_prompt_adapter_gate_budget"] = 0.0
+                training["lambda_prompt_adapter_message_help"] = 0.0
+                training["lambda_prompt_adapter_utility_gate"] = 0.0
+                training["lambda_prompt_router_pattern_balance"] = 0.0
+                training["lambda_prompt_router_pattern_supervision"] = 0.0
+                training["lambda_prompt_router_pattern_utility"] = 0.0
+                training["lambda_prompt_router_class_pattern_reliability"] = 0.0
             # Reuse p18-style episodic consistency.
             training.setdefault("prompt_adapter_episode_count_per_epoch", 3)
             training.setdefault("lambda_prompt_adapter_gate_consistency", 0.02)
@@ -834,6 +886,7 @@ def _build_prompt_adapter_module(
     | UtilitySupervisedPatternPromptRouter
     | P21LiteAdaptiveFilter
     | P21V2HeteroFilter
+    | P22ClassPatternEnrichmentBank
     | None
 ):
     if not bool(prompt_adapter_cfg.get("enabled", False)):
@@ -849,6 +902,8 @@ def _build_prompt_adapter_module(
         return P21LiteAdaptiveFilter(source_dim, hidden_dim, resolved_cfg).to(device)
     if module_type == "p21_v2_hetero_filter":
         return P21V2HeteroFilter(source_dim, hidden_dim, resolved_cfg).to(device)
+    if module_type == "p22_class_pattern_enrichment_bank":
+        return P22ClassPatternEnrichmentBank(source_dim, hidden_dim, resolved_cfg).to(device)
     if module_type == "hetero_adapter":
         return HeterophilyAwarePromptAdapter(source_dim, hidden_dim, resolved_cfg).to(device)
     raise ValueError(f"Unsupported prompt_adapter.module_type={module_type!r}")
@@ -1849,7 +1904,7 @@ def _needs_no_prompt_pool_evidence(prompt_graph_module: PromptGraphModuleP1 | No
 def _forward_prompt_adapter(
     *,
     model: FaithfulGP2F,
-    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | P21LiteAdaptiveFilter | P21V2HeteroFilter,
+    prompt_adapter_module: HeterophilyAwarePromptAdapter | ClassConditionedPatternPromptRouter | P21LiteAdaptiveFilter | P21V2HeteroFilter | P22ClassPatternEnrichmentBank,
     z: torch.Tensor,
     edge_index: torch.Tensor,
     update_mask: torch.Tensor | None = None,
@@ -1881,7 +1936,8 @@ def _forward_prompt_adapter(
     h_adp = adapter_out["h_adp"]
     alpha = model.alpha
     h_mix = alpha * h_pre + (1.0 - alpha) * h_adp
-    logits = model.classifier(h_mix)
+    adapter_logits = adapter_out.get("logits")
+    logits = adapter_logits if isinstance(adapter_logits, torch.Tensor) else model.classifier(h_mix)
     model_out = {
         "logits": logits,
         "h_pre": h_pre,
@@ -2099,6 +2155,10 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
         "p21_low_two_discrepancy": scalar("p21_low_two_discrepancy"),
         "p21_no_prompt_entropy": scalar("p21_no_prompt_entropy"),
         "p21_no_prompt_margin": scalar("p21_no_prompt_margin"),
+        "p22_pattern_scale": scalar("pattern_scale"),
+        "p22_pattern_reg": scalar("pattern_reg"),
+        "p22_logit_bias_norm": scalar("logit_bias"),
+        "p22_pattern_evidence_norm": scalar("pattern_evidence"),
     }
 
 
@@ -5567,6 +5627,8 @@ def run_single(
     lambda_prompt_router_class_pattern_reliability = float(
         training_cfg.get("lambda_prompt_router_class_pattern_reliability", 0.0)
     )
+    lambda_p22_pattern_only = float(training_cfg.get("lambda_p22_pattern_only", 0.0))
+    lambda_p22_pattern_reg = float(training_cfg.get("lambda_p22_pattern_reg", 0.0))
     lambda_prompt_router_deployment_utility = float(
         training_cfg.get("lambda_prompt_router_deployment_utility", 0.0)
     )
@@ -5746,6 +5808,8 @@ def run_single(
             prompt_graph_module.train()
         if prompt_adapter_module is not None:
             prompt_adapter_module.train()
+            if hasattr(prompt_adapter_module, "set_epoch"):
+                prompt_adapter_module.set_epoch(epoch)
         optimizer.zero_grad()
 
         support_mask, query_mask, support_query_stats = _support_query_masks_for_epoch(
@@ -5808,6 +5872,8 @@ def run_single(
         prompt_adapter_pattern_supervision = z.new_tensor(0.0)
         prompt_adapter_pattern_utility = z.new_tensor(0.0)
         prompt_adapter_class_pattern_reliability = z.new_tensor(0.0)
+        p22_pattern_only = z.new_tensor(0.0)
+        p22_pattern_reg = z.new_tensor(0.0)
         prompt_adapter_deployment_utility = z.new_tensor(0.0)
         prompt_adapter_expert_utility_supervision = z.new_tensor(0.0)
         prompt_adapter_pattern_supervision_stats = {
@@ -5938,6 +6004,8 @@ def run_single(
             pattern_utility_losses: list[torch.Tensor] = []
             class_pattern_reliability_losses: list[torch.Tensor] = []
             deployment_utility_losses: list[torch.Tensor] = []
+            p22_pattern_only_losses: list[torch.Tensor] = []
+            p22_pattern_reg_losses: list[torch.Tensor] = []
             p21_channel_expert_losses: list[torch.Tensor] = []
             p21_channel_utility_losses: list[torch.Tensor] = []
             p21_gate_utility_losses: list[torch.Tensor] = []
@@ -6017,6 +6085,17 @@ def run_single(
                         graph.y[episode_loss_mask],
                     )
                 )
+                if "pattern_evidence" in episode_adapter_out:
+                    p22_logits = episode_adapter_out["pattern_evidence"]
+                    p22_pattern_only_losses.append(F.cross_entropy(p22_logits[episode_loss_mask], graph.y[episode_loss_mask]))
+                    p22_reg_value = episode_adapter_out.get("pattern_reg")
+                    if isinstance(p22_reg_value, torch.Tensor):
+                        p22_pattern_reg_losses.append(p22_reg_value)
+                    else:
+                        p22_pattern_reg_losses.append(z.new_tensor(0.0))
+                else:
+                    p22_pattern_only_losses.append(z.new_tensor(0.0))
+                    p22_pattern_reg_losses.append(z.new_tensor(0.0))
                 update_losses.append(prompt_adapter_update_norm_loss(episode_adapter_out, episode_update_mask))
                 budget_losses.append(
                     prompt_adapter_gate_budget_loss(
@@ -6274,6 +6353,8 @@ def run_single(
             prompt_adapter_pattern_supervision = torch.stack(pattern_supervision_losses).mean()
             prompt_adapter_pattern_utility = torch.stack(pattern_utility_losses).mean()
             prompt_adapter_class_pattern_reliability = torch.stack(class_pattern_reliability_losses).mean()
+            p22_pattern_only = torch.stack(p22_pattern_only_losses).mean()
+            p22_pattern_reg = torch.stack(p22_pattern_reg_losses).mean()
             prompt_adapter_deployment_utility = torch.stack(deployment_utility_losses).mean()
             p21_channel_expert_utility = torch.stack(p21_channel_expert_losses).mean()
             p21_channel_utility = torch.stack(p21_channel_utility_losses).mean()
@@ -6850,6 +6931,8 @@ def run_single(
             + lambda_prompt_router_pattern_supervision * prompt_adapter_pattern_supervision
             + lambda_prompt_router_pattern_utility * prompt_adapter_pattern_utility
             + lambda_prompt_router_class_pattern_reliability * prompt_adapter_class_pattern_reliability
+            + lambda_p22_pattern_only * p22_pattern_only
+            + lambda_p22_pattern_reg * p22_pattern_reg
             + effective_lambda_deployment_utility * prompt_adapter_deployment_utility
             + effective_lambda_p21_channel_expert * p21_channel_expert_utility
             + effective_lambda_p21_channel_utility * p21_channel_utility
@@ -6913,6 +6996,8 @@ def run_single(
             "prompt_router_class_pattern_reliability_loss": float(
                 prompt_adapter_class_pattern_reliability.detach().item()
             ),
+            "p22_pattern_only_loss": float(p22_pattern_only.detach().item()),
+            "p22_pattern_reg_loss": float(p22_pattern_reg.detach().item()),
             "prompt_router_deployment_utility_loss": float(prompt_adapter_deployment_utility.detach().item()),
             "p21_channel_expert_utility_loss": float(p21_channel_expert_utility.detach().item()),
             "p21_channel_utility_loss": float(p21_channel_utility.detach().item()),
@@ -6955,6 +7040,8 @@ def run_single(
             "lambda_prompt_router_pattern_supervision": lambda_prompt_router_pattern_supervision,
             "lambda_prompt_router_pattern_utility": lambda_prompt_router_pattern_utility,
             "lambda_prompt_router_class_pattern_reliability": lambda_prompt_router_class_pattern_reliability,
+            "lambda_p22_pattern_only": lambda_p22_pattern_only,
+            "lambda_p22_pattern_reg": lambda_p22_pattern_reg,
             "lambda_prompt_router_deployment_utility": lambda_prompt_router_deployment_utility,
             "lambda_p21_channel_expert_utility": lambda_p21_channel_expert_utility,
             "lambda_p21_channel_expert_utility_after_warmup": lambda_p21_channel_expert_utility_after_warmup,

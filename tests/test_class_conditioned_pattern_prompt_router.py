@@ -10,6 +10,7 @@ from models.class_conditioned_pattern_prompt_router import (
 from models.hetero_prompt_adapter import prompt_adapter_message_help_loss
 from models.p21_adaptive_filter import P21LiteAdaptiveFilter
 from models.p21_v2_hetero_filter import P21V2HeteroFilter
+from models.p22_class_pattern_enrichment import P22ClassPatternEnrichmentBank
 from models.utility_supervised_pattern_prompt_router import UtilitySupervisedPatternPromptRouter
 
 
@@ -58,11 +59,26 @@ def _p21_v2_filter(**overrides) -> P21V2HeteroFilter:
     return P21V2HeteroFilter(3, 6, config)
 
 
+def _p22_bank(**overrides) -> P22ClassPatternEnrichmentBank:
+    config = {
+        "dropout": 0.0,
+        "num_classes": 3,
+        "num_patterns": 4,
+        "pattern_dim": 8,
+        "pattern_encoder_hidden_dim": 12,
+        "pattern_init": "kmeans_all_signature",
+        "pattern_scale_warmup_epochs": 0,
+    }
+    config.update(overrides)
+    return P22ClassPatternEnrichmentBank(3, 6, config)
+
+
 def test_consumes_base_logits_flag() -> None:
     assert ClassConditionedPatternPromptRouter.consumes_base_logits is True
     assert UtilitySupervisedPatternPromptRouter.consumes_base_logits is True
     assert P21LiteAdaptiveFilter.consumes_base_logits is True
     assert P21V2HeteroFilter.consumes_base_logits is True
+    assert P22ClassPatternEnrichmentBank.consumes_base_logits is True
 
 
 def test_forward_shapes_and_routing_normalisation() -> None:
@@ -221,6 +237,52 @@ def test_pattern_router_can_start_with_low_reject_prior() -> None:
         torch.full_like(pattern_mean[1:], 0.95 / 5.0),
         atol=1e-5,
     )
+
+
+def test_p22_pattern_enrichment_outputs_logits_without_hidden_update() -> None:
+    z, edge_index, h_adp = _toy_graph()
+    bank = _p22_bank(pattern_scale_init=0.25, pattern_scale_max=1.0)
+    labels = torch.tensor([0, 1, 2, 1, 0])
+    support_mask = torch.tensor([True, True, True, False, False])
+    base_logits = torch.randn(5, 3)
+    out = bank(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=base_logits,
+        labels=labels,
+        support_mask=support_mask,
+    )
+
+    assert out["h_adp"] is h_adp
+    assert out["logits"].shape == (5, 3)
+    assert out["pattern_evidence"].shape == (5, 3)
+    assert out["pattern_weights"].shape == (5, 4)
+    assert torch.allclose(out["pattern_weights"].sum(dim=-1), torch.ones(5), atol=1e-5)
+    assert out["prompt_update_norm"].item() == 0.0
+    assert torch.allclose(out["logits"], base_logits.detach() + out["logit_bias"], atol=1e-6)
+
+
+def test_p22_detaches_base_logits_but_trains_pattern_branch() -> None:
+    z, edge_index, h_adp = _toy_graph()
+    bank = _p22_bank(pattern_init="random", pattern_scale_init=0.5, pattern_scale_max=1.0)
+    labels = torch.tensor([0, 1, 2, 1, 0])
+    support_mask = torch.tensor([True, True, True, False, False])
+    base_logits = torch.randn(5, 3, requires_grad=True)
+    out = bank(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=base_logits,
+        labels=labels,
+        support_mask=support_mask,
+    )
+    loss = torch.nn.functional.cross_entropy(out["pattern_evidence"], labels) + out["logits"].pow(2).mean()
+    loss.backward()
+
+    assert base_logits.grad is None
+    grads = [p.grad for p in bank.parameters() if p.requires_grad]
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum().item() > 0 for g in grads)
 
 
 def test_pattern_supervision_trains_router_toward_helpful_pattern() -> None:
