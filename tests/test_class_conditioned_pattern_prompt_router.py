@@ -317,6 +317,27 @@ def test_p22_reliability_gate_gates_logit_bias_and_normalizes_basis() -> None:
     assert torch.allclose(out["ungated_logits"], base_logits.detach() + out["ungated_logit_bias"], atol=1e-6)
 
 
+def test_p22_cyclic_anchor_initializes_pattern_basis_logits() -> None:
+    bank = _p22_bank(
+        pattern_init="random",
+        basis_types=[
+            "ego_logprob",
+            "onehop_logprob",
+            "twohop_logprob",
+            "highpass_ego_onehop",
+            "highpass_onehop_twohop",
+        ],
+        num_bases=5,
+        pattern_basis_init="cyclic_anchor",
+        pattern_basis_anchor_logit=2.0,
+        pattern_basis_off_logit=-2.0,
+    )
+
+    logits = bank.pattern_basis_logits.detach()
+    assert torch.equal(logits.argmax(dim=-1), torch.tensor([0, 1, 2, 3]))
+    assert torch.allclose(logits[0], torch.tensor([2.0, -2.0, -2.0, -2.0, -2.0]))
+
+
 def test_p22_deployment_loss_trains_reliability_gate() -> None:
     from experiments.run_gp2f_prompt_graph import _p22_deployment_losses
 
@@ -357,15 +378,95 @@ def test_p22_deployment_loss_trains_reliability_gate() -> None:
         labels=labels,
         mask=torch.ones(5, dtype=torch.bool),
         gate_margin=0.0005,
+        gate_target_mode="tri_state",
+        gate_positive_margin=0.0001,
+        gate_negative_margin=-0.0001,
+        gate_ignore_neutral=True,
         anti_harm_margin=0.0,
         gain_cap=0.02,
+        gate_budget_max=0.35,
+        gate_budget_warmup_epochs=0,
+        epoch=10,
+        gate_harm_negative_margin=-0.0001,
     )
-    loss = losses["deployment"] + losses["gate"] + losses["anti_harm"] + 0.2 * losses["gain_reward"]
+    loss = (
+        losses["deployment"]
+        + losses["gate"]
+        + losses["anti_harm"]
+        + losses["gate_budget"]
+        + losses["gate_harm"]
+        + 0.2 * losses["gain_reward"]
+    )
     loss.backward()
 
     assert stats["p22_gate_bce_loss"] > 0.0
+    assert "p22_gate_target_ignore_ratio" in stats
+    assert "p22_gate_harm_loss" in stats
     gate_grads = [p.grad for p in bank.reliability_gate.parameters()]
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum().item() > 0 for g in gate_grads)
+
+
+def test_p22_deployment_loss_can_use_crossfit_stability_target() -> None:
+    from experiments.run_gp2f_prompt_graph import _p22_deployment_losses
+
+    z, edge_index, h_adp = _toy_graph()
+    bank = _p22_bank(
+        pattern_init="random",
+        basis_types=[
+            "ego_logprob",
+            "onehop_logprob",
+            "twohop_logprob",
+            "highpass_ego_onehop",
+            "highpass_onehop_twohop",
+        ],
+        num_bases=5,
+        enrichment_weight=0.0,
+        use_class_transition=False,
+        use_reliability_gate=True,
+        reliability_gate_hidden_dim=8,
+        reliability_gate_init_bias=-2.0,
+    )
+    labels = torch.tensor([0, 1, 2, 1, 0])
+    support_mask = torch.tensor([True, True, True, False, False])
+    base_logits = torch.randn(5, 3)
+    out = bank(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=base_logits,
+        labels=labels,
+        support_mask=support_mask,
+    )
+    losses, stats = _p22_deployment_losses(
+        adapter_out=out,
+        base_logits=base_logits,
+        labels=labels,
+        mask=torch.ones(5, dtype=torch.bool),
+        gate_margin=0.0005,
+        gate_target_mode="tri_state",
+        gate_positive_margin=0.010,
+        gate_negative_margin=-0.005,
+        gate_ignore_neutral=True,
+        anti_harm_margin=0.0,
+        gain_cap=0.01,
+        gate_budget_max=0.35,
+        gate_budget_warmup_epochs=0,
+        epoch=10,
+        gate_harm_negative_margin=-0.005,
+        gate_use_crossfit_stability=True,
+        gate_stability_helpful_rate=torch.tensor([0.8, 0.1, 0.8, 0.1, 0.1]),
+        gate_stability_harmful_rate=torch.tensor([0.1, 0.6, 0.1, 0.6, 0.1]),
+        gate_stability_seen=torch.full((5,), 2.0),
+        gate_helpful_stability_threshold=0.70,
+        gate_harmful_stability_threshold=0.50,
+        gate_stability_min_seen=2,
+    )
+
+    assert losses["gate"].item() > 0.0
+    assert stats["p22_gate_stability_enabled"] == 1.0
+    assert stats["p22_gate_stability_enough_ratio"] == 1.0
+    assert stats["p22_gate_target_positive_ratio"] > 0.0
+    assert stats["p22_gate_target_negative_ratio"] > 0.0
 
 
 def test_p22_detaches_base_logits_but_trains_pattern_branch() -> None:
@@ -464,6 +565,50 @@ def test_p22_v03_variant_config_enables_reliability_calibrated_basis() -> None:
     assert cfg["training"]["lambda_p22_gate"] == 0.5
     assert cfg["training"]["lambda_p22_anti_harm"] == 1.0
     assert cfg["training"]["lambda_p22_gain_reward"] == 0.2
+
+
+def test_p22_v031_variant_config_is_conservative_and_isolated() -> None:
+    cfg = _config_for_variant(
+        {
+            "experiment": {"prompt_variant": "p22_v031_conservative_reliability_basis_bank"},
+            "prompt_adapter": {"enabled": True},
+            "training": {
+                "lambda_prompt_router_pattern_supervision": 9.0,
+                "lambda_prompt_adapter_gate_budget": 9.0,
+                "prompt_adapter_update_mask": "support",
+                "prompt_adapter_loss_mask": "support",
+            },
+        },
+        "p22_v031_conservative_reliability_basis_bank",
+    )
+
+    assert cfg["prompt_graph"]["enabled"] is False
+    assert cfg["prompt_adapter"]["module_type"] == "p22_class_pattern_enrichment_bank"
+    assert cfg["prompt_adapter"]["pattern_basis_init"] == "cyclic_anchor"
+    assert cfg["prompt_adapter"]["pattern_scale_init"] == 0.01
+    assert cfg["prompt_adapter"]["pattern_scale_max"] == 0.30
+    assert cfg["prompt_adapter"]["pattern_temperature_final"] == 0.40
+    assert cfg["prompt_adapter"]["reliability_gate_init_bias"] == -2.5
+    assert cfg["prompt_adapter"]["use_candidate_pool"] is False
+    assert cfg["training"]["prompt_adapter_update_mask"] == "all"
+    assert cfg["training"]["prompt_adapter_loss_mask"] == "query"
+    assert cfg["training"]["lambda_prompt_router_pattern_supervision"] == 0.0
+    assert cfg["training"]["lambda_prompt_adapter_gate_budget"] == 0.0
+    assert cfg["training"]["p22_gate_target_mode"] == "tri_state"
+    assert cfg["training"]["p22_gate_positive_margin"] == 0.010
+    assert cfg["training"]["p22_gate_negative_margin"] == -0.005
+    assert cfg["training"]["p22_gate_use_crossfit_stability"] is True
+    assert cfg["training"]["p22_gate_helpful_stability_threshold"] == 0.70
+    assert cfg["training"]["p22_gate_harmful_stability_threshold"] == 0.50
+    assert cfg["training"]["p22_gate_stability_min_seen"] == 2
+    assert cfg["training"]["lambda_p22_gain_reward"] == 0.05
+    assert cfg["training"]["lambda_p22_gate_budget"] == 0.2
+    assert cfg["training"]["lambda_p22_gate_harm"] == 0.5
+    assert cfg["training"]["lambda_p22_scale_reg"] == 0.01
+    assert cfg["training"]["p22_safe_checkpoint_enabled"] is True
+    assert cfg["training"]["p22_safe_checkpoint_metric"] == "val_acc_plus_val_delta_ce"
+    assert cfg["training"]["p22_safe_checkpoint_min_val_delta_ce"] == -0.0005
+    assert cfg["training"]["p22_freeze_pattern_after_epoch"] == 180
 
 
 def test_pattern_supervision_trains_router_toward_helpful_pattern() -> None:

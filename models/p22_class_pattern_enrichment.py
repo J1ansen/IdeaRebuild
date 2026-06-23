@@ -146,7 +146,18 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             nn.Linear(encoder_hidden, self.pattern_dim),
         )
         self.pattern_tokens = nn.Parameter(torch.randn(self.num_patterns, self.pattern_dim) * 0.02)
-        self.pattern_basis_logits = nn.Parameter(torch.zeros(self.num_patterns, self.num_bases))
+        self.pattern_basis_logits = nn.Parameter(torch.empty(self.num_patterns, self.num_bases))
+        pattern_basis_init = str(self.config.get("pattern_basis_init", "zeros"))
+        with torch.no_grad():
+            if pattern_basis_init == "cyclic_anchor":
+                self.pattern_basis_logits.fill_(float(self.config.get("pattern_basis_off_logit", -2.0)))
+                anchor_logit = float(self.config.get("pattern_basis_anchor_logit", 2.0))
+                for pattern_idx in range(self.num_patterns):
+                    self.pattern_basis_logits[pattern_idx, pattern_idx % self.num_bases] = anchor_logit
+            elif pattern_basis_init == "zeros":
+                self.pattern_basis_logits.zero_()
+            else:
+                raise ValueError(f"Unsupported P22 pattern_basis_init={pattern_basis_init!r}")
         self.reliability_feature_dim = 10
         if self.use_reliability_gate:
             gate_hidden = int(self.config.get("reliability_gate_hidden_dim", 32))
@@ -501,12 +512,14 @@ class P22ClassPatternEnrichmentBank(nn.Module):
                 pattern_evidence=pattern_evidence,
                 ungated_logit_bias=ungated_logit_bias,
             )
-            raw_reliability_gate = torch.sigmoid(self.reliability_gate(reliability_features)).squeeze(-1)
+            reliability_gate_logit = self.reliability_gate(reliability_features).squeeze(-1)
+            raw_reliability_gate = torch.sigmoid(reliability_gate_logit)
             reliability_gate = self.reliability_gate_min + (
                 self.reliability_gate_max - self.reliability_gate_min
             ) * raw_reliability_gate
         else:
             reliability_features = h_adp.new_zeros(h_adp.size(0), self.reliability_feature_dim)
+            reliability_gate_logit = h_adp.new_full((h_adp.size(0),), 20.0)
             raw_reliability_gate = h_adp.new_ones(h_adp.size(0))
             reliability_gate = h_adp.new_ones(h_adp.size(0))
         effective_gate = reliability_gate
@@ -549,6 +562,7 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             "ungated_logits": ungated_logits,
             "pattern_scale": pattern_scale,
             "reliability_features": reliability_features.detach(),
+            "reliability_gate_logit": reliability_gate_logit,
             "reliability_gate": reliability_gate,
             "raw_reliability_gate": raw_reliability_gate,
             "effective_reliability_gate": effective_gate,
