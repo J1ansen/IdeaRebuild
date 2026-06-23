@@ -110,8 +110,11 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         self.enrichment_weight = float(self.config.get("enrichment_weight", 0.5))
         self.basis_weight_scale = float(self.config.get("basis_weight_scale", 1.0))
         self.use_class_transition = bool(self.config.get("use_class_transition", True))
+        self.transition_type = str(self.config.get("transition_type", "support_edges"))
         self.class_transition_smoothing = float(self.config.get("class_transition_smoothing", 0.5))
         self.basis_usage_entropy_floor = float(self.config.get("basis_usage_entropy_floor", 0.60))
+        self.normalize_basis_evidence = bool(self.config.get("normalize_basis_evidence", False))
+        self.basis_evidence_std_floor = float(self.config.get("basis_evidence_std_floor", 0.5))
         self.pattern_scale_max = float(self.config.get("pattern_scale_max", 1.0))
         pattern_scale_init = float(self.config.get("pattern_scale_init", 0.10))
         self.raw_pattern_scale = nn.Parameter(
@@ -124,6 +127,10 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         self.temperature_warmdown_epochs = int(self.config.get("pattern_temperature_warmdown_epochs", 50))
         self.normalize_evidence = bool(self.config.get("normalize_pattern_evidence", True))
         self.evidence_std_floor = float(self.config.get("pattern_evidence_std_floor", 0.5))
+        self.use_reliability_gate = bool(self.config.get("use_reliability_gate", False))
+        self.reliability_gate_min = float(self.config.get("reliability_gate_min", 0.0))
+        self.reliability_gate_max = float(self.config.get("reliability_gate_max", 1.0))
+        self.reliability_gate_detach_input = bool(self.config.get("reliability_gate_detach_input", True))
         self.use_pattern_gate = bool(self.config.get("use_pattern_gate", False))
         if self.use_pattern_gate:
             raise ValueError("P22 keeps use_pattern_gate disabled in the basis-supervised version")
@@ -140,6 +147,23 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         )
         self.pattern_tokens = nn.Parameter(torch.randn(self.num_patterns, self.pattern_dim) * 0.02)
         self.pattern_basis_logits = nn.Parameter(torch.zeros(self.num_patterns, self.num_bases))
+        self.reliability_feature_dim = 10
+        if self.use_reliability_gate:
+            gate_hidden = int(self.config.get("reliability_gate_hidden_dim", 32))
+            self.reliability_norm = nn.LayerNorm(self.reliability_feature_dim)
+            self.reliability_gate = nn.Sequential(
+                nn.Linear(self.reliability_feature_dim, gate_hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(gate_hidden, 1),
+            )
+            nn.init.constant_(
+                self.reliability_gate[-1].bias,
+                float(self.config.get("reliability_gate_init_bias", -2.0)),
+            )
+        else:
+            self.reliability_norm = nn.Identity()
+            self.reliability_gate = None
         self.register_buffer("pattern_tokens_initialized", torch.tensor(False), persistent=True)
 
     def set_epoch(self, epoch: int | float) -> None:
@@ -310,13 +334,26 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             labels_t = torch.zeros(num_nodes, dtype=torch.long, device=logits.device)
         else:
             labels_t = labels.to(device=logits.device, dtype=torch.long)
-        transition = estimate_class_transition_from_support(
-            labels=labels_t,
-            support_mask=support,
-            edge_index=edge_index,
-            num_classes=self.num_classes,
-            smoothing=self.class_transition_smoothing,
-        ).to(device=logits.device, dtype=logits.dtype)
+        if self.transition_type == "support_neighbor_prob":
+            transition = logits.new_full(
+                (self.num_classes, self.num_classes),
+                float(self.class_transition_smoothing),
+            )
+            for class_id in range(self.num_classes):
+                class_mask = support & (labels_t == class_id)
+                if bool(class_mask.any()):
+                    transition[class_id] = transition[class_id] + neigh_prob[class_mask].sum(dim=0)
+            transition = transition / transition.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        elif self.transition_type == "support_edges":
+            transition = estimate_class_transition_from_support(
+                labels=labels_t,
+                support_mask=support,
+                edge_index=edge_index,
+                num_classes=self.num_classes,
+                smoothing=self.class_transition_smoothing,
+            ).to(device=logits.device, dtype=logits.dtype)
+        else:
+            raise ValueError(f"Unsupported P22 transition_type={self.transition_type!r}")
 
         values: list[torch.Tensor] = []
         for basis_type in self.basis_types:
@@ -338,7 +375,62 @@ class P22ClassPatternEnrichmentBank(nn.Module):
                     values.append(logits.new_zeros(num_nodes, self.num_classes))
             else:
                 raise ValueError(f"Unsupported P22 basis type: {basis_type!r}")
-        return torch.stack(values, dim=1), transition
+        basis_evidence = torch.stack(values, dim=1)
+        if self.normalize_basis_evidence:
+            basis_evidence = basis_evidence - basis_evidence.mean(dim=-1, keepdim=True)
+            std = basis_evidence.std(dim=-1, keepdim=True).detach().clamp_min(self.basis_evidence_std_floor)
+            basis_evidence = basis_evidence / std
+        return basis_evidence, transition
+
+    def _reliability_features(
+        self,
+        *,
+        base_logits: torch.Tensor,
+        edge_index: torch.Tensor,
+        pattern_weights: torch.Tensor,
+        pattern_evidence: torch.Tensor,
+        ungated_logit_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = base_logits.detach().to(device=pattern_evidence.device, dtype=pattern_evidence.dtype)
+        prob = F.softmax(logits, dim=-1)
+        entropy = -(prob * prob.clamp_min(1e-12).log()).sum(dim=-1)
+        pattern_entropy = -(pattern_weights * pattern_weights.clamp_min(1e-12).log()).sum(dim=-1)
+        if prob.size(-1) > 1:
+            entropy = entropy / math.log(float(prob.size(-1)))
+        if pattern_weights.size(-1) > 1:
+            pattern_entropy = pattern_entropy / math.log(float(pattern_weights.size(-1)))
+        top2 = torch.topk(prob, k=min(2, prob.size(-1)), dim=-1).values
+        confidence = top2[:, 0]
+        margin = top2[:, 0] if top2.size(-1) == 1 else top2[:, 0] - top2[:, 1]
+        pattern_max = pattern_weights.max(dim=-1).values
+        evidence_norm = _minmax(pattern_evidence.detach().norm(dim=-1))
+        bias_norm = _minmax(ungated_logit_bias.detach().norm(dim=-1))
+        cosine = F.cosine_similarity(logits, pattern_evidence.detach(), dim=-1, eps=1e-12)
+        agree = (
+            logits.argmax(dim=-1) == pattern_evidence.detach().argmax(dim=-1)
+        ).to(dtype=pattern_evidence.dtype)
+        neigh_prob = mean_neighbor_summary(prob, edge_index, num_nodes=int(prob.size(0)))
+        neigh_entropy = -(neigh_prob * neigh_prob.clamp_min(1e-12).log()).sum(dim=-1)
+        if prob.size(-1) > 1:
+            neigh_entropy = neigh_entropy / math.log(float(prob.size(-1)))
+        degree_norm = self._degree_norm(edge_index, int(prob.size(0)), pattern_evidence)
+        features = torch.stack(
+            [
+                entropy,
+                margin,
+                confidence,
+                pattern_entropy,
+                pattern_max,
+                evidence_norm,
+                bias_norm,
+                cosine,
+                agree,
+                0.5 * (neigh_entropy + degree_norm),
+            ],
+            dim=-1,
+        )
+        features = features.detach() if self.reliability_gate_detach_input else features
+        return self.reliability_norm(features)
 
     def forward(
         self,
@@ -400,13 +492,32 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             std = pattern_evidence.std(dim=-1, keepdim=True).detach().clamp_min(self.evidence_std_floor)
             pattern_evidence = pattern_evidence / std
         pattern_scale = self._scale()
-        logit_bias = pattern_scale * pattern_evidence
+        ungated_logit_bias = pattern_scale * pattern_evidence
+        if self.use_reliability_gate and self.reliability_gate is not None:
+            reliability_features = self._reliability_features(
+                base_logits=base_logits,
+                edge_index=edge_index,
+                pattern_weights=pattern_weights,
+                pattern_evidence=pattern_evidence,
+                ungated_logit_bias=ungated_logit_bias,
+            )
+            raw_reliability_gate = torch.sigmoid(self.reliability_gate(reliability_features)).squeeze(-1)
+            reliability_gate = self.reliability_gate_min + (
+                self.reliability_gate_max - self.reliability_gate_min
+            ) * raw_reliability_gate
+        else:
+            reliability_features = h_adp.new_zeros(h_adp.size(0), self.reliability_feature_dim)
+            raw_reliability_gate = h_adp.new_ones(h_adp.size(0))
+            reliability_gate = h_adp.new_ones(h_adp.size(0))
+        effective_gate = reliability_gate
         if update_mask is not None:
             # The mask only gates deployment of evidence; support statistics stay
             # controlled by support_mask.
             mask = update_mask.to(device=h_adp.device, dtype=h_adp.dtype).unsqueeze(-1)
-            logit_bias = logit_bias * mask
+            effective_gate = effective_gate * mask.squeeze(-1)
+        logit_bias = ungated_logit_bias * effective_gate.unsqueeze(-1)
         logits = base_logits.detach().to(device=h_adp.device, dtype=h_adp.dtype) + logit_bias
+        ungated_logits = base_logits.detach().to(device=h_adp.device, dtype=h_adp.dtype) + ungated_logit_bias
 
         zero = h_adp.new_zeros(h_adp.shape)
         pattern_usage_mean = pattern_weights.mean(dim=0)
@@ -434,7 +545,13 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             "basis_pattern_evidence": basis_pattern_evidence,
             "basis_evidence": basis_evidence,
             "logit_bias": logit_bias,
+            "ungated_logit_bias": ungated_logit_bias,
+            "ungated_logits": ungated_logits,
             "pattern_scale": pattern_scale,
+            "reliability_features": reliability_features.detach(),
+            "reliability_gate": reliability_gate,
+            "raw_reliability_gate": raw_reliability_gate,
+            "effective_reliability_gate": effective_gate,
             "pattern_weights": pattern_weights,
             "pattern_logits": pattern_logits,
             "pattern_basis_weight": pattern_basis_weight,
@@ -457,18 +574,20 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             "delta": zero,
             "raw_delta": zero,
             "update": zero,
-            "gate": update_mask_eff.to(dtype=h_adp.dtype),
-            "raw_gate": update_mask_eff.to(dtype=h_adp.dtype),
+            "gate": effective_gate,
+            "raw_gate": reliability_gate,
             "prompt_update_norm": h_adp.new_tensor(0.0),
             "prompt_update_max_norm": h_adp.new_tensor(0.0),
             "prompt_raw_delta_norm": h_adp.new_tensor(0.0),
             "prompt_delta_norm": h_adp.new_tensor(0.0),
-            "prompt_gate_mean": update_mask_eff.to(dtype=h_adp.dtype).mean(),
-            "prompt_gate_min": update_mask_eff.to(dtype=h_adp.dtype).min(),
-            "prompt_gate_max": update_mask_eff.to(dtype=h_adp.dtype).max(),
-            "prompt_raw_gate_mean": update_mask_eff.to(dtype=h_adp.dtype).mean(),
-            "prompt_raw_gate_min": update_mask_eff.to(dtype=h_adp.dtype).min(),
-            "prompt_raw_gate_max": update_mask_eff.to(dtype=h_adp.dtype).max(),
+            "prompt_gate_mean": effective_gate.mean(),
+            "prompt_gate_min": effective_gate.min() if effective_gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "prompt_gate_max": effective_gate.max() if effective_gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "prompt_raw_gate_mean": reliability_gate.mean(),
+            "prompt_raw_gate_min": reliability_gate.min() if reliability_gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "prompt_raw_gate_max": reliability_gate.max() if reliability_gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "p22_gate_std": effective_gate.std(unbiased=False) if effective_gate.numel() > 0 else h_adp.new_tensor(0.0),
+            "p22_gate_open_ratio": (effective_gate > 0.5).to(dtype=h_adp.dtype).mean(),
             "prompt_update_mask_ratio": update_mask_eff.to(dtype=h_adp.dtype).mean(),
             "prompt_update_clip_ratio": h_adp.new_tensor(0.0),
             "high_frequency_norm": h_adp.new_tensor(0.0),

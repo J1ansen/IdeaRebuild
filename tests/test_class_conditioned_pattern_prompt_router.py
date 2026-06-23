@@ -269,6 +269,105 @@ def test_p22_pattern_enrichment_outputs_logits_without_hidden_update() -> None:
     assert out["basis_usage_loss"].item() >= 0.0
 
 
+def test_p22_reliability_gate_gates_logit_bias_and_normalizes_basis() -> None:
+    z, edge_index, h_adp = _toy_graph()
+    bank = _p22_bank(
+        pattern_init="random",
+        basis_types=[
+            "ego_logprob",
+            "onehop_logprob",
+            "twohop_logprob",
+            "highpass_ego_onehop",
+            "highpass_onehop_twohop",
+        ],
+        num_bases=5,
+        enrichment_weight=0.0,
+        basis_weight_scale=1.0,
+        use_class_transition=False,
+        normalize_basis_evidence=True,
+        use_reliability_gate=True,
+        reliability_gate_hidden_dim=8,
+        reliability_gate_init_bias=-2.0,
+        pattern_scale_init=0.2,
+        pattern_scale_max=1.0,
+    )
+    labels = torch.tensor([0, 1, 2, 1, 0])
+    support_mask = torch.tensor([True, True, True, False, False])
+    base_logits = torch.randn(5, 3)
+    out = bank(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=base_logits,
+        labels=labels,
+        support_mask=support_mask,
+    )
+
+    assert out["basis_evidence"].shape == (5, 5, 3)
+    assert torch.allclose(out["basis_evidence"].mean(dim=-1), torch.zeros(5, 5), atol=1e-5)
+    assert out["reliability_features"].shape == (5, 10)
+    assert out["reliability_gate"].shape == (5,)
+    assert torch.all(out["reliability_gate"] >= 0.0)
+    assert torch.all(out["reliability_gate"] <= 1.0)
+    assert torch.allclose(
+        out["logit_bias"],
+        out["ungated_logit_bias"] * out["effective_reliability_gate"].unsqueeze(-1),
+        atol=1e-6,
+    )
+    assert torch.allclose(out["ungated_logits"], base_logits.detach() + out["ungated_logit_bias"], atol=1e-6)
+
+
+def test_p22_deployment_loss_trains_reliability_gate() -> None:
+    from experiments.run_gp2f_prompt_graph import _p22_deployment_losses
+
+    z, edge_index, h_adp = _toy_graph()
+    bank = _p22_bank(
+        pattern_init="random",
+        basis_types=[
+            "ego_logprob",
+            "onehop_logprob",
+            "twohop_logprob",
+            "highpass_ego_onehop",
+            "highpass_onehop_twohop",
+        ],
+        num_bases=5,
+        enrichment_weight=0.0,
+        use_class_transition=False,
+        normalize_basis_evidence=True,
+        use_reliability_gate=True,
+        reliability_gate_hidden_dim=8,
+        reliability_gate_init_bias=-2.0,
+        pattern_scale_init=0.2,
+        pattern_scale_max=1.0,
+    )
+    labels = torch.tensor([0, 1, 2, 1, 0])
+    support_mask = torch.tensor([True, True, True, False, False])
+    base_logits = torch.randn(5, 3)
+    out = bank(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=base_logits,
+        labels=labels,
+        support_mask=support_mask,
+    )
+    losses, stats = _p22_deployment_losses(
+        adapter_out=out,
+        base_logits=base_logits,
+        labels=labels,
+        mask=torch.ones(5, dtype=torch.bool),
+        gate_margin=0.0005,
+        anti_harm_margin=0.0,
+        gain_cap=0.02,
+    )
+    loss = losses["deployment"] + losses["gate"] + losses["anti_harm"] + 0.2 * losses["gain_reward"]
+    loss.backward()
+
+    assert stats["p22_gate_bce_loss"] > 0.0
+    gate_grads = [p.grad for p in bank.reliability_gate.parameters()]
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum().item() > 0 for g in gate_grads)
+
+
 def test_p22_detaches_base_logits_but_trains_pattern_branch() -> None:
     z, edge_index, h_adp = _toy_graph()
     bank = _p22_bank(pattern_init="random", pattern_scale_init=0.5, pattern_scale_max=1.0)
@@ -307,6 +406,64 @@ def test_p22_support_class_transition_estimate() -> None:
     assert torch.allclose(transition.sum(dim=-1), torch.ones(3), atol=1e-6)
     # Support edge 0 -> 1 makes class 0 prefer class 1 neighbors over class 2.
     assert transition[0, 1] > transition[0, 2]
+
+
+def test_p22_support_neighbor_prob_transition_type() -> None:
+    z, edge_index, h_adp = _toy_graph()
+    bank = _p22_bank(
+        pattern_init="random",
+        basis_types=["class_transition"],
+        num_bases=1,
+        use_class_transition=True,
+        transition_type="support_neighbor_prob",
+    )
+    labels = torch.tensor([0, 1, 2, 1, 0])
+    support_mask = torch.tensor([True, True, True, False, False])
+    base_logits = torch.randn(5, 3)
+    out = bank(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=base_logits,
+        labels=labels,
+        support_mask=support_mask,
+    )
+
+    transition = out["transition_matrix"]
+    assert transition.shape == (3, 3)
+    assert torch.allclose(transition.sum(dim=-1), torch.ones(3), atol=1e-6)
+
+
+def test_p22_v03_variant_config_enables_reliability_calibrated_basis() -> None:
+    cfg = _config_for_variant(
+        {
+            "experiment": {"prompt_variant": "p22_reliability_calibrated_basis_bank"},
+            "prompt_adapter": {"enabled": True},
+        },
+        "p22_reliability_calibrated_basis_bank",
+    )
+
+    assert cfg["prompt_graph"]["enabled"] is False
+    assert cfg["prompt_adapter"]["module_type"] == "p22_class_pattern_enrichment_bank"
+    assert cfg["prompt_adapter"]["enrichment_weight"] == 0.0
+    assert cfg["prompt_adapter"]["use_class_transition"] is False
+    assert cfg["prompt_adapter"]["basis_types"] == [
+        "ego_logprob",
+        "onehop_logprob",
+        "twohop_logprob",
+        "highpass_ego_onehop",
+        "highpass_onehop_twohop",
+    ]
+    assert cfg["prompt_adapter"]["normalize_basis_evidence"] is True
+    assert cfg["prompt_adapter"]["use_reliability_gate"] is True
+    assert cfg["prompt_adapter"]["reliability_gate_init_bias"] == -2.0
+    assert cfg["training"]["p22_crossfit_enabled"] is True
+    assert cfg["training"]["p22_support_source"] == "episode"
+    assert cfg["training"]["p22_loss_source"] == "episode"
+    assert cfg["training"]["lambda_p22_deployment"] == 1.0
+    assert cfg["training"]["lambda_p22_gate"] == 0.5
+    assert cfg["training"]["lambda_p22_anti_harm"] == 1.0
+    assert cfg["training"]["lambda_p22_gain_reward"] == 0.2
 
 
 def test_pattern_supervision_trains_router_toward_helpful_pattern() -> None:
