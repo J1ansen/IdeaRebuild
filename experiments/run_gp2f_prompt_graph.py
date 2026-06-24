@@ -38,6 +38,7 @@ from models import (
     P21LiteAdaptiveFilter,
     P21V2HeteroFilter,
     P22ClassPatternEnrichmentBank,
+    P23V01PromptModule,
     PromptAwareGP2F,
     PromptGraphModuleP1,
     SelectiveDiscreteFeaturePromptGraph,
@@ -104,6 +105,7 @@ PROMPT_GRAPH_VARIANTS = {
     "p22_reliability_calibrated_basis_bank",
     "p22_v031_conservative_reliability_basis_bank",
     "p22_v04_minimal_transition_basis",
+    "p23_v0_1",
     "p23_selective_discrete_feature_prompting",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
@@ -202,6 +204,52 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         training.setdefault("early_stop_min_epochs", 80)
         training.setdefault("early_stop_patience", 60)
         training.setdefault("output_dir", "outputs/gp2f_prompt_p23_selective_discrete_feature_prompting")
+    if variant == "p23_v0_1":
+        prompt_graph["enabled"] = True
+        prompt_aware["enabled"] = False
+        prompt_adapter["enabled"] = False
+        prompt_graph.setdefault("module_type", "p23_v0_1")
+        prompt_graph.setdefault("feature_tokenizer", {"mode": "binary_nonzero", "topk": 8, "binary_threshold": 0.0})
+        prompt_graph.setdefault("risk", {"lambda_hetero": [0.25, 0.20, 0.20, 0.15, 0.20]})
+        prompt_graph.setdefault("graph_risk_weights", {"ego_neighbor": 0.40, "onehop_twohop": 0.30, "neighbor_variance": 0.30})
+        prompt_graph.setdefault("pool", {"adaptive_ratio": True, "rho_min": 0.08, "rho_max": 0.30, "rho_power": 1.0, "force_train_nodes": True})
+        prompt_graph.setdefault("feature_filter", {"min_df_pool": 2, "max_df_pool_ratio": 0.50, "max_df_global_ratio": 0.80})
+        prompt_graph.setdefault("prompt_graph", {"init_scope": "global_same_feature", "edge_type_prompt_to_node": 2})
+        prompt_graph.setdefault("receiver", {"max_update_norm": 0.05, "prompt_dropout": 0.10, "init_gate_bias": -2.0})
+        prompt_graph.setdefault("lambda_edge_l1", 0.0)
+        prompt_graph.setdefault("lambda_prompt_balance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_role_diversity", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_budget", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.0)
+        prompt_graph.setdefault("lambda_prompt_view_entropy", 0.0)
+        prompt_graph.setdefault("lambda_view_prior", 0.0)
+        prompt_graph.setdefault("lambda_class_route", 0.0)
+        prompt_graph.setdefault("lambda_key_proto", 0.0)
+        prompt_graph.setdefault("lambda_prompt_benefit_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_correction", 0.0)
+        prompt_graph.setdefault("lambda_prompt_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_prompt_message_help", 0.0)
+        prompt_graph.setdefault("lambda_prompt_message_help_query", 0.0)
+        prompt_graph.setdefault("lambda_prompt_class_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_utility_receive_gate", 0.0)
+        prompt_graph.setdefault("lambda_utility_receive_gate_query", 0.0)
+        prompt_graph.setdefault("lambda_receive_gate_budget", 0.0)
+        prompt_graph.setdefault("lambda_query_proto_alignment", 0.0)
+        prompt_graph.setdefault("lambda_edge_utility_supervision", 0.0)
+        prompt_graph.setdefault("lambda_correction_alignment", 0.0)
+        prompt_graph.setdefault("lambda_correction_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_p23_norm", 0.01)
+        prompt_graph.setdefault("lambda_p23_hub_budget", 0.01)
+        training.setdefault("freeze_base_model", False)
+        training.setdefault("train_prompt_graph_module", True)
+        training.setdefault("train_prompt_adapter", False)
+        training.setdefault("train_prompt_aware_module", False)
+        training.setdefault("epochs", 250)
+        training.setdefault("early_stop_min_epochs", 80)
+        training.setdefault("early_stop_patience", 60)
+        training.setdefault("output_dir", "outputs/gp2f_prompt_p23_v0_1")
     if variant in adapter_variants:
         prompt_adapter["enabled"] = True
         prompt_aware["enabled"] = False
@@ -1102,11 +1150,13 @@ def _build_prompt_graph_module(
     num_classes: int,
     prompt_graph_cfg: dict[str, Any],
     device: torch.device,
-) -> PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | None:
+) -> PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | P23V01PromptModule | None:
     if variant == "noprompt" or not bool(prompt_graph_cfg.get("enabled", True)):
         return None
     resolved_cfg = dict(prompt_graph_cfg)
     resolved_cfg.setdefault("num_classes", int(num_classes))
+    if variant == "p23_v0_1" or str(resolved_cfg.get("module_type", "")) == "p23_v0_1":
+        return P23V01PromptModule(source_dim, hidden_dim, resolved_cfg).to(device)
     if str(resolved_cfg.get("module_type", "")) == "selective_discrete_feature_prompt":
         return SelectiveDiscreteFeaturePromptGraph(source_dim, hidden_dim, resolved_cfg).to(device)
     return PromptGraphModuleP1(source_dim, hidden_dim, resolved_cfg).to(device)
@@ -2090,7 +2140,7 @@ def _prompt_aware_diagnostics(model_out: dict[str, Any]) -> dict[str, Any]:
 def _forward_prompt_graph(
     *,
     model: FaithfulGP2F,
-    prompt_graph_module: PromptGraphModuleP1 | None,
+    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | P23V01PromptModule | None,
     z: torch.Tensor,
     edge_index: torch.Tensor,
     train_mask: torch.Tensor,
@@ -2124,6 +2174,16 @@ def _forward_prompt_graph(
         forward_kwargs["adapted_edge_type"] = prompt_out.get("adapted_edge_type")
         forward_kwargs["prompt_update_mask"] = prompt_out.get("pool_mask")
     model_out = model.forward_with_h_pre(z, edge_index, **forward_kwargs)
+    if isinstance(prompt_graph_module, P23V01PromptModule):
+        receiver_out = prompt_graph_module.apply_receiver(model_out["h_adp"])
+        h_adp = receiver_out["h_adp"]
+        alpha = model_out["alpha"]
+        h_mix = alpha * model_out["h_pre"] + (1.0 - alpha) * h_adp
+        model_out["h_adp"] = h_adp
+        model_out["h_mix"] = h_mix
+        model_out["logits"] = model.classifier(h_mix)
+        model_out["p23_receiver"] = receiver_out
+        prompt_out["aux"].update(prompt_graph_module.receiver_aux(receiver_out))
     model_out["h_pre_shared"] = h_pre
     return model_out, prompt_out
 
@@ -2150,7 +2210,7 @@ def _forward_no_prompt_with_h_pre(
 
 
 def _needs_no_prompt_pool_evidence(
-    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | None,
+    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | P23V01PromptModule | None,
 ) -> bool:
     if prompt_graph_module is None:
         return False
@@ -2159,7 +2219,56 @@ def _needs_no_prompt_pool_evidence(
             float(getattr(prompt_graph_module, "uncertainty_weight", 0.0)) > 0.0
             or float(getattr(prompt_graph_module, "disagreement_weight", 0.0)) > 0.0
         )
+    if isinstance(prompt_graph_module, P23V01PromptModule):
+        return False
     return getattr(prompt_graph_module, "pool_strategy", "") == "utility_structural"
+
+
+@torch.no_grad()
+def _maybe_build_p23_v01_static_state(
+    *,
+    prompt_graph_module: torch.nn.Module | None,
+    input_aligner: InputAligner,
+    model: FaithfulGP2F,
+    x_raw: torch.Tensor,
+    edge_index: torch.Tensor,
+    train_mask: torch.Tensor,
+) -> dict[str, Any]:
+    if not isinstance(prompt_graph_module, P23V01PromptModule):
+        return {}
+    aligner_was_training = input_aligner.training
+    model_was_training = model.training
+    module_was_training = prompt_graph_module.training
+    input_aligner.eval()
+    model.eval()
+    prompt_graph_module.eval()
+    z_snapshot = input_aligner(x_raw)
+    h_pre = model.encode_frozen(z_snapshot, edge_index)
+    no_prompt_out = _forward_no_prompt_with_h_pre(
+        model=model,
+        z=z_snapshot,
+        edge_index=edge_index,
+        h_pre=h_pre,
+    )
+    state = prompt_graph_module.build_state(
+        x_raw=x_raw,
+        z_snapshot=z_snapshot.detach(),
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=no_prompt_out["logits"].detach(),
+        h_pre_snapshot=h_pre.detach(),
+        h_adp0_snapshot=no_prompt_out["h_adp"].detach(),
+    )
+    input_aligner.train(aligner_was_training)
+    model.train(model_was_training)
+    prompt_graph_module.train(module_was_training)
+    return {
+        "p23_static_pool_size": float(state.pool_mask.sum().item()),
+        "p23_static_pool_ratio": float(state.pool_mask.float().mean().item()),
+        "p23_static_feature_prompt_count": float(state.prompt_x.size(0)),
+        "p23_static_prompt_edge_count": float(state.prompt_edge_index.size(1)),
+        "p23_static_graph_risk": float(state.graph_risk.detach().item()),
+    }
 
 
 def _forward_prompt_adapter(
@@ -6245,6 +6354,14 @@ def run_single(
             seed=seed,
             epoch=0,
         )
+    p23_static_init_stats = _maybe_build_p23_v01_static_state(
+        prompt_graph_module=prompt_graph_module,
+        input_aligner=input_aligner,
+        model=model,
+        x_raw=graph.x,
+        edge_index=graph.edge_index,
+        train_mask=init_train_mask,
+    )
     class_key_init_stats = _maybe_initialize_class_keys(
         prompt_graph_module=prompt_graph_module,
         input_aligner=input_aligner,
@@ -6396,6 +6513,10 @@ def run_single(
     lambda_correction_anti_harm = float(prompt_graph_cfg.get("lambda_correction_anti_harm", 0.0))
     correction_alignment_margin = float(prompt_graph_cfg.get("correction_alignment_margin", 0.0))
     correction_alignment_warmup_epochs = int(prompt_graph_cfg.get("correction_alignment_warmup_epochs", 0))
+    lambda_p23_norm = float(prompt_graph_cfg.get("lambda_p23_norm", prompt_graph_cfg.get("norm_weight", 0.0)))
+    lambda_p23_hub_budget = float(
+        prompt_graph_cfg.get("lambda_p23_hub_budget", prompt_graph_cfg.get("hub_budget_weight", 0.0))
+    )
     lambda_prompt_adapter_update_norm = float(training_cfg.get("lambda_prompt_adapter_update_norm", 0.0))
     lambda_prompt_adapter_gate_budget = float(training_cfg.get("lambda_prompt_adapter_gate_budget", 0.0))
     lambda_prompt_adapter_message_help = float(training_cfg.get("lambda_prompt_adapter_message_help", 0.0))
@@ -7544,6 +7665,16 @@ def run_single(
             cls_loss = F.cross_entropy(model_out["logits"][label_train_mask], graph.y[label_train_mask])
         edge_l1 = prompt_edge_l1_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_balance = prompt_balance_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
+        p23_norm = (
+            prompt_out.get("aux", {}).get("p23_norm_loss", z.new_tensor(0.0))
+            if prompt_graph_module is not None
+            else z.new_tensor(0.0)
+        )
+        p23_hub_budget = (
+            prompt_out.get("aux", {}).get("p23_hub_budget_loss", z.new_tensor(0.0))
+            if prompt_graph_module is not None
+            else z.new_tensor(0.0)
+        )
         legacy_prompt_graph = isinstance(prompt_graph_module, PromptGraphModuleP1)
         prompt_role_diversity = (
             prompt_role_diversity_loss(prompt_graph_module) if legacy_prompt_graph else z.new_tensor(0.0)
@@ -8034,6 +8165,8 @@ def run_single(
             + lambda_edge_utility_supervision * edge_utility_supervision
             + lambda_correction_alignment * correction_alignment
             + lambda_correction_anti_harm * correction_alignment_anti_harm
+            + lambda_p23_norm * p23_norm
+            + lambda_p23_hub_budget * p23_hub_budget
             + lambda_prompt_adapter_update_norm * prompt_adapter_update_norm
             + lambda_prompt_adapter_gate_budget * prompt_adapter_budget
             + lambda_prompt_adapter_message_help * prompt_adapter_message_help
@@ -8117,6 +8250,8 @@ def run_single(
             "edge_utility_supervision_loss": float(edge_utility_supervision.detach().item()),
             "correction_alignment_loss": float(correction_alignment.detach().item()),
             "correction_alignment_anti_harm_loss": float(correction_alignment_anti_harm.detach().item()),
+            "p23_norm_loss": float(p23_norm.detach().item()),
+            "p23_hub_budget_loss": float(p23_hub_budget.detach().item()),
             "prompt_adapter_update_norm_loss": float(prompt_adapter_update_norm.detach().item()),
             "prompt_adapter_gate_budget_loss": float(prompt_adapter_budget.detach().item()),
             "prompt_adapter_message_help_loss": float(prompt_adapter_message_help.detach().item()),
@@ -8172,6 +8307,8 @@ def run_single(
             "lambda_edge_utility_supervision": lambda_edge_utility_supervision,
             "lambda_correction_alignment": lambda_correction_alignment,
             "lambda_correction_anti_harm": lambda_correction_anti_harm,
+            "lambda_p23_norm": lambda_p23_norm,
+            "lambda_p23_hub_budget": lambda_p23_hub_budget,
             "lambda_prompt_adapter_update_norm": lambda_prompt_adapter_update_norm,
             "lambda_prompt_adapter_gate_budget": lambda_prompt_adapter_gate_budget,
             "lambda_prompt_adapter_message_help": lambda_prompt_adapter_message_help,
@@ -8653,6 +8790,7 @@ def run_single(
         "prompt_adapter_parameter_count": count_trainable_parameters(prompt_adapter_module),
         "class_key_initialization": class_key_init_stats,
         "pattern_key_initialization": pattern_key_init_stats,
+        "p23_static_initialization": p23_static_init_stats,
         "trainable_parameters": trainable_summary,
         "optimizer": optimizer_summary,
         "regularization": {
