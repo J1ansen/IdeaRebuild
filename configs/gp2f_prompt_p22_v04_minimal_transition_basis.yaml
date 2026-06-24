@@ -1,0 +1,189 @@
+experiment:
+  name: gp2f_prompt_p22_v04_minimal_transition_basis
+  seed: 0
+  runs: 1
+  source_dataset: Cora
+  target_dataset: Cora
+  prompt_variant: p22_v04_minimal_transition_basis
+
+data:
+  root: /Users/jackson/MyIdea/data
+  download_if_missing: false
+  shots: 5
+  val_per_class: 30
+
+pretrained:
+  checkpoint_path: pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl
+  freeze_backbone: true
+
+model:
+  hidden_dim: 128
+  input_aligner: identity_if_same_dim
+  adapter_style: stable_zero_init
+  adapter_bottleneck_dim: 16
+  adapter_beta_init: 0.01
+  adapter_alpha_init: 0.1
+  fusion_alpha_style: sigmoid
+  alpha_init: 0.5
+
+loss:
+  use_cls: true
+  use_original_contrastive: false
+  use_original_topology_fusion: false
+  lambda_ctr: 0.0
+  lambda_fus: 0.0
+
+prompt_graph:
+  enabled: false
+  support_query_split:
+    enabled: true
+    support_ratio: 0.80
+    min_query_per_class: 1
+    resample_each_epoch: true
+
+prompt_aware:
+  enabled: false
+
+prompt_adapter:
+  enabled: true
+  module_type: p22_v04_minimal_transition_basis
+  num_patterns: 8
+  pattern_dim: 64
+  pattern_encoder_hidden_dim: 128
+  dropout: 0.0
+  pattern_init: kmeans_all_signature
+  pattern_init_use_labels: false
+  detach_class_pattern: true
+  kmeans_iters: 15
+  class_pattern_smoothing: 0.5
+  use_basis_evidence: true
+  num_bases: 7
+  basis_types:
+    - ego_logprob
+    - onehop_logprob
+    - twohop_logprob
+    - highpass_ego_onehop
+    - highpass_onehop_twohop
+    - onehop_transition_logprob
+    - highpass_ego_transition_onehop
+  enrichment_weight: 0.0
+  basis_weight_scale: 1.0
+  use_class_transition: false
+  use_transition_basis: true
+  transition_matrix_mode: support_uniform
+  transition_prior: uniform
+  transition_alpha: 5.0
+  transition_lambda_support: 1.0
+  transition_lambda_pseudo: 0.0
+  use_c2_matrix: false
+  use_transition_ema: false
+  detach_transition_matrix: true
+  log_transition_matrix_stats: true
+  log_single_basis_delta_ce: true
+  basis_delta_scale_grid: [0.01, 0.03, 0.05, 0.10, 0.20]
+  normalize_basis_evidence: true
+  basis_evidence_std_floor: 0.5
+  normalize_pattern_evidence: true
+  pattern_evidence_std_floor: 0.5
+  use_basis_teacher: true
+  basis_teacher_temperature: 0.5
+  basis_teacher_scale: 1.0
+  basis_usage_entropy_floor: 0.60
+  pattern_basis_init: cyclic_anchor
+  pattern_basis_anchor_logit: 2.0
+  pattern_basis_off_logit: -2.0
+  use_raw_hidden_in_signature: false
+  use_raw_prob_in_signature: false
+  use_prob_differences: true
+  use_entropy_margin: true
+  use_structural_hidden_relations: true
+  pattern_temperature_init: 0.70
+  pattern_temperature_final: 0.40
+  pattern_temperature_warmdown_epochs: 80
+  pattern_scale_init: 0.01
+  pattern_scale_max: 0.30
+  pattern_scale_warmup_epochs: 120
+  use_reliability_gate: true
+  reliability_gate_hidden_dim: 32
+  reliability_gate_init_bias: -2.5
+  reliability_gate_min: 0.0
+  reliability_gate_max: 1.0
+  reliability_gate_detach_input: true
+  use_pattern_gate: false
+  use_candidate_pool: false
+
+training:
+  epochs: 250
+  lr: 0.001
+  prompt_lr: 0.003
+  prompt_lr_multiplier: 1.0
+  weight_decay: 0.0005
+  prompt_weight_decay: 0.0
+  grad_clip: 1.0
+  log_every: 5
+  eval_every: 5
+  output_dir: outputs/gp2f_prompt_p22_v04_minimal_transition_basis
+  early_stop_patience: 60
+  early_stop_min_epochs: 80
+  early_stop_metric: val_acc
+  keep_best_checkpoint: true
+  freeze_base_model: true
+  train_prompt_adapter: true
+  train_prompt_graph_module: false
+  train_prompt_aware_module: false
+  prompt_adapter_update_mask: all
+  prompt_adapter_loss_mask: query
+  prompt_adapter_episode_count_per_epoch: 5
+  p22_stage1_epochs: 30
+  p22_stage1_pattern_only: true
+  p22_support_source: episode
+  p22_loss_source: episode
+  p22_crossfit_enabled: true
+  p22_crossfit_num_folds: 5
+  p22_crossfit_resample_each_epoch: true
+  p22_crossfit_class_balanced: true
+  p22_freeze_pattern_after_epoch: 180
+  p22_gate_margin: 0.0005
+  p22_gate_target_mode: tri_state
+  p22_gate_target_source: ungated_delta
+  p22_gate_positive_margin: 0.010
+  p22_gate_negative_margin: -0.005
+  p22_gate_ignore_neutral: true
+  p22_gate_use_crossfit_stability: false
+  p22_anti_harm_margin: 0.0
+  p22_gain_reward_cap: 0.01
+  p22_gate_budget_max: 0.35
+  p22_gate_budget_warmup_epochs: 30
+  p22_gate_harm_negative_margin: -0.005
+  lambda_prompt_adapter_update_norm: 0.0
+  lambda_prompt_adapter_gate_budget: 0.0
+  lambda_prompt_adapter_message_help: 0.0
+  lambda_prompt_adapter_utility_gate: 0.0
+  lambda_prompt_adapter_gate_consistency: 0.0
+  lambda_prompt_adapter_delta_consistency: 0.0
+  lambda_prompt_router_pattern_balance: 0.0
+  lambda_prompt_router_pattern_supervision: 0.0
+  lambda_prompt_router_pattern_utility: 0.0
+  lambda_prompt_router_class_pattern_reliability: 0.0
+  lambda_prompt_router_deployment_utility: 0.0
+  lambda_p22_pattern_only: 0.2
+  lambda_p22_pattern_reg: 0.005
+  lambda_p22_basis_teacher: 0.2
+  lambda_p22_basis_usage: 0.01
+  lambda_p22_deployment: 1.0
+  lambda_p22_gate: 0.5
+  lambda_p22_anti_harm: 1.0
+  lambda_p22_gain_reward: 0.05
+  lambda_p22_gate_budget: 0.2
+  lambda_p22_gate_harm: 0.5
+  lambda_p22_scale_reg: 0.01
+  p22_safe_checkpoint_enabled: true
+  p22_safe_checkpoint_metric: val_acc_plus_val_delta_ce
+  p22_safe_checkpoint_min_val_delta_ce: -0.0005
+  p22_safe_checkpoint_delta_weight: 0.5
+  p22_safe_checkpoint_delta_cap: 0.01
+  base_checkpoint_path:
+  base_checkpoint_root:
+  load_prompt_from_base_checkpoint: false
+  enable_test_label_cheat: false
+  test_label_cheat_fraction: 0.10

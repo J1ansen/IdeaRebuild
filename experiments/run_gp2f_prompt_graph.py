@@ -40,6 +40,7 @@ from models import (
     P22ClassPatternEnrichmentBank,
     PromptAwareGP2F,
     PromptGraphModuleP1,
+    SelectiveDiscreteFeaturePromptGraph,
     UtilitySupervisedPatternPromptRouter,
     load_pretrained_gcn,
 )
@@ -102,6 +103,8 @@ PROMPT_GRAPH_VARIANTS = {
     "p22_class_pattern_enrichment_bank",
     "p22_reliability_calibrated_basis_bank",
     "p22_v031_conservative_reliability_basis_bank",
+    "p22_v04_minimal_transition_basis",
+    "p23_selective_discrete_feature_prompting",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -135,6 +138,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         "p22_class_pattern_enrichment_bank",
         "p22_reliability_calibrated_basis_bank",
         "p22_v031_conservative_reliability_basis_bank",
+        "p22_v04_minimal_transition_basis",
     }
     if variant == "noprompt" or variant in adapter_variants:
         prompt_graph["enabled"] = False
@@ -144,6 +148,60 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
     prompt_aware["enabled"] = variant.startswith("p2_") or variant.startswith("p5_") or variant.startswith("p13_")
     prompt_adapter = out.setdefault("prompt_adapter", {})
     explicit_prompt_adapter_keys = set(prompt_adapter.keys())
+    if variant == "p23_selective_discrete_feature_prompting":
+        prompt_graph["enabled"] = True
+        prompt_aware["enabled"] = False
+        prompt_adapter["enabled"] = False
+        prompt_graph.setdefault("module_type", "selective_discrete_feature_prompt")
+        prompt_graph.setdefault("static_graph", True)
+        prompt_graph.setdefault("tokenizer", "binary_nonzero")
+        prompt_graph.setdefault("topk_feature_dims", 32)
+        prompt_graph.setdefault("min_df", 2)
+        prompt_graph.setdefault("max_df_ratio", 0.20)
+        prompt_graph.setdefault("rho", 0.15)
+        prompt_graph.setdefault("include_train_in_pool", True)
+        prompt_graph.setdefault("topk_feature_prompt_per_node", 3)
+        prompt_graph.setdefault("direction", "prompt_to_node")
+        prompt_graph.setdefault("feature_node_init", "avg_z_detached")
+        prompt_graph.setdefault("feature_edge_weight", 0.10)
+        prompt_graph.setdefault("difficulty_edge_weight", 0.50)
+        prompt_graph.setdefault("utility_pool_structural_weight", 0.40)
+        prompt_graph.setdefault("utility_pool_uncertainty_weight", 0.30)
+        prompt_graph.setdefault("utility_pool_disagreement_weight", 0.30)
+        prompt_graph.setdefault("use_idf", True)
+        prompt_graph.setdefault("use_feature_reliability", True)
+        prompt_graph.setdefault("lambda_edge_l1", 0.0)
+        prompt_graph.setdefault("lambda_prompt_balance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_role_diversity", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_budget", 0.0)
+        prompt_graph.setdefault("lambda_prompt_acceptance_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.0)
+        prompt_graph.setdefault("lambda_prompt_view_entropy", 0.0)
+        prompt_graph.setdefault("lambda_view_prior", 0.0)
+        prompt_graph.setdefault("lambda_class_route", 0.0)
+        prompt_graph.setdefault("lambda_key_proto", 0.0)
+        prompt_graph.setdefault("lambda_prompt_benefit_supervision", 0.0)
+        prompt_graph.setdefault("lambda_prompt_correction", 0.0)
+        prompt_graph.setdefault("lambda_prompt_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_prompt_message_help", 0.0)
+        prompt_graph.setdefault("lambda_prompt_message_help_query", 0.0)
+        prompt_graph.setdefault("lambda_prompt_class_anti_harm", 0.0)
+        prompt_graph.setdefault("lambda_utility_receive_gate", 0.0)
+        prompt_graph.setdefault("lambda_utility_receive_gate_query", 0.0)
+        prompt_graph.setdefault("lambda_receive_gate_budget", 0.0)
+        prompt_graph.setdefault("lambda_query_proto_alignment", 0.0)
+        prompt_graph.setdefault("lambda_edge_utility_supervision", 0.0)
+        prompt_graph.setdefault("lambda_correction_alignment", 0.0)
+        prompt_graph.setdefault("lambda_correction_anti_harm", 0.0)
+        training.setdefault("freeze_base_model", False)
+        training.setdefault("train_prompt_graph_module", False)
+        training.setdefault("train_prompt_adapter", False)
+        training.setdefault("train_prompt_aware_module", False)
+        training.setdefault("epochs", 250)
+        training.setdefault("early_stop_min_epochs", 80)
+        training.setdefault("early_stop_patience", 60)
+        training.setdefault("output_dir", "outputs/gp2f_prompt_p23_selective_discrete_feature_prompting")
     if variant in adapter_variants:
         prompt_adapter["enabled"] = True
         prompt_aware["enabled"] = False
@@ -247,6 +305,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
             "p22_class_pattern_enrichment_bank",
             "p22_reliability_calibrated_basis_bank",
             "p22_v031_conservative_reliability_basis_bank",
+            "p22_v04_minimal_transition_basis",
         }:
             training.setdefault("freeze_base_model", False)
             training.setdefault("log_every", 5)
@@ -255,6 +314,7 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 "p22_class_pattern_enrichment_bank",
                 "p22_reliability_calibrated_basis_bank",
                 "p22_v031_conservative_reliability_basis_bank",
+                "p22_v04_minimal_transition_basis",
             }
             if variant in p22_variants:
                 prompt_adapter.setdefault("module_type", "p22_class_pattern_enrichment_bank")
@@ -275,11 +335,28 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 ]
                 if variant == "p22_class_pattern_enrichment_bank":
                     default_basis_types = [*default_basis_types, "class_transition"]
+                elif variant == "p22_v04_minimal_transition_basis":
+                    default_basis_types = [
+                        *default_basis_types,
+                        "onehop_transition_logprob",
+                        "highpass_ego_transition_onehop",
+                    ]
                 prompt_adapter.setdefault("basis_types", default_basis_types)
                 prompt_adapter.setdefault("num_bases", len(prompt_adapter["basis_types"]))
                 prompt_adapter.setdefault("enrichment_weight", 0.5 if variant == "p22_class_pattern_enrichment_bank" else 0.0)
                 prompt_adapter.setdefault("basis_weight_scale", 1.0)
                 prompt_adapter.setdefault("use_class_transition", variant == "p22_class_pattern_enrichment_bank")
+                prompt_adapter.setdefault("use_transition_basis", variant == "p22_v04_minimal_transition_basis")
+                prompt_adapter.setdefault("transition_matrix_mode", "support_uniform")
+                prompt_adapter.setdefault("transition_prior", "uniform")
+                prompt_adapter.setdefault("transition_alpha", 5.0)
+                prompt_adapter.setdefault("transition_lambda_support", 1.0)
+                prompt_adapter.setdefault("transition_lambda_pseudo", 0.0)
+                prompt_adapter.setdefault("use_c2_matrix", False)
+                prompt_adapter.setdefault("use_transition_ema", False)
+                prompt_adapter.setdefault("log_transition_matrix_stats", variant == "p22_v04_minimal_transition_basis")
+                prompt_adapter.setdefault("log_single_basis_delta_ce", variant == "p22_v04_minimal_transition_basis")
+                prompt_adapter.setdefault("basis_delta_scale_grid", [0.01, 0.03, 0.05, 0.10, 0.20])
                 prompt_adapter.setdefault("class_transition_smoothing", 0.5)
                 prompt_adapter.setdefault("class_pattern_smoothing", 0.5)
                 prompt_adapter.setdefault("use_basis_teacher", True)
@@ -290,31 +367,52 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 prompt_adapter.setdefault("basis_evidence_std_floor", 0.5)
                 prompt_adapter.setdefault(
                     "pattern_basis_init",
-                    "cyclic_anchor" if variant == "p22_v031_conservative_reliability_basis_bank" else "zeros",
+                    "cyclic_anchor" if variant in {
+                        "p22_v031_conservative_reliability_basis_bank",
+                        "p22_v04_minimal_transition_basis",
+                    } else "zeros",
                 )
                 prompt_adapter.setdefault("pattern_basis_anchor_logit", 2.0)
                 prompt_adapter.setdefault("pattern_basis_off_logit", -2.0)
                 prompt_adapter.setdefault("pattern_temperature_init", 0.70)
                 prompt_adapter.setdefault(
                     "pattern_temperature_final",
-                    0.40 if variant == "p22_v031_conservative_reliability_basis_bank" else (0.35 if variant == "p22_reliability_calibrated_basis_bank" else 0.30),
+                    0.40 if variant in {
+                        "p22_v031_conservative_reliability_basis_bank",
+                        "p22_v04_minimal_transition_basis",
+                    } else (0.35 if variant == "p22_reliability_calibrated_basis_bank" else 0.30),
                 )
                 prompt_adapter.setdefault(
                     "pattern_temperature_warmdown_epochs",
-                    80 if variant == "p22_v031_conservative_reliability_basis_bank" else (60 if variant == "p22_reliability_calibrated_basis_bank" else 80),
+                    80 if variant in {
+                        "p22_v031_conservative_reliability_basis_bank",
+                        "p22_v04_minimal_transition_basis",
+                    } else (60 if variant == "p22_reliability_calibrated_basis_bank" else 80),
                 )
                 prompt_adapter.setdefault(
                     "pattern_scale_init",
-                    0.01 if variant == "p22_v031_conservative_reliability_basis_bank" else (0.03 if variant == "p22_reliability_calibrated_basis_bank" else 0.05),
+                    0.01 if variant in {
+                        "p22_v031_conservative_reliability_basis_bank",
+                        "p22_v04_minimal_transition_basis",
+                    } else (0.03 if variant == "p22_reliability_calibrated_basis_bank" else 0.05),
                 )
                 prompt_adapter.setdefault(
                     "pattern_scale_max",
-                    0.30 if variant == "p22_v031_conservative_reliability_basis_bank" else (0.60 if variant == "p22_reliability_calibrated_basis_bank" else 1.0),
+                    0.30 if variant in {
+                        "p22_v031_conservative_reliability_basis_bank",
+                        "p22_v04_minimal_transition_basis",
+                    } else (0.60 if variant == "p22_reliability_calibrated_basis_bank" else 1.0),
                 )
-                prompt_adapter.setdefault("pattern_scale_warmup_epochs", 120 if variant == "p22_v031_conservative_reliability_basis_bank" else 80)
+                prompt_adapter.setdefault("pattern_scale_warmup_epochs", 120 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else 80)
                 prompt_adapter.setdefault("use_reliability_gate", variant != "p22_class_pattern_enrichment_bank")
                 prompt_adapter.setdefault("reliability_gate_hidden_dim", 32)
-                prompt_adapter.setdefault("reliability_gate_init_bias", -2.5 if variant == "p22_v031_conservative_reliability_basis_bank" else -2.0)
+                prompt_adapter.setdefault("reliability_gate_init_bias", -2.5 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else -2.0)
                 prompt_adapter.setdefault("reliability_gate_min", 0.0)
                 prompt_adapter.setdefault("reliability_gate_max", 1.0)
                 prompt_adapter.setdefault("reliability_gate_detach_input", True)
@@ -337,7 +435,10 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training.setdefault("p22_crossfit_num_folds", 5)
                 training.setdefault("p22_crossfit_resample_each_epoch", True)
                 training.setdefault("p22_crossfit_class_balanced", True)
-                training.setdefault("p22_freeze_pattern_after_epoch", 180 if variant == "p22_v031_conservative_reliability_basis_bank" else (200 if variant == "p22_reliability_calibrated_basis_bank" else 0))
+                training.setdefault("p22_freeze_pattern_after_epoch", 180 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else (200 if variant == "p22_reliability_calibrated_basis_bank" else 0))
                 training["lambda_prompt_adapter_update_norm"] = 0.0
                 training["lambda_prompt_adapter_gate_budget"] = 0.0
                 training["lambda_prompt_adapter_message_help"] = 0.0
@@ -346,17 +447,29 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training["lambda_prompt_router_pattern_supervision"] = 0.0
                 training["lambda_prompt_router_pattern_utility"] = 0.0
                 training["lambda_prompt_router_class_pattern_reliability"] = 0.0
-                training.setdefault("lambda_p22_pattern_only", 0.2 if variant == "p22_v031_conservative_reliability_basis_bank" else (0.3 if variant == "p22_reliability_calibrated_basis_bank" else 1.0))
+                training.setdefault("lambda_p22_pattern_only", 0.2 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else (0.3 if variant == "p22_reliability_calibrated_basis_bank" else 1.0))
                 training.setdefault("lambda_p22_pattern_reg", 0.005)
-                training.setdefault("lambda_p22_basis_teacher", 0.2 if variant == "p22_v031_conservative_reliability_basis_bank" else (0.3 if variant == "p22_reliability_calibrated_basis_bank" else 0.5))
+                training.setdefault("lambda_p22_basis_teacher", 0.2 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else (0.3 if variant == "p22_reliability_calibrated_basis_bank" else 0.5))
                 training.setdefault("lambda_p22_basis_usage", 0.01)
                 training.setdefault("lambda_p22_deployment", 1.0 if variant != "p22_class_pattern_enrichment_bank" else 0.0)
                 training.setdefault("lambda_p22_gate", 0.5 if variant != "p22_class_pattern_enrichment_bank" else 0.0)
                 training.setdefault("lambda_p22_anti_harm", 1.0 if variant != "p22_class_pattern_enrichment_bank" else 0.0)
-                training.setdefault("lambda_p22_gain_reward", 0.05 if variant == "p22_v031_conservative_reliability_basis_bank" else (0.2 if variant == "p22_reliability_calibrated_basis_bank" else 0.0))
+                training.setdefault("lambda_p22_gain_reward", 0.05 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else (0.2 if variant == "p22_reliability_calibrated_basis_bank" else 0.0))
                 training.setdefault("p22_anti_harm_margin", 0.0)
                 training.setdefault("p22_gate_margin", 0.0005)
-                training.setdefault("p22_gate_target_mode", "tri_state" if variant == "p22_v031_conservative_reliability_basis_bank" else "binary")
+                training.setdefault("p22_gate_target_mode", "tri_state" if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else "binary")
                 training.setdefault("p22_gate_positive_margin", 0.010)
                 training.setdefault("p22_gate_negative_margin", -0.005)
                 training.setdefault("p22_gate_ignore_neutral", True)
@@ -365,14 +478,29 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
                 training.setdefault("p22_gate_helpful_stability_threshold", 0.70)
                 training.setdefault("p22_gate_harmful_stability_threshold", 0.50)
                 training.setdefault("p22_gate_stability_min_seen", 2)
-                training.setdefault("lambda_p22_gate_budget", 0.2 if variant == "p22_v031_conservative_reliability_basis_bank" else 0.0)
+                training.setdefault("lambda_p22_gate_budget", 0.2 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else 0.0)
                 training.setdefault("p22_gate_budget_max", 0.35)
                 training.setdefault("p22_gate_budget_warmup_epochs", 30)
-                training.setdefault("lambda_p22_gate_harm", 0.5 if variant == "p22_v031_conservative_reliability_basis_bank" else 0.0)
+                training.setdefault("lambda_p22_gate_harm", 0.5 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else 0.0)
                 training.setdefault("p22_gate_harm_negative_margin", -0.005)
-                training.setdefault("lambda_p22_scale_reg", 0.01 if variant == "p22_v031_conservative_reliability_basis_bank" else 0.0)
-                training.setdefault("p22_gain_reward_cap", 0.01 if variant == "p22_v031_conservative_reliability_basis_bank" else 0.02)
-                training.setdefault("p22_safe_checkpoint_enabled", variant == "p22_v031_conservative_reliability_basis_bank")
+                training.setdefault("lambda_p22_scale_reg", 0.01 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else 0.0)
+                training.setdefault("p22_gain_reward_cap", 0.01 if variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                } else 0.02)
+                training.setdefault("p22_safe_checkpoint_enabled", variant in {
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                })
                 training.setdefault("p22_safe_checkpoint_metric", "val_acc_plus_val_delta_ce")
                 training.setdefault("p22_safe_checkpoint_min_val_delta_ce", -0.0005)
                 training.setdefault("p22_safe_checkpoint_delta_weight", 0.5)
@@ -974,11 +1102,13 @@ def _build_prompt_graph_module(
     num_classes: int,
     prompt_graph_cfg: dict[str, Any],
     device: torch.device,
-) -> PromptGraphModuleP1 | None:
+) -> PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | None:
     if variant == "noprompt" or not bool(prompt_graph_cfg.get("enabled", True)):
         return None
     resolved_cfg = dict(prompt_graph_cfg)
     resolved_cfg.setdefault("num_classes", int(num_classes))
+    if str(resolved_cfg.get("module_type", "")) == "selective_discrete_feature_prompt":
+        return SelectiveDiscreteFeaturePromptGraph(source_dim, hidden_dim, resolved_cfg).to(device)
     return PromptGraphModuleP1(source_dim, hidden_dim, resolved_cfg).to(device)
 
 
@@ -1015,6 +1145,7 @@ def _build_prompt_adapter_module(
         "p22_class_pattern_enrichment_bank",
         "p22_reliability_calibrated_basis_bank",
         "p22_v031_conservative_reliability_basis_bank",
+        "p22_v04_minimal_transition_basis",
     }:
         return P22ClassPatternEnrichmentBank(source_dim, hidden_dim, resolved_cfg).to(device)
     if module_type == "hetero_adapter":
@@ -1854,6 +1985,14 @@ def _prompt_graph_diagnostics(
     diagnostics["structural_view_weight"] = view_values[1]
     diagnostics["role_view_weight"] = view_values[2]
     diagnostics["attribute_view_weight"] = view_values[3] if len(view_values) > 3 else 0.0
+    for key, value in aux.items():
+        if not str(key).startswith("p23_") or not isinstance(value, torch.Tensor):
+            continue
+        tensor = value.detach()
+        if tensor.numel() == 1:
+            diagnostics[str(key)] = float(tensor.item())
+        elif tensor.numel() > 0:
+            diagnostics[f"{key}_mean"] = float(tensor.to(dtype=torch.float32).mean().item())
     for name in ["semantic_route_margin", "structural_route_margin", "role_route_margin", "attribute_route_margin"]:
         value = aux.get(name)
         diagnostics[name] = float(value.detach().item()) if isinstance(value, torch.Tensor) else 0.0
@@ -2010,8 +2149,17 @@ def _forward_no_prompt_with_h_pre(
     return model.forward_with_h_pre(z, edge_index, **forward_kwargs)
 
 
-def _needs_no_prompt_pool_evidence(prompt_graph_module: PromptGraphModuleP1 | None) -> bool:
-    return prompt_graph_module is not None and getattr(prompt_graph_module, "pool_strategy", "") == "utility_structural"
+def _needs_no_prompt_pool_evidence(
+    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | None,
+) -> bool:
+    if prompt_graph_module is None:
+        return False
+    if isinstance(prompt_graph_module, SelectiveDiscreteFeaturePromptGraph):
+        return (
+            float(getattr(prompt_graph_module, "uncertainty_weight", 0.0)) > 0.0
+            or float(getattr(prompt_graph_module, "disagreement_weight", 0.0)) > 0.0
+        )
+    return getattr(prompt_graph_module, "pool_strategy", "") == "utility_structural"
 
 
 def _forward_prompt_adapter(
@@ -2294,6 +2442,13 @@ def _prompt_adapter_diagnostics(adapter_out: dict[str, torch.Tensor] | None) -> 
         "p22_gate_mean": scalar("prompt_gate_mean"),
         "p22_gate_std": scalar("p22_gate_std"),
         "p22_gate_open_ratio": scalar("p22_gate_open_ratio"),
+        "transition_C_row_entropy": scalar("transition_C_row_entropy"),
+        "transition_C_diag_mean": scalar("transition_C_diag_mean"),
+        "transition_C_offdiag_mean": scalar("transition_C_offdiag_mean"),
+        "transition_C_max_mean": scalar("transition_C_max_mean"),
+        "transition_support_edge_count": scalar("transition_support_edge_count"),
+        "transition_support_nonzero_row_ratio": scalar("transition_support_nonzero_row_ratio"),
+        "transition_support_class_pair_coverage": scalar("transition_support_class_pair_coverage"),
         "p22_pattern_usage_distribution": vector("pattern_usage_mean"),
         "p22_basis_usage_distribution": vector("basis_usage"),
     }
@@ -2354,6 +2509,70 @@ def _prompt_adapter_delta_stats(
         f"{prefix}_count": float(idx.numel()),
         f"{prefix}_delta_ce_by_class": by_class,
     }
+
+
+def _safe_metric_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in str(value)).strip("_")
+
+
+@torch.no_grad()
+def _p22_single_basis_delta_stats(
+    *,
+    adapter_out: dict[str, Any],
+    base_logits: torch.Tensor,
+    labels: torch.Tensor,
+    masks: dict[str, torch.Tensor],
+    scale_grid: list[float],
+) -> dict[str, float]:
+    basis_evidence = adapter_out.get("basis_evidence")
+    if not isinstance(basis_evidence, torch.Tensor) or basis_evidence.ndim != 3:
+        return {}
+    if not scale_grid:
+        scale_grid = [0.05]
+    basis_names_raw = adapter_out.get("basis_names")
+    if isinstance(basis_names_raw, list) and len(basis_names_raw) == int(basis_evidence.size(1)):
+        basis_names = [_safe_metric_name(str(name)) for name in basis_names_raw]
+    else:
+        basis_names = [f"basis_{idx}" for idx in range(int(basis_evidence.size(1)))]
+    logits_base = base_logits.detach().to(device=basis_evidence.device, dtype=basis_evidence.dtype)
+    y = labels.to(device=basis_evidence.device, dtype=torch.long)
+    out: dict[str, float] = {}
+    for split_name, split_mask in masks.items():
+        mask = split_mask.to(device=basis_evidence.device, dtype=torch.bool)
+        idx = torch.where(mask)[0]
+        for basis_idx, basis_name in enumerate(basis_names):
+            key_prefix = f"basis_delta_ce_{basis_name}_{split_name}"
+            if idx.numel() == 0:
+                out[f"{key_prefix}_best"] = 0.0
+                out[f"{key_prefix}_best_scale"] = 0.0
+                out[f"{key_prefix}_positive_ratio"] = 0.0
+                if split_name == "val":
+                    out[f"basis_delta_ce_{basis_name}"] = 0.0
+                    out[f"basis_delta_scale_{basis_name}"] = 0.0
+                continue
+            base_ce = F.cross_entropy(logits_base[idx], y[idx], reduction="none")
+            best_delta: torch.Tensor | None = None
+            best_positive_ratio = 0.0
+            best_scale = 0.0
+            for scale in scale_grid:
+                scale_value = float(scale)
+                logits_basis = logits_base + scale_value * basis_evidence[:, basis_idx, :]
+                basis_ce = F.cross_entropy(logits_basis[idx], y[idx], reduction="none")
+                delta = base_ce - basis_ce
+                mean_delta = delta.mean()
+                if best_delta is None or float(mean_delta.item()) > float(best_delta.item()):
+                    best_delta = mean_delta
+                    best_positive_ratio = float((delta > 0.0).to(dtype=basis_evidence.dtype).mean().item())
+                    best_scale = scale_value
+            assert best_delta is not None
+            out[f"{key_prefix}_best"] = float(best_delta.item())
+            out[f"{key_prefix}_best_scale"] = best_scale
+            out[f"{key_prefix}_positive_ratio"] = best_positive_ratio
+            if split_name == "val":
+                out[f"basis_delta_ce_{basis_name}"] = float(best_delta.item())
+                out[f"basis_delta_scale_{basis_name}"] = best_scale
+                out[f"basis_delta_positive_ratio_{basis_name}"] = best_positive_ratio
+    return out
 
 
 def _p22_pattern_only_metrics(
@@ -5271,6 +5490,23 @@ def evaluate_prompt_graph(
                 "p22_test_positive_delta_ratio": test_delta_stats.get("adapter_test_positive_delta_ratio", 0.0),
             }
         )
+        if bool(prompt_adapter_cfg.get("log_single_basis_delta_ce", False)):
+            raw_scale_grid = prompt_adapter_cfg.get("basis_delta_scale_grid", [0.01, 0.03, 0.05, 0.10, 0.20])
+            if isinstance(raw_scale_grid, str):
+                scale_grid = [float(item.strip()) for item in raw_scale_grid.split(",") if item.strip()]
+            elif isinstance(raw_scale_grid, list):
+                scale_grid = [float(item) for item in raw_scale_grid]
+            else:
+                scale_grid = [float(raw_scale_grid)]
+            adapter_diag.update(
+                _p22_single_basis_delta_stats(
+                    adapter_out=adapter_out,
+                    base_logits=no_prompt_out["logits"],
+                    labels=labels,
+                    masks={"train": train_mask, "val": val_mask, "test": test_mask},
+                    scale_grid=scale_grid,
+                )
+            )
         adapter_diag.update(
             _p22_pattern_only_metrics(
                 adapter_out=adapter_out,
@@ -6427,7 +6663,11 @@ def run_single(
             if hasattr(prompt_adapter_module, "set_epoch"):
                 prompt_adapter_module.set_epoch(epoch)
             if (
-                variant in {"p22_reliability_calibrated_basis_bank", "p22_v031_conservative_reliability_basis_bank"}
+                variant in {
+                    "p22_reliability_calibrated_basis_bank",
+                    "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
+                }
                 and isinstance(prompt_adapter_module, P22ClassPatternEnrichmentBank)
                 and p22_freeze_pattern_after_epoch > 0
             ):
@@ -6664,6 +6904,12 @@ def run_single(
             "prompt_adapter_delta_consistency_loss": 0.0,
             "prompt_adapter_episode_count": 1.0,
         }
+        effective_lambda_p21_channel_expert = 0.0
+        effective_lambda_p21_channel_utility = 0.0
+        effective_lambda_p21_gate_utility = 0.0
+        effective_lambda_deployment_utility = 0.0
+        in_expert_warmup = False
+        effective_p21_gate_source = p21_channel_utility_gate_source
         no_prompt_out: dict[str, Any] | None = None
         if prompt_adapter_module is not None:
             prompt_out = _prompt_out_with_pool(
@@ -6729,6 +6975,7 @@ def run_single(
             p22_is_reliability = variant in {
                 "p22_reliability_calibrated_basis_bank",
                 "p22_v031_conservative_reliability_basis_bank",
+                "p22_v04_minimal_transition_basis",
             }
             effective_episode_count = (
                 max(2, int(p22_crossfit_num_folds))
@@ -6768,6 +7015,7 @@ def run_single(
                     "p22_class_pattern_enrichment_bank",
                     "p22_reliability_calibrated_basis_bank",
                     "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
                 }:
                     if p22_is_reliability and p22_crossfit_enabled:
                         pass
@@ -6782,6 +7030,7 @@ def run_single(
                     "p22_class_pattern_enrichment_bank",
                     "p22_reliability_calibrated_basis_bank",
                     "p22_v031_conservative_reliability_basis_bank",
+                    "p22_v04_minimal_transition_basis",
                 }:
                     if p22_is_reliability and p22_crossfit_enabled:
                         pass
@@ -7295,8 +7544,9 @@ def run_single(
             cls_loss = F.cross_entropy(model_out["logits"][label_train_mask], graph.y[label_train_mask])
         edge_l1 = prompt_edge_l1_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_balance = prompt_balance_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
+        legacy_prompt_graph = isinstance(prompt_graph_module, PromptGraphModuleP1)
         prompt_role_diversity = (
-            prompt_role_diversity_loss(prompt_graph_module) if prompt_graph_module is not None else z.new_tensor(0.0)
+            prompt_role_diversity_loss(prompt_graph_module) if legacy_prompt_graph else z.new_tensor(0.0)
         )
         prompt_acceptance = prompt_acceptance_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_acceptance_budget = (
@@ -7730,7 +7980,7 @@ def run_single(
         )
         key_proto = (
             prompt_key_proto_loss(prompt_graph_module, prompt_out, graph.y, prompt_supervision_mask)
-            if prompt_graph_module is not None
+            if legacy_prompt_graph
             else z.new_tensor(0.0)
         )
         receive_gate_budget = (
@@ -7806,6 +8056,7 @@ def run_single(
                 "p22_class_pattern_enrichment_bank",
                 "p22_reliability_calibrated_basis_bank",
                 "p22_v031_conservative_reliability_basis_bank",
+                "p22_v04_minimal_transition_basis",
             }
             and p22_stage1_pattern_only
             and epoch <= p22_stage1_epochs
@@ -8744,6 +8995,14 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "pool_score_selected_mean",
         "pool_uncertainty_mean",
         "pool_disagreement_mean",
+        "p23_pool_ratio",
+        "p23_pool_score_mean",
+        "p23_feature_prompt_count",
+        "p23_valid_feature_count",
+        "p23_prompt_edge_count",
+        "p23_avg_prompt_degree",
+        "p23_feature_df_mean",
+        "p23_feature_reliability_mean",
         "candidate_pool_enabled",
         "candidate_pool_ratio",
         "candidate_pool_count",
@@ -8873,6 +9132,23 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "adapter_test_candidate_pool_positive_delta_ratio",
         "adapter_test_outside_candidate_pool_mean_delta_ce",
         "adapter_test_outside_candidate_pool_positive_delta_ratio",
+        "transition_C_row_entropy",
+        "transition_C_diag_mean",
+        "transition_C_offdiag_mean",
+        "transition_C_max_mean",
+        "transition_support_edge_count",
+        "transition_support_nonzero_row_ratio",
+        "transition_support_class_pair_coverage",
+        "basis_delta_ce_ego_logprob",
+        "basis_delta_ce_onehop_logprob",
+        "basis_delta_ce_twohop_logprob",
+        "basis_delta_ce_highpass_ego_onehop",
+        "basis_delta_ce_highpass_onehop_twohop",
+        "basis_delta_ce_onehop_transition_logprob",
+        "basis_delta_ce_highpass_ego_transition_onehop",
+        "basis_delta_ce_onehop_transition_logprob_train_best",
+        "basis_delta_ce_onehop_transition_logprob_val_best",
+        "basis_delta_ce_onehop_transition_logprob_test_best",
         "support_context_enabled",
         "support_context_available",
         "support_context_coverage",

@@ -10,7 +10,11 @@ from models.class_conditioned_pattern_prompt_router import (
 from models.hetero_prompt_adapter import prompt_adapter_message_help_loss
 from models.p21_adaptive_filter import P21LiteAdaptiveFilter
 from models.p21_v2_hetero_filter import P21V2HeteroFilter
-from models.p22_class_pattern_enrichment import P22ClassPatternEnrichmentBank, estimate_class_transition_from_support
+from models.p22_class_pattern_enrichment import (
+    P22ClassPatternEnrichmentBank,
+    compute_support_uniform_compatibility_matrix,
+    estimate_class_transition_from_support,
+)
 from models.utility_supervised_pattern_prompt_router import UtilitySupervisedPatternPromptRouter
 
 
@@ -509,6 +513,72 @@ def test_p22_support_class_transition_estimate() -> None:
     assert transition[0, 1] > transition[0, 2]
 
 
+def test_p22_support_uniform_compatibility_matrix_uses_neighbor_to_ego_direction() -> None:
+    labels = torch.tensor([0, 1, 2])
+    support_mask = torch.tensor([True, True, True])
+    edge_index = torch.tensor([[0, 1, 1], [1, 2, 0]], dtype=torch.long)
+
+    transition, stats = compute_support_uniform_compatibility_matrix(
+        labels=labels,
+        support_mask=support_mask,
+        edge_index=edge_index,
+        num_classes=3,
+        alpha=0.3,
+        prior="uniform",
+    )
+
+    assert transition.shape == (3, 3)
+    assert torch.allclose(transition.sum(dim=-1), torch.ones(3), atol=1e-6)
+    # Edges 1 -> 2 and 1 -> 0 mean neighbor class 1 should point to ego classes 2 and 0.
+    assert transition[1, 0] > transition[1, 1]
+    assert transition[1, 2] > transition[1, 1]
+    assert stats["transition_support_edge_count"].item() == 3.0
+    assert stats["transition_support_class_pair_coverage"].item() > 0.0
+
+
+def test_p22_v04_transition_basis_outputs_stats_and_basis_names() -> None:
+    z, edge_index, h_adp = _toy_graph()
+    bank = _p22_bank(
+        pattern_init="random",
+        basis_types=[
+            "ego_logprob",
+            "onehop_logprob",
+            "twohop_logprob",
+            "highpass_ego_onehop",
+            "highpass_onehop_twohop",
+            "onehop_transition_logprob",
+            "highpass_ego_transition_onehop",
+        ],
+        num_bases=7,
+        use_transition_basis=True,
+        transition_matrix_mode="support_uniform",
+        transition_prior="uniform",
+        transition_alpha=0.5,
+        transition_lambda_pseudo=0.0,
+        enrichment_weight=0.0,
+        use_class_transition=False,
+        normalize_basis_evidence=False,
+    )
+    labels = torch.tensor([0, 1, 2, 1, 0])
+    support_mask = torch.tensor([True, True, True, False, False])
+    base_logits = torch.randn(5, 3)
+    out = bank(
+        z=z,
+        edge_index=edge_index,
+        h_adp=h_adp,
+        base_logits=base_logits,
+        labels=labels,
+        support_mask=support_mask,
+    )
+
+    assert out["basis_evidence"].shape == (5, 7, 3)
+    assert out["basis_names"][-2:] == ["onehop_transition_logprob", "highpass_ego_transition_onehop"]
+    assert out["transition_matrix"].shape == (3, 3)
+    assert torch.allclose(out["transition_matrix"].sum(dim=-1), torch.ones(3), atol=1e-6)
+    assert out["transition_C_row_entropy"].item() >= 0.0
+    assert out["transition_support_edge_count"].item() >= 0.0
+
+
 def test_p22_support_neighbor_prob_transition_type() -> None:
     z, edge_index, h_adp = _toy_graph()
     bank = _p22_bank(
@@ -609,6 +679,41 @@ def test_p22_v031_variant_config_is_conservative_and_isolated() -> None:
     assert cfg["training"]["p22_safe_checkpoint_metric"] == "val_acc_plus_val_delta_ce"
     assert cfg["training"]["p22_safe_checkpoint_min_val_delta_ce"] == -0.0005
     assert cfg["training"]["p22_freeze_pattern_after_epoch"] == 180
+
+
+def test_p22_v04_minimal_variant_config_enables_support_uniform_transition_diagnostics() -> None:
+    cfg = _config_for_variant(
+        {
+            "experiment": {"prompt_variant": "p22_v04_minimal_transition_basis"},
+            "prompt_adapter": {"enabled": True},
+        },
+        "p22_v04_minimal_transition_basis",
+    )
+
+    assert cfg["prompt_graph"]["enabled"] is False
+    assert cfg["prompt_adapter"]["module_type"] == "p22_class_pattern_enrichment_bank"
+    assert cfg["prompt_adapter"]["basis_types"] == [
+        "ego_logprob",
+        "onehop_logprob",
+        "twohop_logprob",
+        "highpass_ego_onehop",
+        "highpass_onehop_twohop",
+        "onehop_transition_logprob",
+        "highpass_ego_transition_onehop",
+    ]
+    assert cfg["prompt_adapter"]["num_bases"] == 7
+    assert cfg["prompt_adapter"]["use_transition_basis"] is True
+    assert cfg["prompt_adapter"]["transition_matrix_mode"] == "support_uniform"
+    assert cfg["prompt_adapter"]["transition_prior"] == "uniform"
+    assert cfg["prompt_adapter"]["transition_alpha"] == 5.0
+    assert cfg["prompt_adapter"]["transition_lambda_pseudo"] == 0.0
+    assert cfg["prompt_adapter"]["use_c2_matrix"] is False
+    assert cfg["prompt_adapter"]["use_transition_ema"] is False
+    assert cfg["prompt_adapter"]["log_single_basis_delta_ce"] is True
+    assert cfg["prompt_adapter"]["basis_delta_scale_grid"] == [0.01, 0.03, 0.05, 0.10, 0.20]
+    assert cfg["training"]["p22_gate_target_mode"] == "tri_state"
+    assert cfg["training"]["p22_gate_use_crossfit_stability"] is False
+    assert cfg["training"]["p22_safe_checkpoint_enabled"] is True
 
 
 def test_pattern_supervision_trains_router_toward_helpful_pattern() -> None:

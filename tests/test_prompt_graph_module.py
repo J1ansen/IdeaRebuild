@@ -21,6 +21,7 @@ from models.prompt_graph_module import (
     prompt_view_prior_loss,
     utility_receive_gate_budget_loss,
 )
+from models.discrete_feature_prompt import SelectiveDiscreteFeaturePromptGraph
 from experiments.run_gp2f_prompt_graph import (
     _acceptance_supervision_loss,
     _benefit_supervision_loss,
@@ -32,6 +33,7 @@ from experiments.run_gp2f_prompt_graph import (
     _prompt_correction_losses,
     _query_proto_alignment_loss,
     _utility_receive_gate_loss,
+    _config_for_variant,
 )
 from utils.io import read_yaml
 
@@ -86,6 +88,83 @@ def _toy_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tenso
     y = torch.tensor([0, 0, 1, 1, 0, 1], dtype=torch.long)
     train_mask = torch.tensor([True, False, True, False, False, False])
     return z, h_pre, edge_index, y, train_mask
+
+
+def test_selective_discrete_feature_prompt_graph_adds_prompt_to_node_edges() -> None:
+    z, h_pre, edge_index, _y, train_mask = _toy_inputs()
+    no_prompt_logits = torch.tensor(
+        [
+            [2.0, 0.1],
+            [0.3, 0.2],
+            [0.1, 2.0],
+            [0.4, 0.3],
+            [0.2, 0.1],
+            [0.1, 0.2],
+        ]
+    )
+    module = SelectiveDiscreteFeaturePromptGraph(
+        source_dim=z.size(1),
+        hidden_dim=h_pre.size(1),
+        config={
+            "tokenizer": "binary_nonzero",
+            "min_df": 1,
+            "max_df_ratio": 1.0,
+            "rho": 0.5,
+            "topk_feature_prompt_per_node": 2,
+            "feature_edge_weight": 0.2,
+        },
+    )
+
+    out_zero = module(
+        z=z,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        edge_scale_multiplier=0.0,
+        no_prompt_logits=no_prompt_logits,
+        h_adp_no_prompt=h_pre * 0.8,
+    )
+    out = module(
+        z=z,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        edge_scale_multiplier=1.0,
+        no_prompt_logits=no_prompt_logits,
+        h_adp_no_prompt=h_pre * 0.8,
+    )
+
+    assert out["adapted_x"].size(0) > z.size(0)
+    assert out["adapted_edge_index"].size(1) > edge_index.size(1)
+    prompt_edges = out["adapted_edge_index"][:, edge_index.size(1) :]
+    assert bool((prompt_edges[0] >= z.size(0)).all())
+    assert bool((prompt_edges[1] < z.size(0)).all())
+    assert out["pool_mask"].dtype == torch.bool
+    assert out["aux"]["p23_feature_prompt_count"].item() == out["prompt_node_x"].size(0)
+    assert out_zero["aux"]["p23_static_cache_hit"].item() == 0.0
+    assert out["aux"]["p23_static_cache_hit"].item() == 1.0
+    assert out_zero["aux"]["prompt_edge_weight"].sum().item() == 0.0
+    assert out["aux"]["prompt_edge_weight"].sum().item() > 0.0
+
+
+def test_p23_variant_config_uses_selective_discrete_feature_prompt_module() -> None:
+    cfg = _config_for_variant(
+        {
+            "experiment": {"prompt_variant": "p23_selective_discrete_feature_prompting"},
+            "prompt_graph": {},
+            "prompt_adapter": {"enabled": True},
+            "prompt_aware": {"enabled": True},
+            "training": {},
+        },
+        "p23_selective_discrete_feature_prompting",
+    )
+
+    assert cfg["prompt_graph"]["enabled"] is True
+    assert cfg["prompt_graph"]["module_type"] == "selective_discrete_feature_prompt"
+    assert cfg["prompt_graph"]["static_graph"] is True
+    assert cfg["prompt_adapter"]["enabled"] is False
+    assert cfg["prompt_aware"]["enabled"] is False
+    assert cfg["training"]["train_prompt_graph_module"] is False
 
 
 def test_class_balanced_support_query_split_is_disjoint_and_train_only() -> None:

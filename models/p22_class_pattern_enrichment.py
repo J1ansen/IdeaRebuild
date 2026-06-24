@@ -59,6 +59,72 @@ def estimate_class_transition_from_support(
     return transition / transition.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
+@torch.no_grad()
+def compute_support_uniform_compatibility_matrix(
+    *,
+    labels: torch.Tensor,
+    support_mask: torch.Tensor,
+    edge_index: torch.Tensor,
+    num_classes: int,
+    alpha: float = 5.0,
+    prior: str = "uniform",
+    support_weight: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Estimate C[neighbor_class, ego_class] with a configurable row prior."""
+
+    k = int(num_classes)
+    if k <= 0:
+        raise ValueError("num_classes must be positive")
+    device = labels.device
+    dtype = torch.float32
+    counts = torch.zeros(k, k, device=device, dtype=dtype)
+    support = support_mask.to(device=device, dtype=torch.bool)
+    y = labels.to(device=device, dtype=torch.long)
+    if edge_index.numel() > 0:
+        src, dst = edge_index.to(device)
+        edge_mask = support[src] & support[dst]
+        neigh_y = y[src[edge_mask]]
+        ego_y = y[dst[edge_mask]]
+        valid = (neigh_y >= 0) & (neigh_y < k) & (ego_y >= 0) & (ego_y < k)
+        neigh_y = neigh_y[valid]
+        ego_y = ego_y[valid]
+        if neigh_y.numel() > 0:
+            flat_idx = neigh_y * k + ego_y
+            counts = counts + torch.bincount(flat_idx, minlength=k * k).to(dtype=dtype).view(k, k)
+    prior_name = str(prior)
+    if prior_name == "uniform":
+        prior_counts = torch.full((k, k), 1.0 / float(k), device=device, dtype=dtype)
+    elif prior_name == "identity":
+        prior_counts = torch.eye(k, device=device, dtype=dtype)
+    elif prior_name == "anti_identity":
+        if k == 1:
+            prior_counts = torch.ones(1, 1, device=device, dtype=dtype)
+        else:
+            prior_counts = torch.full((k, k), 1.0 / float(k - 1), device=device, dtype=dtype)
+            prior_counts.fill_diagonal_(0.0)
+    else:
+        raise ValueError(f"Unsupported transition_prior={prior_name!r}")
+    total = max(0.0, float(support_weight)) * counts + max(0.0, float(alpha)) * prior_counts
+    transition = total / total.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    row_entropy = -(transition * transition.clamp_min(1e-12).log()).sum(dim=-1)
+    if k > 1:
+        row_entropy = row_entropy / math.log(float(k))
+    diag = torch.diagonal(transition)
+    offdiag_mask = ~torch.eye(k, dtype=torch.bool, device=device)
+    offdiag = transition[offdiag_mask]
+    support_edge_count = counts.sum()
+    stats = {
+        "transition_support_edge_count": support_edge_count,
+        "transition_support_nonzero_row_ratio": (counts.sum(dim=-1) > 0).to(dtype=dtype).mean(),
+        "transition_support_class_pair_coverage": (counts > 0).to(dtype=dtype).mean(),
+        "transition_C_row_entropy": row_entropy.mean(),
+        "transition_C_diag_mean": diag.mean(),
+        "transition_C_offdiag_mean": offdiag.mean() if offdiag.numel() > 0 else transition.new_tensor(0.0),
+        "transition_C_max_mean": transition.max(dim=-1).values.mean(),
+    }
+    return transition, stats
+
+
 class P22ClassPatternEnrichmentBank(nn.Module):
     """Basis-supervised logit-evidence adapter for P22.
 
@@ -112,6 +178,14 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         self.use_class_transition = bool(self.config.get("use_class_transition", True))
         self.transition_type = str(self.config.get("transition_type", "support_edges"))
         self.class_transition_smoothing = float(self.config.get("class_transition_smoothing", 0.5))
+        self.use_transition_basis = bool(self.config.get("use_transition_basis", False))
+        self.transition_matrix_mode = str(self.config.get("transition_matrix_mode", "support_edges"))
+        self.transition_prior = str(self.config.get("transition_prior", "uniform"))
+        self.transition_alpha = float(self.config.get("transition_alpha", 5.0))
+        self.transition_lambda_support = float(self.config.get("transition_lambda_support", 1.0))
+        self.transition_lambda_pseudo = float(self.config.get("transition_lambda_pseudo", 0.0))
+        if self.transition_lambda_pseudo != 0.0 and self.transition_matrix_mode == "support_uniform":
+            raise ValueError("P22 support_uniform transition basis keeps transition_lambda_pseudo at 0.0")
         self.basis_usage_entropy_floor = float(self.config.get("basis_usage_entropy_floor", 0.60))
         self.normalize_basis_evidence = bool(self.config.get("normalize_basis_evidence", False))
         self.basis_evidence_std_floor = float(self.config.get("basis_evidence_std_floor", 0.5))
@@ -331,7 +405,7 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         edge_index: torch.Tensor,
         support_mask: torch.Tensor | None,
         labels: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         logits = base_logits.detach()
         num_nodes = int(logits.size(0))
         prob = F.softmax(logits, dim=-1)
@@ -345,7 +419,23 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             labels_t = torch.zeros(num_nodes, dtype=torch.long, device=logits.device)
         else:
             labels_t = labels.to(device=logits.device, dtype=torch.long)
-        if self.transition_type == "support_neighbor_prob":
+        transition_stats: dict[str, torch.Tensor] = {}
+        if self.use_transition_basis and self.transition_matrix_mode == "support_uniform":
+            transition, transition_stats = compute_support_uniform_compatibility_matrix(
+                labels=labels_t,
+                support_mask=support,
+                edge_index=edge_index,
+                num_classes=self.num_classes,
+                alpha=self.transition_alpha,
+                prior=self.transition_prior,
+                support_weight=self.transition_lambda_support,
+            )
+            transition = transition.to(device=logits.device, dtype=logits.dtype).detach()
+            transition_stats = {
+                key: value.to(device=logits.device, dtype=logits.dtype)
+                for key, value in transition_stats.items()
+            }
+        elif self.transition_type == "support_neighbor_prob":
             transition = logits.new_full(
                 (self.num_classes, self.num_classes),
                 float(self.class_transition_smoothing),
@@ -366,10 +456,13 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         else:
             raise ValueError(f"Unsupported P22 transition_type={self.transition_type!r}")
 
+        onehop_transition_prob = (neigh_prob @ transition).clamp_min(self.eps)
+        onehop_transition_logprob = onehop_transition_prob.log()
+        ego_logprob = prob.clamp_min(self.eps).log()
         values: list[torch.Tensor] = []
         for basis_type in self.basis_types:
             if basis_type == "ego_logprob":
-                values.append(prob.clamp_min(self.eps).log())
+                values.append(ego_logprob)
             elif basis_type == "onehop_logprob":
                 values.append(neigh_prob.clamp_min(self.eps).log())
             elif basis_type == "twohop_logprob":
@@ -384,6 +477,10 @@ class P22ClassPatternEnrichmentBank(nn.Module):
                     values.append(transition_evidence.clamp_min(self.eps).log())
                 else:
                     values.append(logits.new_zeros(num_nodes, self.num_classes))
+            elif basis_type == "onehop_transition_logprob":
+                values.append(onehop_transition_logprob)
+            elif basis_type == "highpass_ego_transition_onehop":
+                values.append(ego_logprob - onehop_transition_logprob)
             else:
                 raise ValueError(f"Unsupported P22 basis type: {basis_type!r}")
         basis_evidence = torch.stack(values, dim=1)
@@ -391,7 +488,7 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             basis_evidence = basis_evidence - basis_evidence.mean(dim=-1, keepdim=True)
             std = basis_evidence.std(dim=-1, keepdim=True).detach().clamp_min(self.basis_evidence_std_floor)
             basis_evidence = basis_evidence / std
-        return basis_evidence, transition
+        return basis_evidence, transition, transition_stats
 
     def _reliability_features(
         self,
@@ -471,7 +568,7 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         )
         enrichment_evidence = pattern_weights @ enrichment.t()
         if self.use_basis_evidence:
-            basis_evidence, transition_matrix = self._basis_evidence(
+            basis_evidence, transition_matrix, transition_stats = self._basis_evidence(
                 base_logits=base_logits,
                 edge_index=edge_index,
                 support_mask=support_mask,
@@ -489,6 +586,7 @@ class P22ClassPatternEnrichmentBank(nn.Module):
         else:
             basis_evidence = h_adp.new_zeros(h_adp.size(0), self.num_bases, self.num_classes)
             transition_matrix = h_adp.new_zeros(self.num_classes, self.num_classes)
+            transition_stats = {}
             pattern_basis_weight = F.softmax(self.pattern_basis_logits, dim=-1)
             basis_pattern_evidence = h_adp.new_zeros(h_adp.size(0), self.num_classes)
             student_basis = pattern_weights @ pattern_basis_weight
@@ -574,6 +672,7 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             "basis_usage_entropy": basis_usage_entropy,
             "basis_usage_loss": basis_usage_loss,
             "transition_matrix": transition_matrix,
+            "basis_names": list(self.basis_types),
             "class_pattern_enrichment": enrichment,
             "class_pattern": class_pattern,
             "class_pattern_kl_to_global": class_pattern_kl,
@@ -606,4 +705,5 @@ class P22ClassPatternEnrichmentBank(nn.Module):
             "prompt_update_clip_ratio": h_adp.new_tensor(0.0),
             "high_frequency_norm": h_adp.new_tensor(0.0),
             "low_frequency_norm": h_adp.new_tensor(0.0),
+            **transition_stats,
         }
