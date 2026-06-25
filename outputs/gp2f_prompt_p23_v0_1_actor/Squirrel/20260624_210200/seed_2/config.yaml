@@ -1,34 +1,32 @@
 experiment:
   name: gp2f_prompt_p23_v0_1_actor
-  seed: 0
-  runs: 1
+  seed: 2
+  runs: 5
   source_dataset: Cora
-  target_dataset: Actor
+  target_dataset: Squirrel
   prompt_variant: p23_v0_1
-
+  seeds: null
 data:
   root: /Users/jackson/MyIdea/data
   download_if_missing: false
   shots: 5
   homophily_shots: 5
   auto_shot_by_dataset: true
-  heterophily_shot_ratio: 0.10
+  heterophily_shot_ratio: 0.1
   heterophily_datasets:
-    - Actor
-    - Squirrel
-    - Chameleon
-    - Texas
-    - Cornell
-    - Wisconsin
-    - Minesweeper
-    - Tolokers
-    - Questions
+  - Actor
+  - Squirrel
+  - Chameleon
+  - Texas
+  - Cornell
+  - Wisconsin
+  - Minesweeper
+  - Tolokers
+  - Questions
   val_per_class: 30
-
 pretrained:
   checkpoint_path: pretrained_gnns/lr_0.0005_weightdecay_0.0005_hid_dim_128.pkl
   freeze_backbone: true
-
 model:
   hidden_dim: 128
   input_aligner: identity_if_same_dim
@@ -38,14 +36,12 @@ model:
   adapter_alpha_init: 0.1
   fusion_alpha_style: sigmoid
   alpha_init: 0.5
-
 loss:
   use_cls: true
   use_original_contrastive: false
   use_original_topology_fusion: false
   lambda_ctr: 0.0
   lambda_fus: 0.0
-
 prompt_graph:
   enabled: true
   module_type: p23_v0_1
@@ -55,29 +51,39 @@ prompt_graph:
     topk: 8
     binary_topk: 16
   risk:
-    lambda_homo: [0.35, 0.25, 0.20, 0.10, 0.10]
-    lambda_hetero: [0.25, 0.20, 0.20, 0.15, 0.20]
+    lambda_homo:
+    - 0.35
+    - 0.25
+    - 0.2
+    - 0.1
+    - 0.1
+    lambda_hetero:
+    - 0.25
+    - 0.2
+    - 0.2
+    - 0.15
+    - 0.2
   graph_risk_weights:
-    ego_neighbor: 0.40
-    onehop_twohop: 0.30
-    neighbor_variance: 0.30
+    ego_neighbor: 0.4
+    onehop_twohop: 0.3
+    neighbor_variance: 0.3
   pool:
     adaptive_ratio: true
     rho_min: 0.05
-    rho_max: 0.20
+    rho_max: 0.2
     rho_power: 1.0
     force_train_nodes: true
   feature_filter:
     min_df_pool: 2
-    max_df_pool_ratio: 0.50
-    max_df_global_ratio: 0.80
+    max_df_pool_ratio: 0.5
+    max_df_global_ratio: 0.8
   prompt_graph:
     init_scope: global_same_feature
     edge_type_prompt_to_node: 2
     topk_feature_prompt_per_node: 4
   receiver:
     max_update_norm: 0.02
-    prompt_dropout: 0.10
+    prompt_dropout: 0.1
     init_gate_bias: -5.0
   edge_scale_warmup_epochs: 20
   edge_scale_warmup_start: 0.0
@@ -109,13 +115,10 @@ prompt_graph:
   lambda_correction_anti_harm: 0.0
   lambda_p23_norm: 0.01
   lambda_p23_hub_budget: 0.01
-
 prompt_aware:
   enabled: false
-
 prompt_adapter:
   enabled: false
-
 training:
   epochs: 250
   lr: 0.001
@@ -135,8 +138,8 @@ training:
   train_prompt_graph_module: true
   train_prompt_adapter: false
   train_prompt_aware_module: false
-  base_checkpoint_path:
-  base_checkpoint_root:
+  base_checkpoint_path: null
+  base_checkpoint_root: null
   load_prompt_from_base_checkpoint: false
   enable_test_label_cheat: false
-  test_label_cheat_fraction: 0.10
+  test_label_cheat_fraction: 0.1

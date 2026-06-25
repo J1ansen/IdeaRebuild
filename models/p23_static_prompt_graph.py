@@ -67,10 +67,19 @@ class RawFeatureTokenizer:
             raise ValueError("P23 v0.1 supports raw feature tokenizer modes: binary_nonzero, topk_activation")
         self.topk = int(cfg.get("topk", 8))
         self.binary_threshold = float(cfg.get("binary_threshold", 0.0))
+        self.binary_topk = int(cfg.get("binary_topk", cfg.get("max_nonzero_per_node", 0)))
 
     def __call__(self, x_raw: torch.Tensor) -> torch.Tensor:
         if self.mode == "binary_nonzero":
-            return x_raw.abs() > self.binary_threshold
+            membership = x_raw.abs() > self.binary_threshold
+            if self.binary_topk > 0 and self.binary_topk < int(x_raw.size(1)):
+                capped = torch.zeros_like(membership)
+                scores = x_raw.abs().masked_fill(~membership, float("-inf"))
+                k = min(self.binary_topk, int(x_raw.size(1)))
+                topk = torch.topk(scores, k=k, dim=-1).indices
+                capped.scatter_(1, topk, True)
+                membership = capped & membership
+            return membership
         k = min(max(1, self.topk), int(x_raw.size(1)))
         topk = torch.topk(x_raw.abs(), k=k, dim=-1).indices
         membership = torch.zeros(x_raw.shape, dtype=torch.bool, device=x_raw.device)
@@ -161,20 +170,6 @@ class P23StaticPromptGraphBuilder:
             h_pre_snapshot=h_pre_snapshot,
             h_adp0_snapshot=h_adp0_snapshot,
         )
-        risk_cfg = self.config.get("risk", {})
-        risk_weights = list(risk_cfg.get("lambda_hetero", [0.25, 0.20, 0.20, 0.15, 0.20]))
-        heterophily_risk = _minmax(
-            self._weighted_sum(
-                [
-                    components["ego_neighbor"],
-                    components["onehop_twohop"],
-                    components["neighbor_variance"],
-                    components["uncertainty"],
-                    components["branch_disagreement"],
-                ],
-                [float(item) for item in risk_weights],
-            )
-        )
         graph_weights = self.config.get("graph_risk_weights", {})
         graph_risk_score = self._weighted_sum(
             [
@@ -188,6 +183,25 @@ class P23StaticPromptGraphBuilder:
                 float(graph_weights.get("neighbor_variance", 0.30)),
             ],
         ).mean().clamp(0.0, 1.0)
+        risk_cfg = self.config.get("risk", {})
+        lambda_hetero = [float(item) for item in risk_cfg.get("lambda_hetero", [0.25, 0.20, 0.20, 0.15, 0.20])]
+        lambda_homo = [float(item) for item in risk_cfg.get("lambda_homo", lambda_hetero)]
+        if len(lambda_homo) != len(lambda_hetero):
+            raise ValueError("P23 risk.lambda_homo and risk.lambda_hetero must have the same length")
+        gamma = float(graph_risk_score.detach().item())
+        risk_weights = [(1.0 - gamma) * h + gamma * g for h, g in zip(lambda_homo, lambda_hetero)]
+        heterophily_risk = _minmax(
+            self._weighted_sum(
+                [
+                    components["ego_neighbor"],
+                    components["onehop_twohop"],
+                    components["neighbor_variance"],
+                    components["uncertainty"],
+                    components["branch_disagreement"],
+                ],
+                risk_weights,
+            )
+        )
 
         pool_cfg = self.config.get("pool", {})
         rho_min = float(pool_cfg.get("rho_min", 0.05))
@@ -228,24 +242,14 @@ class P23StaticPromptGraphBuilder:
             sums = init_membership.to(dtype=dtype).t() @ z_snapshot.detach()
             denom = init_membership.to(dtype=dtype).sum(dim=0).clamp_min(1.0)
             prompt_x = sums / denom.unsqueeze(-1)
-            pool_feature_membership = membership[:, feature_ids] & pool_mask.unsqueeze(-1)
-            edge_node, edge_feature_local = torch.nonzero(pool_feature_membership, as_tuple=True)
-            prompt_edge_index = torch.stack([edge_feature_local, edge_node], dim=0)
-            prompt_edge_type = torch.full(
-                (prompt_edge_index.size(1),),
-                int(self.config.get("prompt_graph", {}).get("edge_type_prompt_to_node", 2)),
-                dtype=torch.long,
-                device=device,
-            )
         else:
             prompt_x = z_snapshot.new_zeros((0, z_snapshot.size(1)))
-            prompt_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-            prompt_edge_type = torch.empty(0, dtype=torch.long, device=device)
 
         df_pool_sel = df_pool[feature_ids] if feature_ids.numel() > 0 else z_snapshot.new_zeros(0)
         df_global_sel = df_global[feature_ids] if feature_ids.numel() > 0 else z_snapshot.new_zeros(0)
         idf = torch.log((z_snapshot.new_tensor(float(num_nodes)) + 1.0) / (df_global_sel + 1.0))
-        pool_rel = df_pool_sel / max(1.0, float(pool_mask.sum().item()))
+        pool_freq = df_pool_sel / max(1.0, float(pool_mask.sum().item()))
+        pool_rel = df_pool_sel / (df_global_sel + 1.0)
         if feature_ids.numel() > 0:
             rows, local_cols = torch.nonzero(membership[:, feature_ids], as_tuple=True)
             z_norm = F.normalize(z_snapshot.detach(), dim=-1, eps=1e-12)
@@ -258,6 +262,37 @@ class P23StaticPromptGraphBuilder:
             cohesion = z_snapshot.new_zeros(0)
         hub_score = df_global_sel / max(1.0, float(num_nodes))
         static_reliability = _minmax(idf + cohesion + pool_rel - hub_score) if feature_ids.numel() > 0 else z_snapshot.new_zeros(0)
+
+        if feature_ids.numel() > 0:
+            pool_feature_membership = membership[:, feature_ids] & pool_mask.unsqueeze(-1)
+            edge_node, edge_feature_local = torch.nonzero(pool_feature_membership, as_tuple=True)
+            topk_per_node = int(
+                self.config.get("prompt_graph", {}).get(
+                    "topk_feature_prompt_per_node",
+                    self.config.get("topk_feature_prompt_per_node", 0),
+                )
+            )
+            if topk_per_node > 0 and edge_node.numel() > 0:
+                keep = torch.zeros(edge_node.size(0), dtype=torch.bool, device=device)
+                edge_score = static_reliability[edge_feature_local] * heterophily_risk[edge_node].clamp_min(1e-6)
+                for node in torch.unique(edge_node).tolist():
+                    mask = edge_node == int(node)
+                    local_idx = torch.where(mask)[0]
+                    k = min(topk_per_node, int(local_idx.numel()))
+                    chosen = local_idx[torch.topk(edge_score[local_idx], k=k, largest=True).indices]
+                    keep[chosen] = True
+                edge_node = edge_node[keep]
+                edge_feature_local = edge_feature_local[keep]
+            prompt_edge_index = torch.stack([edge_feature_local, edge_node], dim=0) if edge_node.numel() > 0 else torch.empty((2, 0), dtype=torch.long, device=device)
+            prompt_edge_type = torch.full(
+                (prompt_edge_index.size(1),),
+                int(self.config.get("prompt_graph", {}).get("edge_type_prompt_to_node", 2)),
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            prompt_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+            prompt_edge_type = torch.empty(0, dtype=torch.long, device=device)
         if prompt_edge_index.numel() > 0:
             prompt_edge_prior = static_reliability[prompt_edge_index[0]].clamp_min(1e-6)
         else:
@@ -269,6 +304,7 @@ class P23StaticPromptGraphBuilder:
             "df_global": df_global_sel,
             "idf": idf,
             "pool_rel": pool_rel,
+            "pool_freq": pool_freq,
             "cohesion": cohesion,
             "hub_score": hub_score,
             "static_reliability": static_reliability,

@@ -119,6 +119,25 @@ def _prompt_variant(config: dict[str, Any]) -> str:
     return str(experiment_cfg.get("prompt_variant", prompt_graph_cfg.get("variant", "p1_graph")))
 
 
+def _resolve_shot_setting(data_cfg: dict[str, Any], experiment_cfg: dict[str, Any], target_dataset: str) -> tuple[int, float | None, str]:
+    shots = int(data_cfg.get("shots", experiment_cfg.get("shots", 5)))
+    shot_ratio_raw = data_cfg.get("shot_ratio", experiment_cfg.get("shot_ratio"))
+    shot_ratio = None if shot_ratio_raw is None else float(shot_ratio_raw)
+    if not bool(data_cfg.get("auto_shot_by_dataset", False)):
+        return shots, shot_ratio, "explicit_ratio" if shot_ratio is not None else "explicit_shots"
+
+    hetero_names = {
+        str(name).lower()
+        for name in data_cfg.get(
+            "heterophily_datasets",
+            ["Actor", "Squirrel", "Chameleon", "Texas", "Cornell", "Wisconsin", "Minesweeper", "Tolokers", "Questions"],
+        )
+    }
+    if str(target_dataset).lower() in hetero_names:
+        return shots, float(data_cfg.get("heterophily_shot_ratio", 0.10)), "heterophily_10pct"
+    return int(data_cfg.get("homophily_shots", shots)), None, "homophily_5shot"
+
+
 def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
     if variant not in PROMPT_GRAPH_VARIANTS:
         raise ValueError(f"Unsupported prompt_variant={variant!r}")
@@ -209,13 +228,27 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         prompt_aware["enabled"] = False
         prompt_adapter["enabled"] = False
         prompt_graph.setdefault("module_type", "p23_v0_1")
-        prompt_graph.setdefault("feature_tokenizer", {"mode": "binary_nonzero", "topk": 8, "binary_threshold": 0.0})
-        prompt_graph.setdefault("risk", {"lambda_hetero": [0.25, 0.20, 0.20, 0.15, 0.20]})
+        prompt_graph.setdefault(
+            "feature_tokenizer",
+            {"mode": "binary_nonzero", "topk": 8, "binary_threshold": 0.0, "binary_topk": 16},
+        )
+        prompt_graph.setdefault(
+            "risk",
+            {
+                "lambda_homo": [0.35, 0.25, 0.20, 0.10, 0.10],
+                "lambda_hetero": [0.25, 0.20, 0.20, 0.15, 0.20],
+            },
+        )
         prompt_graph.setdefault("graph_risk_weights", {"ego_neighbor": 0.40, "onehop_twohop": 0.30, "neighbor_variance": 0.30})
-        prompt_graph.setdefault("pool", {"adaptive_ratio": True, "rho_min": 0.08, "rho_max": 0.30, "rho_power": 1.0, "force_train_nodes": True})
+        prompt_graph.setdefault("pool", {"adaptive_ratio": True, "rho_min": 0.05, "rho_max": 0.20, "rho_power": 1.0, "force_train_nodes": True})
         prompt_graph.setdefault("feature_filter", {"min_df_pool": 2, "max_df_pool_ratio": 0.50, "max_df_global_ratio": 0.80})
-        prompt_graph.setdefault("prompt_graph", {"init_scope": "global_same_feature", "edge_type_prompt_to_node": 2})
-        prompt_graph.setdefault("receiver", {"max_update_norm": 0.05, "prompt_dropout": 0.10, "init_gate_bias": -2.0})
+        prompt_graph.setdefault(
+            "prompt_graph",
+            {"init_scope": "global_same_feature", "edge_type_prompt_to_node": 2, "topk_feature_prompt_per_node": 4},
+        )
+        prompt_graph.setdefault("receiver", {"max_update_norm": 0.02, "prompt_dropout": 0.10, "init_gate_bias": -5.0})
+        prompt_graph.setdefault("edge_scale_warmup_epochs", 20)
+        prompt_graph.setdefault("edge_scale_warmup_start", 0.0)
         prompt_graph.setdefault("lambda_edge_l1", 0.0)
         prompt_graph.setdefault("lambda_prompt_balance", 0.0)
         prompt_graph.setdefault("lambda_prompt_role_diversity", 0.0)
@@ -2137,6 +2170,58 @@ def _prompt_aware_diagnostics(model_out: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _attach_p23_ce_delta_diagnostics(
+    *,
+    model_out: dict[str, Any],
+    prompt_out: dict[str, Any],
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    val_mask: torch.Tensor | None = None,
+    test_mask: torch.Tensor | None = None,
+) -> None:
+    base_logits = model_out.get("p23_no_receiver_logits")
+    prompt_logits = model_out.get("logits")
+    if not isinstance(base_logits, torch.Tensor) or not isinstance(prompt_logits, torch.Tensor):
+        return
+    aux = prompt_out.setdefault("aux", {})
+    with torch.no_grad():
+        y = labels.to(device=prompt_logits.device, dtype=torch.long)
+        ce_base = F.cross_entropy(base_logits.to(device=prompt_logits.device), y, reduction="none")
+        ce_prompt = F.cross_entropy(prompt_logits.detach(), y, reduction="none")
+        delta = ce_base - ce_prompt
+    pool = prompt_out.get("pool_mask")
+    pool_mask = (
+        pool.to(device=prompt_logits.device, dtype=torch.bool)
+        if isinstance(pool, torch.Tensor)
+        else torch.zeros(delta.size(0), dtype=torch.bool, device=prompt_logits.device)
+    )
+
+    def put(name: str, mask: torch.Tensor | None) -> None:
+        if mask is None:
+            return
+        m = mask.to(device=prompt_logits.device, dtype=torch.bool)
+        if not bool(m.any()):
+            aux[f"p23_{name}_delta_ce_mean"] = delta.new_tensor(0.0)
+            aux[f"p23_{name}_positive_delta_ratio"] = delta.new_tensor(0.0)
+            return
+        values = delta[m]
+        aux[f"p23_{name}_delta_ce_mean"] = values.mean()
+        aux[f"p23_{name}_positive_delta_ratio"] = (values > 0).to(dtype=delta.dtype).mean()
+
+    put("train", train_mask)
+    put("val", val_mask)
+    put("test", test_mask)
+    put("train_pool", train_mask.to(device=prompt_logits.device, dtype=torch.bool) & pool_mask)
+    if val_mask is not None:
+        put("val_pool", val_mask.to(device=prompt_logits.device, dtype=torch.bool) & pool_mask)
+    if test_mask is not None:
+        put("test_pool", test_mask.to(device=prompt_logits.device, dtype=torch.bool) & pool_mask)
+    put("pool", pool_mask)
+    put("nonpool", ~pool_mask)
+    aux["p23_ce_delta_train_mean"] = aux.get("p23_train_delta_ce_mean", delta.new_tensor(0.0))
+    aux["p23_ce_delta_pool_mean"] = aux.get("p23_pool_delta_ce_mean", delta.new_tensor(0.0))
+
+
 def _forward_prompt_graph(
     *,
     model: FaithfulGP2F,
@@ -2175,7 +2260,11 @@ def _forward_prompt_graph(
         forward_kwargs["prompt_update_mask"] = prompt_out.get("pool_mask")
     model_out = model.forward_with_h_pre(z, edge_index, **forward_kwargs)
     if isinstance(prompt_graph_module, P23V01PromptModule):
-        receiver_out = prompt_graph_module.apply_receiver(model_out["h_adp"])
+        no_receiver_logits = model_out["logits"]
+        receiver_out = prompt_graph_module.apply_receiver(
+            model_out["h_adp"],
+            edge_scale=prompt_out.get("edge_scale", 1.0),
+        )
         h_adp = receiver_out["h_adp"]
         alpha = model_out["alpha"]
         h_mix = alpha * model_out["h_pre"] + (1.0 - alpha) * h_adp
@@ -2183,6 +2272,7 @@ def _forward_prompt_graph(
         model_out["h_mix"] = h_mix
         model_out["logits"] = model.classifier(h_mix)
         model_out["p23_receiver"] = receiver_out
+        model_out["p23_no_receiver_logits"] = no_receiver_logits.detach()
         prompt_out["aux"].update(prompt_graph_module.receiver_aux(receiver_out))
     model_out["h_pre_shared"] = h_pre
     return model_out, prompt_out
@@ -5824,6 +5914,14 @@ def evaluate_prompt_graph(
         h_adp_no_prompt=None if no_prompt_out is None else no_prompt_out["h_adp"],
     )
     logits = model_out["logits"]
+    _attach_p23_ce_delta_diagnostics(
+        model_out=model_out,
+        prompt_out=prompt_out,
+        labels=labels,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        test_mask=test_mask,
+    )
     branch_cosine = torch.nn.functional.cosine_similarity(model_out["h_pre"], model_out["h_adp"], dim=-1).mean()
     train = split_metrics(logits, labels, train_mask, num_classes=num_classes)
     val = split_metrics(logits, labels, val_mask, num_classes=num_classes)
@@ -6243,10 +6341,15 @@ def run_single(
         download_if_missing=bool(data_cfg.get("download_if_missing", False)),
     )
     graph = loaded.data.to(device)
+    effective_shots, effective_shot_ratio, shot_setting_mode = _resolve_shot_setting(
+        data_cfg,
+        experiment_cfg,
+        target_dataset,
+    )
     split = build_few_shot_split(
         graph.y,
-        shots=int(data_cfg.get("shots", experiment_cfg.get("shots", 5))),
-        shot_ratio=data_cfg.get("shot_ratio", experiment_cfg.get("shot_ratio")),
+        shots=effective_shots,
+        shot_ratio=effective_shot_ratio,
         val_per_class=int(data_cfg.get("val_per_class", experiment_cfg.get("val_per_class", 30))),
         seed=seed,
     )
@@ -7663,6 +7766,14 @@ def run_single(
                 h_adp_no_prompt=None if no_prompt_out is None else no_prompt_out["h_adp"],
             )
             cls_loss = F.cross_entropy(model_out["logits"][label_train_mask], graph.y[label_train_mask])
+        _attach_p23_ce_delta_diagnostics(
+            model_out=model_out,
+            prompt_out=prompt_out,
+            labels=graph.y,
+            train_mask=label_train_mask,
+            val_mask=split.val_mask,
+            test_mask=split.test_mask,
+        )
         edge_l1 = prompt_edge_l1_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_balance = prompt_balance_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         p23_norm = (
@@ -8771,6 +8882,9 @@ def run_single(
         "actual_test_label_cheat_fraction": actual_test_label_cheat_fraction,
         "test_label_cheat_count": cheat_test_label_count,
         "label_train_count": int(label_train_mask.sum().item()),
+        "shot_setting_mode": shot_setting_mode,
+        "effective_shots": int(effective_shots),
+        "effective_shot_ratio": None if effective_shot_ratio is None else float(effective_shot_ratio),
         "rho": float(prompt_graph_cfg.get("rho", 0.0)),
         "topk_prompt_per_node": int(prompt_graph_cfg.get("topk_prompt_per_node", 0)),
         "num_nodes": int(graph.num_nodes),

@@ -72,6 +72,7 @@ class P23HubAwarePromptReceiver(nn.Module):
         *,
         h_base: torch.Tensor,
         state: P23PromptGraphState,
+        edge_scale: torch.Tensor | float = 1.0,
     ) -> dict[str, torch.Tensor]:
         device = h_base.device
         dtype = h_base.dtype
@@ -137,6 +138,12 @@ class P23HubAwarePromptReceiver(nn.Module):
                 entropy_terms.append(-(probs * probs.clamp_min(1e-12).log()).sum())
             edge_entropy = torch.stack(entropy_terms).mean() if entropy_terms else h_base.new_tensor(0.0)
 
+        edge_scale_tensor = (
+            edge_scale.to(device=device, dtype=dtype)
+            if isinstance(edge_scale, torch.Tensor)
+            else h_base.new_tensor(float(edge_scale))
+        )
+        update = update * edge_scale_tensor.clamp_min(0.0)
         h_adp = h_base + update
         update_norm_flat = update.norm(dim=-1)
         pool = state.pool_mask.to(device=device, dtype=torch.bool)
@@ -235,6 +242,8 @@ class P23V01PromptModule(nn.Module):
             "p23_prompt_edge_count": z.new_tensor(float(state.prompt_edge_index.size(1))),
             "p23_df_pool_mean": mean_or_zero(stats.get("df_pool", z.new_zeros(0))),
             "p23_df_global_mean": mean_or_zero(stats.get("df_global", z.new_zeros(0))),
+            "p23_pool_freq_mean": mean_or_zero(stats.get("pool_freq", z.new_zeros(0))),
+            "p23_pool_concentration_mean": mean_or_zero(stats.get("pool_rel", z.new_zeros(0))),
             "p23_static_reliability_mean": mean_or_zero(stats.get("static_reliability", z.new_zeros(0))),
             "p23_hub_score_mean": mean_or_zero(stats.get("hub_score", z.new_zeros(0))),
             "p23_ce_delta_pool_mean": z.new_tensor(0.0),
@@ -271,8 +280,8 @@ class P23V01PromptModule(nn.Module):
             "aux": self._static_aux(state, z, edge_index, train_mask),
         }
 
-    def apply_receiver(self, h_base: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self.receiver(h_base=h_base, state=self._state(h_base))
+    def apply_receiver(self, h_base: torch.Tensor, edge_scale: torch.Tensor | float = 1.0) -> dict[str, torch.Tensor]:
+        return self.receiver(h_base=h_base, state=self._state(h_base), edge_scale=edge_scale)
 
     def receiver_aux(self, receiver_out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         hub_gate = receiver_out["hub_gate"]

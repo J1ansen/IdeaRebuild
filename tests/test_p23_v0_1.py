@@ -143,6 +143,23 @@ def test_receiver_output_shape_and_bounded_update():
     assert out["prompt_update"].norm(dim=-1).max() <= 0.030001
 
 
+def test_receiver_edge_scale_zero_degenerates_to_no_prompt_update():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    state = P23StaticPromptGraphBuilder(_config()).build(
+        x_raw=x_raw,
+        z_snapshot=z,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_pre_snapshot=h_pre,
+        h_adp0_snapshot=h_adp,
+    )
+    receiver = P23HubAwarePromptReceiver(source_dim=3, hidden_dim=6, config=_config())
+    out = receiver(h_base=h_pre, state=state, edge_scale=0.0)
+    assert torch.allclose(out["h_adp"], h_pre)
+    assert torch.allclose(out["prompt_update"], torch.zeros_like(h_pre))
+
+
 def test_hub_score_contributes_to_budget_loss():
     x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
     state = P23StaticPromptGraphBuilder(_config()).build(
@@ -176,3 +193,43 @@ def test_p23_module_uses_original_graph_and_receiver_only_prompt():
     assert prompt_out["adapted_x"].shape == z.shape
     assert torch.equal(prompt_out["adapted_edge_index"], edge_index)
     assert prompt_out["aux"]["edge_type_counts"][2] == prompt_out["prompt_edge_count"]
+
+
+def test_prompt_graph_keeps_topk_feature_prompts_per_node():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    cfg = _config()
+    cfg["prompt_graph"] = {
+        "init_scope": "global_same_feature",
+        "edge_type_prompt_to_node": 2,
+        "topk_feature_prompt_per_node": 1,
+    }
+    state = P23StaticPromptGraphBuilder(cfg).build(
+        x_raw=x_raw,
+        z_snapshot=z,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_pre_snapshot=h_pre,
+        h_adp0_snapshot=h_adp,
+    )
+    if state.prompt_edge_index.numel() > 0:
+        dst = state.prompt_edge_index[1]
+        assert int(torch.bincount(dst, minlength=x_raw.size(0)).max().item()) <= 1
+
+
+def test_pool_rel_uses_pool_concentration_not_pool_frequency():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    state = P23StaticPromptGraphBuilder(_config()).build(
+        x_raw=x_raw,
+        z_snapshot=z,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_pre_snapshot=h_pre,
+        h_adp0_snapshot=h_adp,
+    )
+    df_pool = state.feature_static_stats["df_pool"]
+    df_global = state.feature_static_stats["df_global"]
+    expected = df_pool / (df_global + 1.0)
+    assert torch.allclose(state.feature_static_stats["pool_rel"], expected)
+    assert "pool_freq" in state.feature_static_stats
