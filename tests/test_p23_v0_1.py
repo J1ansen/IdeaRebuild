@@ -1,5 +1,6 @@
 import torch
 
+from experiments.run_gp2f_prompt_graph import _config_for_variant, _p23_node_gate_utility_loss, _set_module_trainable
 from models.p23_prompt_receiver import P23HubAwarePromptReceiver, P23V01PromptModule
 from models.p23_static_prompt_graph import P23StaticPromptGraphBuilder
 
@@ -53,6 +54,12 @@ def _config():
         "prompt_graph": {"init_scope": "global_same_feature", "edge_type_prompt_to_node": 2},
         "receiver": {"max_update_norm": 0.03, "prompt_dropout": 0.0, "init_gate_bias": -1.0},
     }
+
+
+def test_p23_defaults_keep_aligner_trainable_and_gate_utility_off():
+    cfg = _config_for_variant({"experiment": {"prompt_variant": "p23_v0_1"}}, "p23_v0_1")
+    assert cfg["training"]["freeze_input_aligner_for_p23"] is False
+    assert cfg["prompt_graph"]["lambda_p23_node_gate_utility"] == 0.0
 
 
 def test_train_nodes_are_forced_into_pool():
@@ -233,3 +240,63 @@ def test_pool_rel_uses_pool_concentration_not_pool_frequency():
     expected = df_pool / (df_global + 1.0)
     assert torch.allclose(state.feature_static_stats["pool_rel"], expected)
     assert "pool_freq" in state.feature_static_stats
+
+
+def test_p23_node_gate_utility_loss_uses_train_mask_only():
+    labels = torch.tensor([0, 0, 1, 1])
+    train_mask = torch.tensor([True, True, False, False])
+    node_gate = torch.tensor([0.2, 0.8, 0.2, 0.8], requires_grad=True)
+    base_logits = torch.tensor([[2.0, 0.0], [2.0, 0.0], [2.0, 0.0], [0.0, 2.0]])
+    prompt_logits = torch.tensor([[2.5, 0.0], [0.0, 2.0], [0.0, 2.5], [1.0, 0.0]], requires_grad=True)
+    model_out = {
+        "logits": prompt_logits,
+        "p23_no_receiver_logits": base_logits,
+        "p23_receiver": {"node_receive_gate": node_gate},
+    }
+    prompt_out = {"aux": {}, "pool_mask": torch.ones(4, dtype=torch.bool)}
+    loss, stats = _p23_node_gate_utility_loss(
+        model_out=model_out,
+        prompt_out=prompt_out,
+        labels=labels,
+        train_mask=train_mask,
+        positive_margin=0.001,
+        negative_margin=-0.001,
+        class_balanced=False,
+    )
+    assert loss.requires_grad
+    assert stats["p23_node_gate_utility_count"] == 2.0
+    assert stats["p23_node_gate_positive_count"] == 1.0
+    assert stats["p23_node_gate_negative_count"] == 1.0
+
+
+def test_p23_node_gate_utility_ignores_neutral_delta_ce():
+    labels = torch.tensor([0, 1])
+    train_mask = torch.tensor([True, True])
+    node_gate = torch.tensor([0.5, 0.5], requires_grad=True)
+    logits = torch.tensor([[2.0, 0.0], [0.0, 2.0]], requires_grad=True)
+    model_out = {
+        "logits": logits,
+        "p23_no_receiver_logits": logits.detach().clone(),
+        "p23_receiver": {"node_receive_gate": node_gate},
+    }
+    prompt_out = {"aux": {}, "pool_mask": torch.ones(2, dtype=torch.bool)}
+    loss, stats = _p23_node_gate_utility_loss(
+        model_out=model_out,
+        prompt_out=prompt_out,
+        labels=labels,
+        train_mask=train_mask,
+        positive_margin=0.001,
+        negative_margin=-0.001,
+        class_balanced=True,
+    )
+    assert float(loss.item()) == 0.0
+    assert stats["p23_node_gate_utility_count"] == 0.0
+
+
+def test_freezing_input_aligner_does_not_freeze_p23_receiver():
+    module = P23V01PromptModule(source_dim=3, hidden_dim=6, config=_config())
+    aligner = torch.nn.Linear(3, 3)
+    _set_module_trainable(aligner, False)
+    _set_module_trainable(module, True)
+    assert not any(parameter.requires_grad for parameter in aligner.parameters())
+    assert any(parameter.requires_grad for parameter in module.receiver.parameters())

@@ -2,6 +2,7 @@ experiment:
   name: gp2f_prompt_p23_v0_1_actor
   seed: 0
   runs: 1
+  trials_per_seed: 10
   source_dataset: Cora
   target_dataset: Actor
   prompt_variant: p23_v0_1
@@ -109,6 +110,12 @@ prompt_graph:
   lambda_correction_anti_harm: 0.0
   lambda_p23_norm: 0.01
   lambda_p23_hub_budget: 0.01
+  lambda_p23_node_gate_utility: 0.0
+  p23_node_gate_positive_margin: 0.001
+  p23_node_gate_negative_margin: -0.001
+  p23_node_gate_utility_warmup_epochs: 20
+  p23_node_gate_utility_class_balanced: true
+  p23_log_topk_feature_prompt_delta: 20
 
 prompt_aware:
   enabled: false
@@ -132,6 +139,7 @@ training:
   early_stop_metric: val_acc
   keep_best_checkpoint: true
   freeze_base_model: false
+  freeze_input_aligner_for_p23: false
   train_prompt_graph_module: true
   train_prompt_adapter: false
   train_prompt_aware_module: false

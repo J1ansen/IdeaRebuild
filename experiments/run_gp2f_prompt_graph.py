@@ -31,6 +31,7 @@ from experiments.run_gp2f_baseline import (
     _split_counts,
     set_seed,
 )
+from losses import GP2FLossConfig, compute_gp2f_loss
 from models import (
     ClassConditionedPatternPromptRouter,
     FaithfulGP2F,
@@ -79,6 +80,15 @@ def _format_mean_std(values: list[float], *, scale: float = 100.0, precision: in
     mean = float(tensor.mean().item())
     std = float(tensor.std(unbiased=True).item()) if tensor.numel() > 1 else 0.0
     return f"{mean * scale:.{precision}f} ± {std * scale:.{precision}f}"
+
+
+def _format_gp2f_metric(values: list[float]) -> str:
+    if not values:
+        return "0.0000 ± 0.0000(std)"
+    tensor = torch.tensor(values, dtype=torch.float64)
+    mean = float(tensor.mean().item())
+    std = float(tensor.std(unbiased=True).item()) if tensor.numel() > 1 else 0.0
+    return f"{mean:.4f} ± {std:.4f}(std)"
 
 
 PROMPT_GRAPH_VARIANTS = {
@@ -275,7 +285,14 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         prompt_graph.setdefault("lambda_correction_anti_harm", 0.0)
         prompt_graph.setdefault("lambda_p23_norm", 0.01)
         prompt_graph.setdefault("lambda_p23_hub_budget", 0.01)
+        prompt_graph.setdefault("lambda_p23_node_gate_utility", 0.0)
+        prompt_graph.setdefault("p23_node_gate_positive_margin", 0.001)
+        prompt_graph.setdefault("p23_node_gate_negative_margin", -0.001)
+        prompt_graph.setdefault("p23_node_gate_utility_warmup_epochs", 20)
+        prompt_graph.setdefault("p23_node_gate_utility_class_balanced", True)
+        prompt_graph.setdefault("p23_log_topk_feature_prompt_delta", 20)
         training.setdefault("freeze_base_model", False)
+        training.setdefault("freeze_input_aligner_for_p23", False)
         training.setdefault("train_prompt_graph_module", True)
         training.setdefault("train_prompt_adapter", False)
         training.setdefault("train_prompt_aware_module", False)
@@ -2069,13 +2086,17 @@ def _prompt_graph_diagnostics(
     diagnostics["role_view_weight"] = view_values[2]
     diagnostics["attribute_view_weight"] = view_values[3] if len(view_values) > 3 else 0.0
     for key, value in aux.items():
-        if not str(key).startswith("p23_") or not isinstance(value, torch.Tensor):
+        if not str(key).startswith("p23_") or str(key).endswith("_tensor") or not isinstance(value, torch.Tensor):
             continue
         tensor = value.detach()
         if tensor.numel() == 1:
             diagnostics[str(key)] = float(tensor.item())
         elif tensor.numel() > 0:
             diagnostics[f"{key}_mean"] = float(tensor.to(dtype=torch.float32).mean().item())
+    for key in ["p23_top_helpful_feature_prompts", "p23_top_harmful_feature_prompts"]:
+        value = aux.get(key)
+        if isinstance(value, list):
+            diagnostics[key] = value
     for name in ["semantic_route_margin", "structural_route_margin", "role_route_margin", "attribute_route_margin"]:
         value = aux.get(name)
         diagnostics[name] = float(value.detach().item()) if isinstance(value, torch.Tensor) else 0.0
@@ -2220,6 +2241,157 @@ def _attach_p23_ce_delta_diagnostics(
     put("nonpool", ~pool_mask)
     aux["p23_ce_delta_train_mean"] = aux.get("p23_train_delta_ce_mean", delta.new_tensor(0.0))
     aux["p23_ce_delta_pool_mean"] = aux.get("p23_pool_delta_ce_mean", delta.new_tensor(0.0))
+
+    receiver = model_out.get("p23_receiver", {})
+    node_gate = receiver.get("node_receive_gate") if isinstance(receiver, dict) else None
+    if isinstance(node_gate, torch.Tensor):
+        gate = node_gate.detach().to(device=delta.device, dtype=delta.dtype)
+
+        def corr(name: str, mask: torch.Tensor | None) -> None:
+            if mask is None:
+                return
+            m = mask.to(device=delta.device, dtype=torch.bool)
+            aux[f"p23_node_gate_delta_corr_{name}"] = delta.new_tensor(_pearson_corr(gate[m], delta[m]) if bool(m.any()) else 0.0)
+
+        corr("train", train_mask)
+        corr("val", val_mask)
+        corr("test", test_mask)
+
+    prompt_edge_index = aux.get("p23_prompt_edge_index_tensor")
+    feature_ids = aux.get("p23_feature_ids_tensor")
+    if isinstance(prompt_edge_index, torch.Tensor) and isinstance(feature_ids, torch.Tensor) and prompt_edge_index.numel() > 0:
+        topk = int(aux.get("p23_log_topk_feature_prompt_delta", 20))
+        if topk > 0:
+            edge_prompt = prompt_edge_index[0].to(device=delta.device, dtype=torch.long)
+            edge_node = prompt_edge_index[1].to(device=delta.device, dtype=torch.long)
+            edge_delta = delta[edge_node]
+            prompt_count = int(feature_ids.numel())
+            counts = torch.bincount(edge_prompt, minlength=prompt_count).to(device=delta.device, dtype=delta.dtype)
+            sums = delta.new_zeros(prompt_count)
+            sums.index_add_(0, edge_prompt, edge_delta)
+            mean_delta = sums / counts.clamp_min(1.0)
+            valid = counts > 0
+            if bool(valid.any()):
+                hub_gate = receiver.get("hub_gate") if isinstance(receiver, dict) else None
+                hub = hub_gate.detach().to(device=delta.device, dtype=delta.dtype) if isinstance(hub_gate, torch.Tensor) else delta.new_zeros(prompt_count)
+                df_global = aux.get("p23_df_global_tensor", delta.new_zeros(prompt_count)).to(device=delta.device, dtype=delta.dtype)
+                df_pool = aux.get("p23_df_pool_tensor", delta.new_zeros(prompt_count)).to(device=delta.device, dtype=delta.dtype)
+                pool_rel = aux.get("p23_pool_rel_tensor", delta.new_zeros(prompt_count)).to(device=delta.device, dtype=delta.dtype)
+                static_rel = aux.get("p23_static_reliability_tensor", delta.new_zeros(prompt_count)).to(device=delta.device, dtype=delta.dtype)
+                feature_ids_dev = feature_ids.to(device=delta.device, dtype=torch.long)
+
+                def records(indices: torch.Tensor) -> list[dict[str, float | int]]:
+                    out: list[dict[str, float | int]] = []
+                    for idx in indices.detach().cpu().tolist():
+                        local = int(idx)
+                        out.append(
+                            {
+                                "feature_id": int(feature_ids_dev[local].detach().cpu().item()),
+                                "mean_delta_ce": float(mean_delta[local].detach().cpu().item()),
+                                "count": int(counts[local].detach().cpu().item()),
+                                "hub_gate": float(hub[local].detach().cpu().item()) if hub.numel() > local else 0.0,
+                                "df_global": float(df_global[local].detach().cpu().item()) if df_global.numel() > local else 0.0,
+                                "df_pool": float(df_pool[local].detach().cpu().item()) if df_pool.numel() > local else 0.0,
+                                "pool_rel": float(pool_rel[local].detach().cpu().item()) if pool_rel.numel() > local else 0.0,
+                                "static_reliability": float(static_rel[local].detach().cpu().item()) if static_rel.numel() > local else 0.0,
+                            }
+                        )
+                    return out
+
+                valid_idx = torch.where(valid)[0]
+                k = min(topk, int(valid_idx.numel()))
+                helpful = valid_idx[torch.topk(mean_delta[valid_idx], k=k, largest=True).indices]
+                harmful = valid_idx[torch.topk(mean_delta[valid_idx], k=k, largest=False).indices]
+                aux["p23_top_helpful_feature_prompts"] = records(helpful)
+                aux["p23_top_harmful_feature_prompts"] = records(harmful)
+
+
+def _p23_node_gate_utility_loss(
+    *,
+    model_out: dict[str, Any],
+    prompt_out: dict[str, Any],
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    positive_margin: float,
+    negative_margin: float,
+    class_balanced: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    prompt_logits = model_out.get("logits")
+    base_logits = model_out.get("p23_no_receiver_logits")
+    receiver = model_out.get("p23_receiver", {})
+    node_gate = receiver.get("node_receive_gate") if isinstance(receiver, dict) else None
+    if not isinstance(prompt_logits, torch.Tensor) or not isinstance(base_logits, torch.Tensor) or not isinstance(node_gate, torch.Tensor):
+        fallback = labels.new_tensor(0.0, dtype=torch.float32)
+        return fallback, {
+            "p23_node_gate_utility_loss": 0.0,
+            "p23_node_gate_utility_count": 0.0,
+            "p23_node_gate_positive_count": 0.0,
+            "p23_node_gate_negative_count": 0.0,
+            "p23_node_gate_target_mean": 0.0,
+            "p23_node_gate_delta_corr_train": 0.0,
+        }
+
+    device = prompt_logits.device
+    y = labels.to(device=device, dtype=torch.long)
+    mask = train_mask.to(device=device, dtype=torch.bool)
+    if not bool(mask.any()):
+        return prompt_logits.new_tensor(0.0), {
+            "p23_node_gate_utility_loss": 0.0,
+            "p23_node_gate_utility_count": 0.0,
+            "p23_node_gate_positive_count": 0.0,
+            "p23_node_gate_negative_count": 0.0,
+            "p23_node_gate_target_mean": 0.0,
+            "p23_node_gate_delta_corr_train": 0.0,
+        }
+
+    with torch.no_grad():
+        ce_base = F.cross_entropy(base_logits.to(device=device), y, reduction="none")
+        ce_prompt = F.cross_entropy(prompt_logits.detach(), y, reduction="none")
+        delta = ce_base - ce_prompt
+        positive = delta > float(positive_margin)
+        negative = delta < float(negative_margin)
+        supervised = mask & (positive | negative)
+        target = positive.to(dtype=prompt_logits.dtype)
+
+    if not bool(supervised.any()):
+        return prompt_logits.new_tensor(0.0), {
+            "p23_node_gate_utility_loss": 0.0,
+            "p23_node_gate_utility_count": 0.0,
+            "p23_node_gate_positive_count": 0.0,
+            "p23_node_gate_negative_count": 0.0,
+            "p23_node_gate_target_mean": 0.0,
+            "p23_node_gate_delta_corr_train": _pearson_corr(node_gate.detach()[mask], delta[mask]),
+        }
+
+    gate = node_gate.to(device=device, dtype=prompt_logits.dtype).clamp(1e-6, 1.0 - 1e-6)
+    losses = F.binary_cross_entropy(gate[supervised], target[supervised], reduction="none")
+    if class_balanced:
+        pos_mask = supervised & positive
+        neg_mask = supervised & negative
+        parts = []
+        if bool(pos_mask.any()):
+            parts.append(F.binary_cross_entropy(gate[pos_mask], target[pos_mask], reduction="mean"))
+        if bool(neg_mask.any()):
+            parts.append(F.binary_cross_entropy(gate[neg_mask], target[neg_mask], reduction="mean"))
+        loss = torch.stack(parts).mean() if parts else losses.mean()
+    else:
+        loss = losses.mean()
+
+    aux = prompt_out.setdefault("aux", {})
+    aux["p23_node_gate_utility_loss"] = loss.detach()
+    aux["p23_node_gate_utility_count"] = prompt_logits.new_tensor(float(supervised.sum().item()))
+    aux["p23_node_gate_positive_count"] = prompt_logits.new_tensor(float((supervised & positive).sum().item()))
+    aux["p23_node_gate_negative_count"] = prompt_logits.new_tensor(float((supervised & negative).sum().item()))
+    aux["p23_node_gate_target_mean"] = target[supervised].mean().detach()
+    aux["p23_node_gate_delta_corr_train"] = prompt_logits.new_tensor(_pearson_corr(node_gate.detach()[mask], delta[mask]))
+    return loss, {
+        "p23_node_gate_utility_loss": float(loss.detach().item()),
+        "p23_node_gate_utility_count": float(supervised.sum().item()),
+        "p23_node_gate_positive_count": float((supervised & positive).sum().item()),
+        "p23_node_gate_negative_count": float((supervised & negative).sum().item()),
+        "p23_node_gate_target_mean": float(target[supervised].mean().detach().item()),
+        "p23_node_gate_delta_corr_train": _pearson_corr(node_gate.detach()[mask], delta[mask]),
+    }
 
 
 def _forward_prompt_graph(
@@ -5876,10 +6048,16 @@ def evaluate_prompt_graph(
         return {
             "train_acc": train["acc"],
             "train_macro_f1": train["macro_f1"],
+            "train_auroc": train.get("auroc", 0.0),
+            "train_auprc": train.get("auprc", 0.0),
             "val_acc": val["acc"],
             "val_macro_f1": val["macro_f1"],
+            "val_auroc": val.get("auroc", 0.0),
+            "val_auprc": val.get("auprc", 0.0),
             "test_acc": test["acc"],
             "test_macro_f1": test["macro_f1"],
+            "test_auroc": test.get("auroc", 0.0),
+            "test_auprc": test.get("auprc", 0.0),
             "alpha": float(model_out["alpha"].detach().item()),
             "branch_cosine": float(branch_cosine.detach().item()),
             "pool_ratio": float(update_mask.float().mean().item()),
@@ -5929,10 +6107,16 @@ def evaluate_prompt_graph(
     return {
         "train_acc": train["acc"],
         "train_macro_f1": train["macro_f1"],
+        "train_auroc": train.get("auroc", 0.0),
+        "train_auprc": train.get("auprc", 0.0),
         "val_acc": val["acc"],
         "val_macro_f1": val["macro_f1"],
+        "val_auroc": val.get("auroc", 0.0),
+        "val_auprc": val.get("auprc", 0.0),
         "test_acc": test["acc"],
         "test_macro_f1": test["macro_f1"],
+        "test_auroc": test.get("auroc", 0.0),
+        "test_auprc": test.get("auprc", 0.0),
         "alpha": float(model_out["alpha"].detach().item()),
         "branch_cosine": float(branch_cosine.detach().item()),
         **_prompt_aware_diagnostics(model_out),
@@ -6327,8 +6511,11 @@ def run_single(
     prompt_aware_cfg = config.get("prompt_aware", {})
     prompt_adapter_cfg = config.get("prompt_adapter", {})
     training_cfg = config.get("training", {})
+    loss_cfg_raw = config.get("loss", {})
 
     seed = int(experiment_cfg.get("seed", 0))
+    split_seed = int(experiment_cfg.get("split_seed", seed))
+    trial_index = int(experiment_cfg.get("trial_index", 0))
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     target_dataset = str(experiment_cfg.get("target_dataset", "Cora"))
@@ -6341,6 +6528,20 @@ def run_single(
         download_if_missing=bool(data_cfg.get("download_if_missing", False)),
     )
     graph = loaded.data.to(device)
+    gp2f_aux_loss_cfg = GP2FLossConfig(
+        use_cls=False,
+        use_original_contrastive=bool(loss_cfg_raw.get("use_original_contrastive", False)),
+        use_original_topology_fusion=bool(loss_cfg_raw.get("use_original_topology_fusion", False)),
+        lambda_ctr=float(loss_cfg_raw.get("lambda_ctr", 0.0)),
+        lambda_fus=float(loss_cfg_raw.get("lambda_fus", 0.0)),
+        tau_ctr=float(loss_cfg_raw.get("tau_ctr", 0.5)),
+        tau_fus=float(loss_cfg_raw.get("tau_fus", 0.05)),
+        topology_percentile=float(loss_cfg_raw.get("topology_percentile", 70.0)),
+        dense_contrastive_max_nodes=int(loss_cfg_raw.get("dense_contrastive_max_nodes", 5000)),
+        contrastive_sample_size=int(loss_cfg_raw.get("contrastive_sample_size", 2048)),
+        dense_topology_max_nodes=int(loss_cfg_raw.get("dense_topology_max_nodes", 5000)),
+        topology_sample_size=int(loss_cfg_raw.get("topology_sample_size", 20000)),
+    )
     effective_shots, effective_shot_ratio, shot_setting_mode = _resolve_shot_setting(
         data_cfg,
         experiment_cfg,
@@ -6351,7 +6552,7 @@ def run_single(
         shots=effective_shots,
         shot_ratio=effective_shot_ratio,
         val_per_class=int(data_cfg.get("val_per_class", experiment_cfg.get("val_per_class", 30))),
-        seed=seed,
+        seed=split_seed,
     )
 
     checkpoint_path = _resolve_path(
@@ -6488,6 +6689,12 @@ def run_single(
     if freeze_base_model:
         _set_module_trainable(input_aligner, False)
         _set_module_trainable(model, False)
+    p23_freeze_input_aligner = (
+        isinstance(prompt_graph_module, P23V01PromptModule)
+        and bool(training_cfg.get("freeze_input_aligner_for_p23", False))
+    )
+    if p23_freeze_input_aligner:
+        _set_module_trainable(input_aligner, False)
     if isinstance(model, PromptAwareGP2F):
         _set_prompt_aware_trainable(
             model,
@@ -6519,7 +6726,10 @@ def run_single(
     if run_group_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_group_dir = output_root / loaded.name / timestamp
-    run_dir = run_group_dir / f"seed_{seed}"
+    if "trial_index" in experiment_cfg:
+        run_dir = run_group_dir / f"seed_{split_seed}" / f"trial_{trial_index}"
+    else:
+        run_dir = run_group_dir / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     write_yaml(run_dir / "config.yaml", config)
 
@@ -6620,6 +6830,11 @@ def run_single(
     lambda_p23_hub_budget = float(
         prompt_graph_cfg.get("lambda_p23_hub_budget", prompt_graph_cfg.get("hub_budget_weight", 0.0))
     )
+    lambda_p23_node_gate_utility = float(prompt_graph_cfg.get("lambda_p23_node_gate_utility", 0.0))
+    p23_node_gate_positive_margin = float(prompt_graph_cfg.get("p23_node_gate_positive_margin", 0.001))
+    p23_node_gate_negative_margin = float(prompt_graph_cfg.get("p23_node_gate_negative_margin", -0.001))
+    p23_node_gate_utility_warmup_epochs = int(prompt_graph_cfg.get("p23_node_gate_utility_warmup_epochs", 0))
+    p23_node_gate_utility_class_balanced = bool(prompt_graph_cfg.get("p23_node_gate_utility_class_balanced", True))
     lambda_prompt_adapter_update_norm = float(training_cfg.get("lambda_prompt_adapter_update_norm", 0.0))
     lambda_prompt_adapter_gate_budget = float(training_cfg.get("lambda_prompt_adapter_gate_budget", 0.0))
     lambda_prompt_adapter_message_help = float(training_cfg.get("lambda_prompt_adapter_message_help", 0.0))
@@ -6873,7 +7088,10 @@ def run_single(
     stopped_epoch = epochs
     early_stopped = False
 
-    run_label = f"{loaded.name} seed={seed} {variant}"
+    if "trial_index" in experiment_cfg:
+        run_label = f"{loaded.name} split_seed={split_seed} trial={trial_index} {variant}"
+    else:
+        run_label = f"{loaded.name} seed={seed} {variant}"
     if total_runs > 1:
         run_label = f"{run_label} ({run_index + 1}/{total_runs})"
     progress = tqdm(range(1, epochs + 1), desc=run_label, unit="epoch", dynamic_ncols=True)
@@ -7774,6 +7992,17 @@ def run_single(
             val_mask=split.val_mask,
             test_mask=split.test_mask,
         )
+        gp2f_aux_loss = compute_gp2f_loss(
+            logits=model_out["logits"],
+            labels=graph.y,
+            train_mask=label_train_mask,
+            h_pre=model_out["h_pre"],
+            h_adp=model_out["h_adp"],
+            h_mix=model_out["h_mix"],
+            alpha=model_out.get("alpha"),
+            edge_index=graph.edge_index,
+            cfg=gp2f_aux_loss_cfg,
+        )
         edge_l1 = prompt_edge_l1_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         prompt_balance = prompt_balance_loss(prompt_out) if prompt_graph_module is not None else z.new_tensor(0.0)
         p23_norm = (
@@ -7786,6 +8015,32 @@ def run_single(
             if prompt_graph_module is not None
             else z.new_tensor(0.0)
         )
+        if (
+            isinstance(prompt_graph_module, P23V01PromptModule)
+            and lambda_p23_node_gate_utility > 0.0
+            and epoch > p23_node_gate_utility_warmup_epochs
+        ):
+            p23_node_gate_utility, p23_node_gate_utility_stats = _p23_node_gate_utility_loss(
+                model_out=model_out,
+                prompt_out=prompt_out,
+                labels=graph.y,
+                train_mask=label_train_mask,
+                positive_margin=p23_node_gate_positive_margin,
+                negative_margin=p23_node_gate_negative_margin,
+                class_balanced=p23_node_gate_utility_class_balanced,
+            )
+        else:
+            p23_node_gate_utility = z.new_tensor(0.0)
+            p23_node_gate_utility_stats = {
+                "p23_node_gate_utility_loss": 0.0,
+                "p23_node_gate_utility_count": 0.0,
+                "p23_node_gate_positive_count": 0.0,
+                "p23_node_gate_negative_count": 0.0,
+                "p23_node_gate_target_mean": 0.0,
+                "p23_node_gate_delta_corr_train": float(prompt_out.get("aux", {}).get("p23_node_gate_delta_corr_train", z.new_tensor(0.0)).detach().item())
+                if isinstance(prompt_out.get("aux", {}).get("p23_node_gate_delta_corr_train"), torch.Tensor)
+                else 0.0,
+            }
         legacy_prompt_graph = isinstance(prompt_graph_module, PromptGraphModuleP1)
         prompt_role_diversity = (
             prompt_role_diversity_loss(prompt_graph_module) if legacy_prompt_graph else z.new_tensor(0.0)
@@ -8252,6 +8507,7 @@ def run_single(
         p22_aux_loss = p22_warmup_loss + p22_deployment_aux_loss
         full_loss = (
             cls_loss
+            + gp2f_aux_loss.total
             + lambda_edge_l1 * edge_l1
             + lambda_prompt_balance * prompt_balance
             + lambda_prompt_role_diversity * prompt_role_diversity
@@ -8278,6 +8534,7 @@ def run_single(
             + lambda_correction_anti_harm * correction_alignment_anti_harm
             + lambda_p23_norm * p23_norm
             + lambda_p23_hub_budget * p23_hub_budget
+            + lambda_p23_node_gate_utility * p23_node_gate_utility
             + lambda_prompt_adapter_update_norm * prompt_adapter_update_norm
             + lambda_prompt_adapter_gate_budget * prompt_adapter_budget
             + lambda_prompt_adapter_message_help * prompt_adapter_message_help
@@ -8324,6 +8581,7 @@ def run_single(
             z=z,
             train_mask=label_train_mask,
         )
+        prompt_log.update(p23_node_gate_utility_stats)
         prompt_aware_log = _prompt_aware_diagnostics(model_out)
         log_item = {
             "epoch": float(epoch),
@@ -8335,6 +8593,10 @@ def run_single(
             "total": float(loss.detach().item()),
             "full_loss": float(full_loss.detach().item()),
             "p22_aux_loss": float(p22_aux_loss.detach().item()),
+            "gp2f_contrastive_loss": float(gp2f_aux_loss.contrastive.detach().item()),
+            "gp2f_topology_fusion_loss": float(gp2f_aux_loss.topology_fusion.detach().item()),
+            "gp2f_contrastive_mode": gp2f_aux_loss.contrastive_mode,
+            "gp2f_topology_mode": gp2f_aux_loss.topology_mode,
             "p22_stage1_active": float(p22_stage1_active),
             "cls": float(cls_loss.detach().item()),
             "edge_l1": float(edge_l1.detach().item()),
@@ -8363,6 +8625,7 @@ def run_single(
             "correction_alignment_anti_harm_loss": float(correction_alignment_anti_harm.detach().item()),
             "p23_norm_loss": float(p23_norm.detach().item()),
             "p23_hub_budget_loss": float(p23_hub_budget.detach().item()),
+            "p23_node_gate_utility_loss": float(p23_node_gate_utility.detach().item()),
             "prompt_adapter_update_norm_loss": float(prompt_adapter_update_norm.detach().item()),
             "prompt_adapter_gate_budget_loss": float(prompt_adapter_budget.detach().item()),
             "prompt_adapter_message_help_loss": float(prompt_adapter_message_help.detach().item()),
@@ -8420,6 +8683,10 @@ def run_single(
             "lambda_correction_anti_harm": lambda_correction_anti_harm,
             "lambda_p23_norm": lambda_p23_norm,
             "lambda_p23_hub_budget": lambda_p23_hub_budget,
+            "lambda_p23_node_gate_utility": lambda_p23_node_gate_utility,
+            "p23_node_gate_utility_warmup_epochs": float(p23_node_gate_utility_warmup_epochs),
+            "lambda_gp2f_contrastive": gp2f_aux_loss_cfg.lambda_ctr,
+            "lambda_gp2f_topology_fusion": gp2f_aux_loss_cfg.lambda_fus,
             "lambda_prompt_adapter_update_norm": lambda_prompt_adapter_update_norm,
             "lambda_prompt_adapter_gate_budget": lambda_prompt_adapter_gate_budget,
             "lambda_prompt_adapter_message_help": lambda_prompt_adapter_message_help,
@@ -8653,6 +8920,10 @@ def run_single(
                     "total": float(loss.detach().item()),
                     "full_loss": float(full_loss.detach().item()),
                     "p22_aux_loss": float(p22_aux_loss.detach().item()),
+                    "gp2f_contrastive_loss": float(gp2f_aux_loss.contrastive.detach().item()),
+                    "gp2f_topology_fusion_loss": float(gp2f_aux_loss.topology_fusion.detach().item()),
+                    "gp2f_contrastive_mode": gp2f_aux_loss.contrastive_mode,
+                    "gp2f_topology_mode": gp2f_aux_loss.topology_mode,
                     "p22_stage1_active": float(p22_stage1_active),
                     "cls": float(cls_loss.detach().item()),
                     "edge_l1": float(edge_l1.detach().item()),
@@ -8875,6 +9146,8 @@ def run_single(
     result = {
         "dataset": loaded.name,
         "seed": seed,
+        "base_seed": int(experiment_cfg.get("base_seed", split_seed)),
+        "trial_index": trial_index,
         "split_seed": split.seed,
         "prompt_variant": variant,
         "test_label_cheat_enabled": enable_test_label_cheat,
@@ -8885,6 +9158,18 @@ def run_single(
         "shot_setting_mode": shot_setting_mode,
         "effective_shots": int(effective_shots),
         "effective_shot_ratio": None if effective_shot_ratio is None else float(effective_shot_ratio),
+        "p23_freeze_input_aligner": bool(p23_freeze_input_aligner),
+        "p23_freeze_base_model": bool(freeze_base_model),
+        "p23_train_receiver": bool(training_cfg.get("train_prompt_graph_module", True) and isinstance(prompt_graph_module, P23V01PromptModule)),
+        "p23_train_classifier": bool(any(parameter.requires_grad for parameter in model.classifier.parameters())),
+        "p23_train_fusion_alpha": bool(
+            (getattr(model, "raw_alpha", None) is not None and getattr(model, "raw_alpha").requires_grad)
+            or (getattr(model, "alpha_logit", None) is not None and getattr(model, "alpha_logit").requires_grad)
+        ),
+        "use_original_contrastive": bool(gp2f_aux_loss_cfg.use_original_contrastive),
+        "use_original_topology_fusion": bool(gp2f_aux_loss_cfg.use_original_topology_fusion),
+        "lambda_gp2f_contrastive": float(gp2f_aux_loss_cfg.lambda_ctr),
+        "lambda_gp2f_topology_fusion": float(gp2f_aux_loss_cfg.lambda_fus),
         "rho": float(prompt_graph_cfg.get("rho", 0.0)),
         "topk_prompt_per_node": int(prompt_graph_cfg.get("topk_prompt_per_node", 0)),
         "num_nodes": int(graph.num_nodes),
@@ -9082,6 +9367,7 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     variant = _prompt_variant(config)
     config = _config_for_variant(config, variant)
     seeds = _resolve_run_seeds(config)
+    trials_per_seed = max(1, int(config.get("experiment", {}).get("trials_per_seed", 1)))
     output_root = _resolve_path(config.get("training", {}).get("output_dir", "outputs/gp2f_prompt_p1"), base_dir=repo_root)
     target_dataset = str(config.get("experiment", {}).get("target_dataset", "Cora"))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -9101,75 +9387,96 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     scale_selection_metric = str(config.get("training", {}).get("message_scale_selection_metric", "val_acc"))
 
     results: list[dict[str, Any]] = []
-    for idx, seed in enumerate(seeds):
-        if diagnostic_mode:
-            for scale in scale_grid:
-                seed_config = _deep_update(
-                    config,
-                    {
-                        "experiment": {"seed": seed},
-                        "prompt_aware": {"message_scale": float(scale), "message_scale_grid": [float(scale)]},
-                        "training": {"diagnose_prompt_message_utility": True},
-                    },
-                )
+    total_run_count = len(seeds) * trials_per_seed
+    run_counter = 0
+    for seed in seeds:
+        for trial_idx in range(trials_per_seed):
+            trial_seed = int(seed) if trials_per_seed == 1 else int(seed) * 1000003 + int(trial_idx)
+            trial_update = {
+                "experiment": {
+                    "seed": trial_seed,
+                    "split_seed": int(seed),
+                    "trial_index": int(trial_idx),
+                    "base_seed": int(seed),
+                }
+            }
+            current_run_index = run_counter
+            run_counter += 1
+
+            if diagnostic_mode:
+                for scale in scale_grid:
+                    seed_config = _deep_update(
+                        config,
+                        {
+                            **trial_update,
+                            "prompt_aware": {"message_scale": float(scale), "message_scale_grid": [float(scale)]},
+                            "training": {"diagnose_prompt_message_utility": True},
+                        },
+                    )
+                    result = run_single(
+                        seed_config,
+                        repo_root=repo_root,
+                        run_index=current_run_index,
+                        total_runs=total_run_count,
+                        run_group_dir=summary_dir / f"scale_{_scale_label(scale)}",
+                    )
+                    result["diagnostic_message_scale"] = float(scale)
+                    result["selected_message_scale"] = float(scale)
+                    result["message_scale_selection_metric"] = "diagnostic_fixed_scale"
+                    results.append(result)
+            elif use_scale_grid:
+                candidates: list[dict[str, Any]] = []
+                for scale in scale_grid:
+                    seed_config = _deep_update(
+                        config,
+                        {
+                            **trial_update,
+                            "prompt_aware": {"message_scale": float(scale)},
+                        },
+                    )
+                    result = run_single(
+                        seed_config,
+                        repo_root=repo_root,
+                        run_index=current_run_index,
+                        total_runs=total_run_count,
+                        run_group_dir=summary_dir / f"scale_{_scale_label(scale)}",
+                    )
+                    result["candidate_message_scale"] = float(scale)
+                    candidates.append(result)
+                selected = _select_message_scale_candidate(candidates, metric=scale_selection_metric)
+                selected = copy.deepcopy(selected)
+                selected["selected_message_scale"] = float(selected.get("candidate_message_scale", 0.0))
+                selected["message_scale_selection_metric"] = scale_selection_metric
+                selected["message_scale_candidates"] = [
+                    _compact_scale_candidate(candidate, scale_selection_metric) for candidate in candidates
+                ]
+                results.append(selected)
+            else:
+                seed_config = _deep_update(config, trial_update)
                 result = run_single(
                     seed_config,
                     repo_root=repo_root,
-                    run_index=idx,
-                    total_runs=len(seeds),
-                    run_group_dir=summary_dir / f"scale_{_scale_label(scale)}",
+                    run_index=current_run_index,
+                    total_runs=total_run_count,
+                    run_group_dir=summary_dir,
                 )
-                result["diagnostic_message_scale"] = float(scale)
-                result["selected_message_scale"] = float(scale)
-                result["message_scale_selection_metric"] = "diagnostic_fixed_scale"
+                if scale_grid:
+                    result["selected_message_scale"] = float(scale_grid[0])
+                    result["message_scale_selection_metric"] = scale_selection_metric
                 results.append(result)
-        elif use_scale_grid:
-            candidates: list[dict[str, Any]] = []
-            for scale in scale_grid:
-                seed_config = _deep_update(
-                    config,
-                    {
-                        "experiment": {"seed": seed},
-                        "prompt_aware": {"message_scale": float(scale)},
-                    },
-                )
-                result = run_single(
-                    seed_config,
-                    repo_root=repo_root,
-                    run_index=idx,
-                    total_runs=len(seeds),
-                    run_group_dir=summary_dir / f"scale_{_scale_label(scale)}",
-                )
-                result["candidate_message_scale"] = float(scale)
-                candidates.append(result)
-            selected = _select_message_scale_candidate(candidates, metric=scale_selection_metric)
-            selected = copy.deepcopy(selected)
-            selected["selected_message_scale"] = float(selected.get("candidate_message_scale", 0.0))
-            selected["message_scale_selection_metric"] = scale_selection_metric
-            selected["message_scale_candidates"] = [
-                _compact_scale_candidate(candidate, scale_selection_metric) for candidate in candidates
-            ]
-            results.append(selected)
-        else:
-            seed_config = _deep_update(config, {"experiment": {"seed": seed}})
-            result = run_single(
-                seed_config,
-                repo_root=repo_root,
-                run_index=idx,
-                total_runs=len(seeds),
-                run_group_dir=summary_dir,
-            )
-            if scale_grid:
-                result["selected_message_scale"] = float(scale_grid[0])
-                result["message_scale_selection_metric"] = scale_selection_metric
-            results.append(result)
 
     best_test = [float(result["best"].get("test_acc", 0.0)) for result in results]
     best_macro_f1 = [float(result["best"].get("test_macro_f1", 0.0)) for result in results]
+    best_auroc = [float(result["best"].get("test_auroc", 0.0)) for result in results]
+    best_auprc = [float(result["best"].get("test_auprc", 0.0)) for result in results]
     final_test = [float(result["final"].get("test_acc", 0.0)) for result in results]
     final_macro_f1 = [float(result["final"].get("test_macro_f1", 0.0)) for result in results]
+    final_auroc = [float(result["final"].get("test_auroc", 0.0)) for result in results]
+    final_auprc = [float(result["final"].get("test_auprc", 0.0)) for result in results]
     safe_test = [float(result.get("safe", {}).get("test_acc", 0.0)) for result in results]
     safe_macro_f1 = [float(result.get("safe", {}).get("test_macro_f1", 0.0)) for result in results]
+    safe_auroc = [float(result.get("safe", {}).get("test_auroc", 0.0)) for result in results]
+    safe_auprc = [float(result.get("safe", {}).get("test_auprc", 0.0)) for result in results]
     safe_found = [float(result.get("safe", {}).get("p22_safe_checkpoint_found", 0.0)) for result in results]
     cheat_enabled = [float(bool(result.get("test_label_cheat_enabled", False))) for result in results]
     cheat_fractions = [float(result.get("actual_test_label_cheat_fraction", 0.0)) for result in results]
@@ -9179,18 +9486,29 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
         "dataset": target_dataset,
         "prompt_variant": variant,
         "seeds": seeds,
-        "num_runs": len(seeds),
+        "trials_per_seed": trials_per_seed,
+        "num_runs": len(results),
         "test_label_cheat_enabled": any(bool(value) for value in cheat_enabled),
         "actual_test_label_cheat_fraction_mean_std": _format_mean_std(cheat_fractions),
-        "test_label_cheat_count_mean_std": _format_mean_std(cheat_counts),
-        "label_train_count_mean_std": _format_mean_std(label_train_counts),
+        "test_label_cheat_count_mean_std": _format_mean_std(cheat_counts, scale=1.0),
+        "label_train_count_mean_std": _format_mean_std(label_train_counts, scale=1.0),
         "best_test_acc_mean_std": _format_mean_std(best_test),
         "best_test_macro_f1_mean_std": _format_mean_std(best_macro_f1),
+        "best_test_auroc_mean_std": _format_mean_std(best_auroc),
+        "best_test_auprc_mean_std": _format_mean_std(best_auprc),
         "final_test_acc_mean_std": _format_mean_std(final_test),
         "final_test_macro_f1_mean_std": _format_mean_std(final_macro_f1),
+        "final_test_auroc_mean_std": _format_mean_std(final_auroc),
+        "final_test_auprc_mean_std": _format_mean_std(final_auprc),
         "safe_test_acc_mean_std": _format_mean_std(safe_test),
         "safe_test_macro_f1_mean_std": _format_mean_std(safe_macro_f1),
+        "safe_test_auroc_mean_std": _format_mean_std(safe_auroc),
+        "safe_test_auprc_mean_std": _format_mean_std(safe_auprc),
         "safe_checkpoint_found_mean_std": _format_mean_std(safe_found),
+        "gp2f_all_trials_final_test_accuracy": _format_gp2f_metric(final_test),
+        "gp2f_all_trials_final_test_f1": _format_gp2f_metric(final_macro_f1),
+        "gp2f_all_trials_final_test_auroc": _format_gp2f_metric(final_auroc),
+        "gp2f_all_trials_final_test_auprc": _format_gp2f_metric(final_auprc),
         "message_scale_grid": scale_grid,
         "message_scale_selection_metric": scale_selection_metric if scale_grid else "",
         "message_scale_selection_enabled": use_scale_grid,
@@ -9772,6 +10090,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     with (summary_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         fieldnames = [
             "seed",
+            "base_seed",
+            "split_seed",
+            "trial_index",
             "test_label_cheat_enabled",
             "test_label_cheat_fraction",
             "actual_test_label_cheat_fraction",
@@ -9780,12 +10101,18 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             "best_epoch",
             "best_test_acc",
             "best_test_macro_f1",
+            "best_test_auroc",
+            "best_test_auprc",
             "safe_checkpoint_found",
             "safe_test_acc",
             "safe_test_macro_f1",
+            "safe_test_auroc",
+            "safe_test_auprc",
             "safe_val_delta_ce",
             "final_test_acc",
             "final_test_macro_f1",
+            "final_test_auroc",
+            "final_test_auprc",
             "alpha",
             "branch_cosine",
             "rho",
@@ -10078,6 +10405,9 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
             writer.writerow(
                 {
                     "seed": result["seed"],
+                    "base_seed": result.get("base_seed", result.get("split_seed", result["seed"])),
+                    "split_seed": result.get("split_seed", result["seed"]),
+                    "trial_index": result.get("trial_index", 0),
                     "test_label_cheat_enabled": result.get("test_label_cheat_enabled", False),
                     "test_label_cheat_fraction": result.get("test_label_cheat_fraction", 0.0),
                     "actual_test_label_cheat_fraction": result.get("actual_test_label_cheat_fraction", 0.0),
@@ -10086,12 +10416,18 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                     "best_epoch": result["best"].get("best_epoch", 0.0),
                     "best_test_acc": result["best"].get("test_acc", 0.0),
                     "best_test_macro_f1": result["best"].get("test_macro_f1", 0.0),
+                    "best_test_auroc": result["best"].get("test_auroc", 0.0),
+                    "best_test_auprc": result["best"].get("test_auprc", 0.0),
                     "safe_checkpoint_found": result.get("safe", {}).get("p22_safe_checkpoint_found", 0.0),
                     "safe_test_acc": result.get("safe", {}).get("test_acc", 0.0),
                     "safe_test_macro_f1": result.get("safe", {}).get("test_macro_f1", 0.0),
+                    "safe_test_auroc": result.get("safe", {}).get("test_auroc", 0.0),
+                    "safe_test_auprc": result.get("safe", {}).get("test_auprc", 0.0),
                     "safe_val_delta_ce": result.get("safe", {}).get("p22_safe_val_delta_ce", 0.0),
                     "final_test_acc": result["final"].get("test_acc", 0.0),
                     "final_test_macro_f1": result["final"].get("test_macro_f1", 0.0),
+                    "final_test_auroc": result["final"].get("test_auroc", 0.0),
+                    "final_test_auprc": result["final"].get("test_auprc", 0.0),
                     "alpha": result["best"].get("alpha", 0.0),
                     "branch_cosine": result["best"].get("branch_cosine", 0.0),
                     "rho": result.get("rho", 0.0),
@@ -10478,13 +10814,23 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
                 }
             )
     print("=" * 72)
-    print(f"Summary | dataset={target_dataset} | variant={variant} | runs={len(seeds)}")
+    print(
+        f"Summary | dataset={target_dataset} | variant={variant} | "
+        f"seeds={len(seeds)} | trials_per_seed={trials_per_seed} | runs={len(results)}"
+    )
     print(f"Best Test Acc:      {summary['best_test_acc_mean_std']}")
     print(f"Best Test Macro-F1: {summary['best_test_macro_f1_mean_std']}")
     print(f"Safe Test Acc:      {summary['safe_test_acc_mean_std']}")
     print(f"Safe Found:         {summary['safe_checkpoint_found_mean_std']}")
     print(f"Final Test Acc:     {summary['final_test_acc_mean_std']}")
     print(f"Final Test Macro-F1: {summary['final_test_macro_f1_mean_std']}")
+    print(
+        f"All {len(results)} trials | test Accuracy {_format_gp2f_metric(final_test)} | "
+        f"F1 {_format_gp2f_metric(final_macro_f1)} | "
+        f"AUROC {_format_gp2f_metric(final_auroc)} | "
+        f"AUPRC {_format_gp2f_metric(final_auprc)}"
+    )
+    print("-----------------")
     print(f"Saved summary to {summary_dir / 'summary.json'}")
     return summary
 
@@ -10501,6 +10847,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--seeds", type=str, default=None)
     parser.add_argument("--runs", type=int, default=None)
+    parser.add_argument("--trials_per_seed", type=int, default=None)
     parser.add_argument("--prompt_variant", type=str, choices=sorted(PROMPT_GRAPH_VARIANTS), default=None)
     parser.add_argument("--rho", type=float, default=None)
     parser.add_argument("--num_prompt_nodes", type=int, default=None)
@@ -10669,6 +11016,8 @@ def main() -> None:
     if args.runs is not None:
         overrides.setdefault("experiment", {})["runs"] = args.runs
         overrides.setdefault("experiment", {})["seeds"] = None
+    if args.trials_per_seed is not None:
+        overrides.setdefault("experiment", {})["trials_per_seed"] = args.trials_per_seed
     if args.epochs is not None:
         overrides.setdefault("training", {})["epochs"] = args.epochs
     if args.lr is not None:
