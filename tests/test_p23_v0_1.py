@@ -1,6 +1,7 @@
 import torch
 
 from experiments.run_gp2f_prompt_graph import _config_for_variant, _p23_node_gate_utility_loss, _set_module_trainable
+from models.discrete_feature_prompt import GraphiteStylePromptGraphAdapter
 from models.p23_prompt_receiver import P23HubAwarePromptReceiver, P23V01PromptModule
 from models.p23_static_prompt_graph import P23StaticPromptGraphBuilder
 
@@ -60,6 +61,15 @@ def test_p23_defaults_keep_aligner_trainable_and_gate_utility_off():
     cfg = _config_for_variant({"experiment": {"prompt_variant": "p23_v0_1"}}, "p23_v0_1")
     assert cfg["training"]["freeze_input_aligner_for_p23"] is False
     assert cfg["prompt_graph"]["lambda_p23_node_gate_utility"] == 0.0
+
+
+def test_p23_graphite_variant_uses_graphite_adapter_module_defaults():
+    cfg = _config_for_variant({"experiment": {"prompt_variant": "p23_graphite_adapter"}}, "p23_graphite_adapter")
+    assert cfg["prompt_graph"]["module_type"] == "graphite_style_prompt_graph"
+    assert cfg["prompt_graph"]["feature_edge_weight"] == 1.0
+    assert cfg["prompt_graph"]["learn_feature_edge_weight"] is True
+    assert cfg["prompt_aware"]["enabled"] is False
+    assert cfg["prompt_adapter"]["enabled"] is False
 
 
 def test_train_nodes_are_forced_into_pool():
@@ -165,6 +175,49 @@ def test_receiver_edge_scale_zero_degenerates_to_no_prompt_update():
     out = receiver(h_base=h_pre, state=state, edge_scale=0.0)
     assert torch.allclose(out["h_adp"], h_pre)
     assert torch.allclose(out["prompt_update"], torch.zeros_like(h_pre))
+
+
+def test_p23_learnable_prompt_delta_gets_gradients():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    cfg = _config()
+    cfg["prompt_token"] = {"learn_delta": True}
+    module = P23V01PromptModule(source_dim=3, hidden_dim=6, config=cfg)
+    module.build_state(
+        x_raw=x_raw,
+        z_snapshot=z,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_pre_snapshot=h_pre,
+        h_adp0_snapshot=h_adp,
+    )
+    assert module.prompt_delta is not None
+    out = module.apply_receiver(h_pre)
+    loss = out["h_adp"].sum()
+    loss.backward()
+    assert module.prompt_delta.grad is not None
+    assert torch.isfinite(module.prompt_delta.grad).all()
+
+
+def test_p23_node_to_prompt_channel_reports_context():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    cfg = _config()
+    cfg["node_to_prompt"] = {"enabled": True, "scale": 0.5}
+    module = P23V01PromptModule(source_dim=3, hidden_dim=6, config=cfg)
+    module.build_state(
+        x_raw=x_raw,
+        z_snapshot=z,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_pre_snapshot=h_pre,
+        h_adp0_snapshot=h_adp,
+    )
+    out = module.apply_receiver(h_pre)
+    aux = module.receiver_aux(out)
+    assert aux["p23_node_to_prompt_enabled"].item() == 1.0
+    assert aux["p23_prompt_context_norm_mean"].item() >= 0.0
+    assert "node_to_prompt_attention" in out
 
 
 def test_hub_score_contributes_to_budget_loss():
@@ -300,3 +353,60 @@ def test_freezing_input_aligner_does_not_freeze_p23_receiver():
     _set_module_trainable(module, True)
     assert not any(parameter.requires_grad for parameter in aligner.parameters())
     assert any(parameter.requires_grad for parameter in module.receiver.parameters())
+
+
+def test_graphite_style_adapter_expands_adapted_graph_with_raw_feature_nodes():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    cfg = {
+        "feature_tokenizer": {"mode": "binary_nonzero", "binary_threshold": 0.0, "binary_topk": 0},
+        "feature_filter": {"min_df_global": 1, "max_df_global_ratio": 1.0},
+        "feature_edge_weight": 1.0,
+        "learn_feature_edge_weight": True,
+    }
+    module = GraphiteStylePromptGraphAdapter(source_dim=3, hidden_dim=6, config=cfg)
+    out = module(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    assert out["adapted_x"].size(0) > z.size(0)
+    assert out["adapted_edge_index"].size(1) > edge_index.size(1)
+    assert torch.all(out["pool_mask"])
+    assert out["aux"]["p23_graphite_enabled"].item() == 1.0
+    assert out["aux"]["edge_type_counts"][1] == out["prompt_edge_count"]
+    feature_edge_weight = out["adapted_edge_weight"][edge_index.size(1) :]
+    assert feature_edge_weight.requires_grad
+
+
+def test_graphite_style_adapter_static_cache_reuses_topology():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    cfg = {
+        "feature_tokenizer": {"mode": "binary_nonzero", "binary_threshold": 0.0},
+        "feature_filter": {"min_df_global": 1, "max_df_global_ratio": 1.0},
+        "static_graph": True,
+    }
+    module = GraphiteStylePromptGraphAdapter(source_dim=3, hidden_dim=6, config=cfg)
+    first = module(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    second = module(
+        z=z + 1.0,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    assert torch.equal(first["adapted_edge_index"], second["adapted_edge_index"])
+    assert second["aux"]["p23_graphite_static_cache_hit"].item() == 1.0

@@ -5,7 +5,7 @@ from models.class_conditioned_pattern_prompt_router import (
     ClassConditionedPatternPromptRouter,
     prompt_router_pattern_balance_loss,
 )
-from models.discrete_feature_prompt import SelectiveDiscreteFeaturePromptGraph
+from models.discrete_feature_prompt import GraphiteStylePromptGraphAdapter, SelectiveDiscreteFeaturePromptGraph
 from models.faithful_gp2f import FaithfulGP2F
 from models.hetero_prompt_adapter import HeterophilyAwarePromptAdapter
 from models.p21_adaptive_filter import P21LiteAdaptiveFilter
@@ -22,6 +22,7 @@ __all__ = [
     "BaseGCN",
     "ClassConditionedPatternPromptRouter",
     "FaithfulGP2F",
+    "GraphiteStylePromptGraphAdapter",
     "HeterophilyAwarePromptAdapter",
     "ParameterMatchedResidualControl",
     "P21LiteAdaptiveFilter",

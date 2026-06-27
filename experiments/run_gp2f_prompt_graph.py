@@ -42,6 +42,7 @@ from models import (
     P23V01PromptModule,
     PromptAwareGP2F,
     PromptGraphModuleP1,
+    GraphiteStylePromptGraphAdapter,
     SelectiveDiscreteFeaturePromptGraph,
     UtilitySupervisedPatternPromptRouter,
     load_pretrained_gcn,
@@ -115,8 +116,10 @@ PROMPT_GRAPH_VARIANTS = {
     "p22_reliability_calibrated_basis_bank",
     "p22_v031_conservative_reliability_basis_bank",
     "p22_v04_minimal_transition_basis",
+    "p23_v0_2_message_passing",
     "p23_v0_1",
     "p23_selective_discrete_feature_prompting",
+    "p23_graphite_adapter",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -233,7 +236,40 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         training.setdefault("early_stop_min_epochs", 80)
         training.setdefault("early_stop_patience", 60)
         training.setdefault("output_dir", "outputs/gp2f_prompt_p23_selective_discrete_feature_prompting")
-    if variant == "p23_v0_1":
+    if variant == "p23_graphite_adapter":
+        prompt_graph["enabled"] = True
+        prompt_aware["enabled"] = False
+        prompt_adapter["enabled"] = False
+        prompt_graph.setdefault("module_type", "graphite_style_prompt_graph")
+        prompt_graph.setdefault("static_graph", True)
+        prompt_graph.setdefault(
+            "feature_tokenizer",
+            {"mode": "binary_nonzero", "binary_threshold": 0.0, "binary_topk": 0, "topk": 0},
+        )
+        prompt_graph.setdefault("feature_filter", {"min_df_global": 2, "max_df_global_ratio": 0.80})
+        prompt_graph.setdefault("use_feature_filter", True)
+        prompt_graph.setdefault("feature_edge_weight", 1.0)
+        prompt_graph.setdefault("original_edge_weight", 1.0)
+        prompt_graph.setdefault("learn_feature_edge_weight", True)
+        prompt_graph.setdefault("detach_feature_prompt", True)
+        prompt_graph.setdefault("edge_scale_warmup_epochs", 0)
+        prompt_graph.setdefault("edge_scale_warmup_start", 1.0)
+        prompt_graph.setdefault("lambda_edge_l1", 0.0)
+        prompt_graph.setdefault("lambda_prompt_balance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.0)
+        prompt_graph.setdefault("lambda_prompt_view_entropy", 0.0)
+        prompt_graph.setdefault("lambda_class_route", 0.0)
+        prompt_graph.setdefault("lambda_key_proto", 0.0)
+        training.setdefault("freeze_base_model", False)
+        training.setdefault("freeze_input_aligner_for_p23", False)
+        training.setdefault("train_prompt_graph_module", True)
+        training.setdefault("train_prompt_adapter", False)
+        training.setdefault("train_prompt_aware_module", False)
+        training.setdefault("epochs", 160)
+        training.setdefault("early_stop_min_epochs", 35)
+        training.setdefault("early_stop_patience", 35)
+        training.setdefault("output_dir", "outputs/gp2f_prompt_p23_graphite_adapter")
+    if variant in {"p23_v0_1", "p23_v0_2_message_passing"}:
         prompt_graph["enabled"] = True
         prompt_aware["enabled"] = False
         prompt_adapter["enabled"] = False
@@ -256,7 +292,17 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
             "prompt_graph",
             {"init_scope": "global_same_feature", "edge_type_prompt_to_node": 2, "topk_feature_prompt_per_node": 4},
         )
-        prompt_graph.setdefault("receiver", {"max_update_norm": 0.02, "prompt_dropout": 0.10, "init_gate_bias": -5.0})
+        prompt_graph.setdefault(
+            "receiver",
+            {"max_update_norm": 0.03, "prompt_dropout": 0.05, "init_gate_bias": -4.5}
+            if variant == "p23_v0_2_message_passing"
+            else {"max_update_norm": 0.02, "prompt_dropout": 0.10, "init_gate_bias": -5.0},
+        )
+        prompt_graph.setdefault("prompt_token", {"learn_delta": False, "delta_init_std": 0.0})
+        prompt_graph.setdefault(
+            "node_to_prompt",
+            {"enabled": True, "scale": 0.5} if variant == "p23_v0_2_message_passing" else {"enabled": False, "scale": 1.0},
+        )
         prompt_graph.setdefault("edge_scale_warmup_epochs", 20)
         prompt_graph.setdefault("edge_scale_warmup_start", 0.0)
         prompt_graph.setdefault("lambda_edge_l1", 0.0)
@@ -300,6 +346,17 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         training.setdefault("early_stop_min_epochs", 80)
         training.setdefault("early_stop_patience", 60)
         training.setdefault("output_dir", "outputs/gp2f_prompt_p23_v0_1")
+        if variant == "p23_v0_2_message_passing":
+            prompt_graph["prompt_token"] = {**dict(prompt_graph.get("prompt_token", {})), "learn_delta": True}
+            prompt_graph["node_to_prompt"] = {
+                **dict(prompt_graph.get("node_to_prompt", {})),
+                "enabled": True,
+            }
+            prompt_graph["receiver"] = {
+                **dict(prompt_graph.get("receiver", {})),
+            }
+            prompt_graph["lambda_p23_hub_budget"] = float(prompt_graph.get("lambda_p23_hub_budget", 0.005))
+            training["output_dir"] = str(training.get("output_dir", "outputs/gp2f_prompt_p23_v0_2_message_passing"))
     if variant in adapter_variants:
         prompt_adapter["enabled"] = True
         prompt_aware["enabled"] = False
@@ -1200,13 +1257,15 @@ def _build_prompt_graph_module(
     num_classes: int,
     prompt_graph_cfg: dict[str, Any],
     device: torch.device,
-) -> PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | P23V01PromptModule | None:
+) -> PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | GraphiteStylePromptGraphAdapter | P23V01PromptModule | None:
     if variant == "noprompt" or not bool(prompt_graph_cfg.get("enabled", True)):
         return None
     resolved_cfg = dict(prompt_graph_cfg)
     resolved_cfg.setdefault("num_classes", int(num_classes))
-    if variant == "p23_v0_1" or str(resolved_cfg.get("module_type", "")) == "p23_v0_1":
+    if variant in {"p23_v0_1", "p23_v0_2_message_passing"} or str(resolved_cfg.get("module_type", "")) == "p23_v0_1":
         return P23V01PromptModule(source_dim, hidden_dim, resolved_cfg).to(device)
+    if variant == "p23_graphite_adapter" or str(resolved_cfg.get("module_type", "")) == "graphite_style_prompt_graph":
+        return GraphiteStylePromptGraphAdapter(source_dim, hidden_dim, resolved_cfg).to(device)
     if str(resolved_cfg.get("module_type", "")) == "selective_discrete_feature_prompt":
         return SelectiveDiscreteFeaturePromptGraph(source_dim, hidden_dim, resolved_cfg).to(device)
     return PromptGraphModuleP1(source_dim, hidden_dim, resolved_cfg).to(device)
@@ -2397,8 +2456,9 @@ def _p23_node_gate_utility_loss(
 def _forward_prompt_graph(
     *,
     model: FaithfulGP2F,
-    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | P23V01PromptModule | None,
+    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | GraphiteStylePromptGraphAdapter | P23V01PromptModule | None,
     z: torch.Tensor,
+    x_raw: torch.Tensor | None = None,
     edge_index: torch.Tensor,
     train_mask: torch.Tensor,
     edge_scale_multiplier: float | torch.Tensor = 1.0,
@@ -2411,15 +2471,18 @@ def _forward_prompt_graph(
     if prompt_graph_module is None:
         prompt_out = _default_prompt_graph_out(z, edge_index)
     else:
-        prompt_out = prompt_graph_module(
-            z=z,
-            h_pre=h_pre.detach(),
-            edge_index=edge_index,
-            train_mask=train_mask,
-            edge_scale_multiplier=edge_scale_multiplier,
-            no_prompt_logits=no_prompt_logits,
-            h_adp_no_prompt=h_adp_no_prompt,
-        )
+        prompt_kwargs: dict[str, Any] = {
+            "z": z,
+            "h_pre": h_pre.detach(),
+            "edge_index": edge_index,
+            "train_mask": train_mask,
+            "edge_scale_multiplier": edge_scale_multiplier,
+            "no_prompt_logits": no_prompt_logits,
+            "h_adp_no_prompt": h_adp_no_prompt,
+        }
+        if isinstance(prompt_graph_module, GraphiteStylePromptGraphAdapter):
+            prompt_kwargs["x_raw"] = x_raw
+        prompt_out = prompt_graph_module(**prompt_kwargs)
     forward_kwargs: dict[str, Any] = {
         "h_pre": h_pre,
         "adapted_x": prompt_out["adapted_x"],
@@ -2472,7 +2535,7 @@ def _forward_no_prompt_with_h_pre(
 
 
 def _needs_no_prompt_pool_evidence(
-    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | P23V01PromptModule | None,
+    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | GraphiteStylePromptGraphAdapter | P23V01PromptModule | None,
 ) -> bool:
     if prompt_graph_module is None:
         return False
@@ -5741,6 +5804,7 @@ def _init_equivalence(
         model=model,
         prompt_graph_module=prompt_graph_module,
         z=z,
+        x_raw=x,
         edge_index=edge_index,
         train_mask=train_mask,
         edge_scale_multiplier=0.0,
@@ -5752,6 +5816,7 @@ def _init_equivalence(
         model=model,
         prompt_graph_module=prompt_graph_module,
         z=z,
+        x_raw=x,
         edge_index=edge_index,
         train_mask=train_mask,
         edge_scale_multiplier=1.0,
@@ -6084,6 +6149,7 @@ def evaluate_prompt_graph(
         model=model,
         prompt_graph_module=prompt_graph_module,
         z=z,
+        x_raw=x,
         edge_index=edge_index,
         train_mask=train_mask,
         edge_scale_multiplier=edge_scale_multiplier,
@@ -6332,6 +6398,7 @@ def diagnose_prompt_message_utility(
             model=model,
             prompt_graph_module=prompt_graph_module,
             z=z,
+            x_raw=x,
             edge_index=edge_index,
             train_mask=train_mask,
             edge_scale_multiplier=1.0,
@@ -7976,6 +8043,7 @@ def run_single(
                 model=model,
                 prompt_graph_module=prompt_graph_module,
                 z=z,
+                x_raw=graph.x,
                 edge_index=graph.edge_index,
                 train_mask=prompt_graph_train_mask,
                 edge_scale_multiplier=current_edge_scale_multiplier,
@@ -10850,6 +10918,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trials_per_seed", type=int, default=None)
     parser.add_argument("--prompt_variant", type=str, choices=sorted(PROMPT_GRAPH_VARIANTS), default=None)
     parser.add_argument("--rho", type=float, default=None)
+    parser.add_argument("--p23_pool_rho", type=float, default=None)
+    parser.add_argument("--p23_pool_rho_min", type=float, default=None)
+    parser.add_argument("--p23_pool_rho_max", type=float, default=None)
     parser.add_argument("--num_prompt_nodes", type=int, default=None)
     parser.add_argument("--topk_prompt_per_node", type=int, default=None)
     parser.add_argument("--capacity_factor", type=float, default=None)
@@ -11048,6 +11119,16 @@ def main() -> None:
         overrides.setdefault("training", {})["test_label_cheat_fraction"] = float(args.test_label_cheat_fraction)
     if args.rho is not None:
         overrides.setdefault("prompt_graph", {})["rho"] = float(args.rho)
+    if args.p23_pool_rho is not None:
+        pool_cfg = overrides.setdefault("prompt_graph", {}).setdefault("pool", {})
+        pool_cfg["adaptive_ratio"] = False
+        pool_cfg["rho"] = float(args.p23_pool_rho)
+        pool_cfg["rho_min"] = float(args.p23_pool_rho)
+        pool_cfg["rho_max"] = float(args.p23_pool_rho)
+    if args.p23_pool_rho_min is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("pool", {})["rho_min"] = float(args.p23_pool_rho_min)
+    if args.p23_pool_rho_max is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("pool", {})["rho_max"] = float(args.p23_pool_rho_max)
     if args.num_prompt_nodes is not None:
         overrides.setdefault("prompt_graph", {})["num_prompt_nodes"] = int(args.num_prompt_nodes)
     if args.topk_prompt_per_node is not None:

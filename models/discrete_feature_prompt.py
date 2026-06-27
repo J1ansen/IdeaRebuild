@@ -352,3 +352,224 @@ class SelectiveDiscreteFeaturePromptGraph(nn.Module):
             "edge_scale": scale,
             "aux": aux,
         }
+
+
+class GraphiteStylePromptGraphAdapter(nn.Module):
+    """GRAPHITE-style feature-node adapter for GP2F's adapted branch.
+
+    The frozen GP2F branch still reads the original graph. The adapted branch
+    receives an expanded graph with raw-discrete feature nodes and bidirectional
+    node-feature edges, so the adapter GNN performs message passing through the
+    prompt nodes instead of receiving a post-hoc residual patch.
+    """
+
+    def __init__(self, source_dim: int, hidden_dim: int, config: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.source_dim = int(source_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.config = dict(config or {})
+        tokenizer_cfg = dict(self.config.get("feature_tokenizer", {}))
+        self.tokenizer = str(tokenizer_cfg.get("mode", self.config.get("tokenizer", "binary_nonzero")))
+        if self.tokenizer not in {"binary_nonzero", "topk_activation"}:
+            raise ValueError("Graphite-style prompt graph supports binary_nonzero and topk_activation tokenizers")
+        self.binary_threshold = float(tokenizer_cfg.get("binary_threshold", self.config.get("binary_threshold", 0.0)))
+        self.binary_topk = int(tokenizer_cfg.get("binary_topk", tokenizer_cfg.get("max_nonzero_per_node", 0)))
+        self.topk = int(tokenizer_cfg.get("topk", self.config.get("topk_feature_dims", 0)))
+        filter_cfg = dict(self.config.get("feature_filter", {}))
+        self.min_df = float(filter_cfg.get("min_df_global", filter_cfg.get("min_df_pool", self.config.get("min_df", 2))))
+        self.max_df_ratio = float(
+            filter_cfg.get("max_df_global_ratio", filter_cfg.get("max_df_ratio", self.config.get("max_df_ratio", 1.0)))
+        )
+        self.feature_edge_weight = float(self.config.get("feature_edge_weight", self.config.get("graphite_feature_edge_weight", 1.0)))
+        self.original_edge_weight = float(self.config.get("original_edge_weight", 1.0))
+        self.static_graph = bool(self.config.get("static_graph", True))
+        self.detach_feature_prompt = bool(self.config.get("detach_feature_prompt", True))
+        self.use_feature_filter = bool(self.config.get("use_feature_filter", True))
+        self.learn_feature_edge_weight = bool(self.config.get("learn_feature_edge_weight", False))
+        if self.learn_feature_edge_weight:
+            init = max(self.feature_edge_weight, 1e-6)
+            self.feature_edge_log_scale = nn.Parameter(torch.log(torch.tensor(init, dtype=torch.float32)))
+        else:
+            self.register_parameter("feature_edge_log_scale", None)
+        self._cached_graph: dict[str, Any] | None = None
+        self._cache_signature: tuple[int, int, int, int, str] | None = None
+
+    def clear_cache(self) -> None:
+        self._cached_graph = None
+        self._cache_signature = None
+
+    def _token_membership(self, x_raw: torch.Tensor) -> torch.Tensor:
+        if self.tokenizer == "binary_nonzero":
+            membership = x_raw.abs() > self.binary_threshold
+            if self.binary_topk > 0 and self.binary_topk < int(x_raw.size(1)):
+                capped = torch.zeros_like(membership)
+                scores = x_raw.abs().masked_fill(~membership, float("-inf"))
+                topk = torch.topk(scores, k=self.binary_topk, dim=-1).indices
+                capped.scatter_(1, topk, True)
+                membership = capped & membership
+            return membership
+        k = self.topk if self.topk > 0 else int(x_raw.size(1))
+        k = min(max(1, k), int(x_raw.size(1)))
+        topk = torch.topk(x_raw.abs(), k=k, dim=-1).indices
+        membership = torch.zeros(x_raw.shape, dtype=torch.bool, device=x_raw.device)
+        membership.scatter_(1, topk, True)
+        return membership
+
+    def _signature(self, z: torch.Tensor, x_raw: torch.Tensor, edge_index: torch.Tensor) -> tuple[int, int, int, int, str]:
+        return (int(z.size(0)), int(z.size(1)), int(x_raw.size(1)), int(edge_index.size(1)), str(z.device))
+
+    def _feature_edge_scale(self, ref: torch.Tensor, edge_scale_multiplier: float | torch.Tensor) -> torch.Tensor:
+        scale = torch.as_tensor(edge_scale_multiplier, dtype=ref.dtype, device=ref.device)
+        if self.feature_edge_log_scale is None:
+            weight = ref.new_tensor(float(self.feature_edge_weight))
+        else:
+            weight = self.feature_edge_log_scale.to(device=ref.device, dtype=ref.dtype).exp()
+        return weight * scale
+
+    def _output_from_cache(
+        self,
+        *,
+        z: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_scale_multiplier: float | torch.Tensor,
+        cache_hit: bool,
+    ) -> dict[str, Any]:
+        if self._cached_graph is None:
+            raise RuntimeError("Graphite-style prompt graph cache is empty")
+        cached = self._cached_graph
+        prompt_x = cached["prompt_x"].to(device=z.device, dtype=z.dtype)
+        prompt_edges = cached["prompt_edges"].to(device=edge_index.device)
+        feature_weight = self._feature_edge_scale(z, edge_scale_multiplier)
+        prompt_edge_weight = torch.ones(prompt_edges.size(1), dtype=z.dtype, device=z.device) * feature_weight
+        adapted_x = torch.cat([z, prompt_x], dim=0)
+        base_weight = torch.ones(edge_index.size(1), dtype=z.dtype, device=z.device) * float(self.original_edge_weight)
+        adapted_edge_index = torch.cat([edge_index, prompt_edges], dim=1)
+        adapted_edge_weight = torch.cat([base_weight, prompt_edge_weight], dim=0)
+        adapted_edge_type = torch.cat(
+            [
+                torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device),
+                torch.ones(prompt_edges.size(1), dtype=torch.long, device=edge_index.device),
+            ],
+            dim=0,
+        )
+        aux = {
+            key: (value.to(device=z.device, dtype=z.dtype) if isinstance(value, torch.Tensor) and value.is_floating_point() else value)
+            for key, value in cached["aux"].items()
+        }
+        aux["prompt_edge_weight"] = prompt_edge_weight
+        aux["p23_graphite_static_cache_hit"] = z.new_tensor(float(cache_hit))
+        aux["p23_graphite_feature_edge_weight"] = feature_weight.detach()
+        return {
+            "adapted_x": adapted_x,
+            "adapted_edge_index": adapted_edge_index,
+            "adapted_edge_weight": adapted_edge_weight,
+            "adapted_edge_type": adapted_edge_type,
+            "prompt_node_x": prompt_x,
+            "pool_mask": cached["pool_mask"].to(device=z.device),
+            "prompt_edge_count": int(prompt_edges.size(1)),
+            "edge_scale": torch.as_tensor(edge_scale_multiplier, dtype=z.dtype, device=z.device),
+            "aux": aux,
+        }
+
+    def forward(
+        self,
+        *,
+        z: torch.Tensor,
+        h_pre: torch.Tensor,
+        edge_index: torch.Tensor,
+        train_mask: torch.Tensor,
+        edge_scale_multiplier: float | torch.Tensor = 1.0,
+        no_prompt_logits: torch.Tensor | None = None,
+        h_adp_no_prompt: torch.Tensor | None = None,
+        x_raw: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        del h_pre, train_mask, no_prompt_logits, h_adp_no_prompt
+        if x_raw is None:
+            x_raw = z
+        x_raw = x_raw.to(device=z.device)
+        signature = self._signature(z, x_raw, edge_index)
+        if self.static_graph and self._cached_graph is not None and self._cache_signature == signature:
+            return self._output_from_cache(
+                z=z,
+                edge_index=edge_index,
+                edge_scale_multiplier=edge_scale_multiplier,
+                cache_hit=True,
+            )
+
+        membership = self._token_membership(x_raw)
+        counts = membership.to(dtype=z.dtype).sum(dim=0)
+        if self.use_feature_filter:
+            max_df = max(1.0, float(self.max_df_ratio) * float(z.size(0)))
+            valid = (counts >= float(self.min_df)) & (counts <= max_df)
+        else:
+            valid = counts > 0
+        feature_ids = torch.where(valid)[0]
+        selected_membership = membership[:, feature_ids] if feature_ids.numel() > 0 else membership[:, :0]
+        if feature_ids.numel() > 0:
+            sums = selected_membership.to(dtype=z.dtype).t() @ z
+            denom = selected_membership.to(dtype=z.dtype).sum(dim=0).clamp_min(1.0)
+            prompt_x = sums / denom.unsqueeze(-1)
+            if self.detach_feature_prompt:
+                prompt_x = prompt_x.detach()
+            edge_node, edge_feature_local = torch.nonzero(selected_membership, as_tuple=True)
+            if edge_node.numel() > 0:
+                prompt_node = edge_feature_local + int(z.size(0))
+                node_to_prompt = torch.stack([edge_node, prompt_node], dim=0)
+                prompt_to_node = torch.stack([prompt_node, edge_node], dim=0)
+                prompt_edges = torch.cat([node_to_prompt, prompt_to_node], dim=1).to(device=edge_index.device)
+            else:
+                prompt_edges = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+        else:
+            prompt_x = z.new_zeros((0, z.size(1)))
+            edge_node = torch.empty(0, dtype=torch.long, device=z.device)
+            edge_feature_local = torch.empty(0, dtype=torch.long, device=z.device)
+            prompt_edges = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+
+        usage = torch.zeros(feature_ids.numel(), dtype=z.dtype, device=z.device)
+        if edge_feature_local.numel() > 0:
+            usage.index_add_(0, edge_feature_local, torch.ones_like(edge_feature_local, dtype=z.dtype))
+            usage_prob = usage / usage.sum().clamp_min(1.0)
+            usage_entropy = -(usage_prob * usage_prob.clamp_min(1e-12).log()).sum()
+            if usage_prob.numel() > 1:
+                usage_entropy = usage_entropy / math.log(float(usage_prob.numel()))
+        else:
+            usage_entropy = z.new_tensor(0.0)
+
+        pool_mask = torch.ones(z.size(0), dtype=torch.bool, device=z.device)
+        aux = {
+            "prompt_edge_weight": torch.ones(prompt_edges.size(1), dtype=z.dtype, device=z.device)
+            * self._feature_edge_scale(z, edge_scale_multiplier),
+            "prompt_usage": usage,
+            "prompt_usage_entropy": usage_entropy,
+            "connected_edge_count": int(prompt_edges.size(1)),
+            "edge_type_counts": [int(edge_index.size(1)), int(prompt_edges.size(1)), 0],
+            "p23_pool_ratio": z.new_tensor(1.0),
+            "p23_graphite_enabled": z.new_tensor(1.0),
+            "p23_graphite_feature_prompt_count": z.new_tensor(float(feature_ids.numel())),
+            "p23_graphite_feature_edge_count": z.new_tensor(float(prompt_edges.size(1))),
+            "p23_graphite_raw_feature_count": z.new_tensor(float(x_raw.size(1))),
+            "p23_graphite_valid_feature_ratio": valid.to(dtype=z.dtype).mean() if valid.numel() > 0 else z.new_tensor(0.0),
+            "p23_graphite_avg_feature_degree": usage.mean() if usage.numel() > 0 else z.new_tensor(0.0),
+            "p23_graphite_max_feature_degree": usage.max() if usage.numel() > 0 else z.new_tensor(0.0),
+            "p23_graphite_static_graph_enabled": z.new_tensor(float(self.static_graph)),
+            "p23_graphite_static_cache_hit": z.new_tensor(0.0),
+            "p23_feature_prompt_count": z.new_tensor(float(feature_ids.numel())),
+            "p23_prompt_edge_count": z.new_tensor(float(prompt_edges.size(1))),
+        }
+        self._cached_graph = {
+            "prompt_x": prompt_x.detach(),
+            "prompt_edges": prompt_edges.detach(),
+            "pool_mask": pool_mask.detach(),
+            "aux": {
+                key: value.detach() if isinstance(value, torch.Tensor) else value
+                for key, value in aux.items()
+                if key != "prompt_edge_weight"
+            },
+        }
+        self._cache_signature = signature if self.static_graph else None
+        return self._output_from_cache(
+            z=z,
+            edge_index=edge_index,
+            edge_scale_multiplier=edge_scale_multiplier,
+            cache_hit=False,
+        )
