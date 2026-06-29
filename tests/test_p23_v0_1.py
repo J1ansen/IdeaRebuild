@@ -1,9 +1,16 @@
 import torch
 
-from experiments.run_gp2f_prompt_graph import _config_for_variant, _p23_node_gate_utility_loss, _set_module_trainable
+from experiments.run_gp2f_prompt_graph import (
+    _classification_loss,
+    _config_for_variant,
+    _p23_feature_harmful_suppression_loss,
+    _p23_node_gate_utility_loss,
+    _set_module_trainable,
+)
 from models.discrete_feature_prompt import GraphiteStylePromptGraphAdapter
 from models.p23_prompt_receiver import P23HubAwarePromptReceiver, P23V01PromptModule
 from models.p23_static_prompt_graph import P23StaticPromptGraphBuilder
+from models.selective_graphite_prompt import ClassAwareSelectiveGraphitePromptGraphAdapter
 
 
 def _toy_inputs():
@@ -70,6 +77,19 @@ def test_p23_graphite_variant_uses_graphite_adapter_module_defaults():
     assert cfg["prompt_graph"]["learn_feature_edge_weight"] is True
     assert cfg["prompt_aware"]["enabled"] is False
     assert cfg["prompt_adapter"]["enabled"] is False
+
+
+def test_p23_selective_graphite_variant_uses_balanced_defaults():
+    cfg = _config_for_variant(
+        {"experiment": {"prompt_variant": "p23_selective_graphite_adapter"}},
+        "p23_selective_graphite_adapter",
+    )
+    assert cfg["prompt_graph"]["module_type"] == "class_aware_selective_graphite_prompt_graph"
+    assert cfg["training"]["class_balanced_ce"] is True
+    assert cfg["training"]["early_stop_metric"] == "val_macro_f1"
+    assert cfg["prompt_graph"]["use_feature_gate"] is True
+    assert cfg["prompt_graph"]["feature_edge_min_scale"] == 0.05
+    assert cfg["prompt_graph"]["feature_gate_floor"] == 0.20
 
 
 def test_train_nodes_are_forced_into_pool():
@@ -410,3 +430,129 @@ def test_graphite_style_adapter_static_cache_reuses_topology():
     )
     assert torch.equal(first["adapted_edge_index"], second["adapted_edge_index"])
     assert second["aux"]["p23_graphite_static_cache_hit"].item() == 1.0
+
+
+def test_selective_graphite_adapter_uses_label_aware_feature_filtering():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    labels = torch.tensor([0, 0, 1, 1, 0])
+    cfg = {
+        "num_classes": 2,
+        "feature_tokenizer": {"mode": "binary_nonzero", "binary_threshold": 0.0},
+        "feature_filter": {
+            "min_df_global": 1,
+            "max_df_global_ratio": 1.0,
+            "min_label_count": 1,
+            "min_purity": 0.5,
+            "max_entropy": 1.0,
+            "max_feature_nodes": 3,
+        },
+        "label_node_weight": 4.0,
+        "unlabeled_node_weight": 0.25,
+        "offclass_label_weight": 0.05,
+    }
+    module = ClassAwareSelectiveGraphitePromptGraphAdapter(source_dim=3, hidden_dim=6, config=cfg)
+    out = module(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    assert out["adapted_x"].size(0) > z.size(0)
+    assert out["prompt_edge_count"] > 0
+    assert out["aux"]["p23_selective_graphite_enabled"].item() == 1.0
+    assert out["aux"]["p23_selective_feature_prompt_count"].item() <= 3.0
+    assert out["adapted_edge_weight"][edge_index.size(1) :].requires_grad
+
+
+def test_selective_graphite_adapter_keeps_prompt_edge_floor():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    labels = torch.tensor([0, 0, 1, 1, 0])
+    cfg = {
+        "num_classes": 2,
+        "feature_tokenizer": {"mode": "binary_nonzero", "binary_threshold": 0.0},
+        "feature_filter": {
+            "min_df_global": 1,
+            "max_df_global_ratio": 1.0,
+            "min_label_count": 1,
+            "min_purity": 0.0,
+            "max_entropy": 1.0,
+        },
+        "feature_edge_weight": 1.0,
+        "feature_edge_min_scale": 0.25,
+        "feature_gate_floor": 0.20,
+    }
+    module = ClassAwareSelectiveGraphitePromptGraphAdapter(source_dim=3, hidden_dim=6, config=cfg)
+    with torch.no_grad():
+        module.feature_edge_log_scale.fill_(-20.0)
+    out = module(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    prompt_weight = out["adapted_edge_weight"][edge_index.size(1) :]
+    assert prompt_weight.numel() > 0
+    assert float(prompt_weight.detach().max()) > 0.0
+
+
+def test_p23_feature_harmful_suppression_trains_feature_gate():
+    feature_gate = torch.tensor([0.8, 0.8], requires_grad=True)
+    prompt_out = {
+        "aux": {
+            "p23_selective_feature_gate": feature_gate,
+            "p23_selective_edge_feature_local": torch.tensor([0, 0, 1, 1]),
+            "p23_selective_edge_node_index": torch.tensor([0, 1, 2, 3]),
+            "p23_selective_feature_dominant_class": torch.tensor([0, 1]),
+        }
+    }
+    labels = torch.tensor([0, 0, 1, 1])
+    logits_no_prompt = torch.tensor([[3.0, 0.0], [3.0, 0.0], [3.0, 0.0], [3.0, 0.0]])
+    logits_prompt = torch.tensor([[0.0, 3.0], [0.0, 3.0], [0.0, 3.0], [0.0, 3.0]])
+    harm, gate, stats = _p23_feature_harmful_suppression_loss(
+        prompt_out=prompt_out,
+        logits_prompt=logits_prompt,
+        logits_no_prompt=logits_no_prompt,
+        labels=labels,
+        train_mask=torch.ones(4, dtype=torch.bool),
+        margin=0.0,
+        temperature=0.05,
+        detach_delta=True,
+        class_balanced=True,
+    )
+    total = harm + gate
+    total.backward()
+    assert harm.requires_grad
+    assert gate.requires_grad
+    assert feature_gate.grad is not None
+    assert stats["p23_feature_harm_count"] > 0.0
+    assert stats["p23_feature_help_count"] > 0.0
+
+
+def test_class_balanced_loss_differs_from_plain_ce_on_imbalanced_labels():
+    logits = torch.tensor([[2.0, 0.0], [2.0, 0.0], [2.0, 0.0], [2.0, 0.0]], requires_grad=True)
+    labels = torch.tensor([0, 0, 0, 1])
+    train_mask = torch.ones(4, dtype=torch.bool)
+    plain = _classification_loss(
+        logits=logits,
+        labels=labels,
+        train_mask=train_mask,
+        num_classes=2,
+        training_cfg={"class_balanced_ce": False},
+    )
+    balanced = _classification_loss(
+        logits=logits,
+        labels=labels,
+        train_mask=train_mask,
+        num_classes=2,
+        training_cfg={"class_balanced_ce": True, "class_weight_mode": "inverse"},
+    )
+    assert balanced.requires_grad
+    assert balanced > plain

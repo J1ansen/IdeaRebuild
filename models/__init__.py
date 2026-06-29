@@ -16,11 +16,13 @@ from models.p23_static_prompt_graph import P23PromptGraphState, P23StaticPromptG
 from models.prompt_aware_gp2f import PromptAwareGP2F
 from models.prompt_graph_module import PromptGraphModuleP1, prompt_balance_loss, prompt_edge_l1_loss
 from models.prompt_module import ParameterMatchedResidualControl, UnifiedMultiViewResidualPrompt
+from models.selective_graphite_prompt import ClassAwareSelectiveGraphitePromptGraphAdapter
 from models.utility_supervised_pattern_prompt_router import UtilitySupervisedPatternPromptRouter
 
 __all__ = [
     "BaseGCN",
     "ClassConditionedPatternPromptRouter",
+    "ClassAwareSelectiveGraphitePromptGraphAdapter",
     "FaithfulGP2F",
     "GraphiteStylePromptGraphAdapter",
     "HeterophilyAwarePromptAdapter",

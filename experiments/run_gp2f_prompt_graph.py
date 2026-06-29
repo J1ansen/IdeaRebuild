@@ -34,6 +34,7 @@ from experiments.run_gp2f_baseline import (
 from losses import GP2FLossConfig, compute_gp2f_loss
 from models import (
     ClassConditionedPatternPromptRouter,
+    ClassAwareSelectiveGraphitePromptGraphAdapter,
     FaithfulGP2F,
     HeterophilyAwarePromptAdapter,
     P21LiteAdaptiveFilter,
@@ -120,6 +121,7 @@ PROMPT_GRAPH_VARIANTS = {
     "p23_v0_1",
     "p23_selective_discrete_feature_prompting",
     "p23_graphite_adapter",
+    "p23_selective_graphite_adapter",
     "p2_strength_random_pool",
     "p2_no_node_to_prompt",
     "p2_no_prompt_to_node",
@@ -143,7 +145,23 @@ def _resolve_shot_setting(data_cfg: dict[str, Any], experiment_cfg: dict[str, An
         str(name).lower()
         for name in data_cfg.get(
             "heterophily_datasets",
-            ["Actor", "Squirrel", "Chameleon", "Texas", "Cornell", "Wisconsin", "Minesweeper", "Tolokers", "Questions"],
+            [
+                "Actor",
+                "Squirrel",
+                "Chameleon",
+                "Texas",
+                "Cornell",
+                "Wisconsin",
+                "Minesweeper",
+                "Roman-empire",
+                "RomanEmpire",
+                "roman_empire",
+                "amazon_ratings",
+                "AmazonRatings",
+                "Amazon-Ratings",
+                "Tolokers",
+                "Questions",
+            ],
         )
     }
     if str(target_dataset).lower() in hetero_names:
@@ -256,6 +274,17 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         prompt_graph.setdefault("edge_scale_warmup_start", 1.0)
         prompt_graph.setdefault("lambda_edge_l1", 0.0)
         prompt_graph.setdefault("lambda_prompt_balance", 0.0)
+        prompt_graph.setdefault("lambda_p23_feature_harm", 0.05)
+        prompt_graph.setdefault("lambda_p23_feature_gate_supervision", 0.0)
+        prompt_graph.setdefault("p23_feature_harm_margin", 0.02)
+        prompt_graph.setdefault("p23_feature_harm_temperature", 0.15)
+        prompt_graph.setdefault("p23_feature_harm_quantile", 0.70)
+        prompt_graph.setdefault("p23_feature_help_quantile", 0.70)
+        prompt_graph.setdefault("p23_feature_min_signal", 0.005)
+        prompt_graph.setdefault("p23_feature_help_weight", 0.25)
+        prompt_graph.setdefault("p23_feature_harm_warmup_epochs", 5)
+        prompt_graph.setdefault("p23_feature_harm_detach_delta", True)
+        prompt_graph.setdefault("p23_feature_harm_class_balanced", True)
         prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.0)
         prompt_graph.setdefault("lambda_prompt_view_entropy", 0.0)
         prompt_graph.setdefault("lambda_class_route", 0.0)
@@ -269,6 +298,58 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         training.setdefault("early_stop_min_epochs", 35)
         training.setdefault("early_stop_patience", 35)
         training.setdefault("output_dir", "outputs/gp2f_prompt_p23_graphite_adapter")
+    if variant == "p23_selective_graphite_adapter":
+        prompt_graph["enabled"] = True
+        prompt_aware["enabled"] = False
+        prompt_adapter["enabled"] = False
+        prompt_graph.setdefault("module_type", "class_aware_selective_graphite_prompt_graph")
+        prompt_graph.setdefault("static_graph", True)
+        prompt_graph.setdefault(
+            "feature_tokenizer",
+            {"mode": "topk_activation", "topk": 16},
+        )
+        prompt_graph.setdefault(
+            "feature_filter",
+            {
+                "min_df_global": 2,
+                "max_df_global_ratio": 0.95,
+                "min_label_count": 2,
+                "min_purity": 0.35,
+                "max_entropy": 0.95,
+                "max_feature_nodes": 512,
+            },
+        )
+        prompt_graph.setdefault("feature_edge_weight", 1.0)
+        prompt_graph.setdefault("feature_edge_min_scale", 0.05)
+        prompt_graph.setdefault("feature_gate_floor", 0.20)
+        prompt_graph.setdefault("original_edge_weight", 1.0)
+        prompt_graph.setdefault("learn_feature_edge_weight", True)
+        prompt_graph.setdefault("use_feature_gate", True)
+        prompt_graph.setdefault("anti_hub_power", 0.5)
+        prompt_graph.setdefault("label_node_weight", 4.0)
+        prompt_graph.setdefault("unlabeled_node_weight", 0.25)
+        prompt_graph.setdefault("offclass_label_weight", 0.05)
+        prompt_graph.setdefault("detach_feature_prompt", True)
+        prompt_graph.setdefault("edge_scale_warmup_epochs", 0)
+        prompt_graph.setdefault("edge_scale_warmup_start", 1.0)
+        prompt_graph.setdefault("lambda_edge_l1", 0.0)
+        prompt_graph.setdefault("lambda_prompt_balance", 0.0)
+        prompt_graph.setdefault("lambda_prompt_usage_consistency", 0.0)
+        prompt_graph.setdefault("lambda_prompt_view_entropy", 0.0)
+        prompt_graph.setdefault("lambda_class_route", 0.0)
+        prompt_graph.setdefault("lambda_key_proto", 0.0)
+        training.setdefault("freeze_base_model", False)
+        training.setdefault("freeze_input_aligner_for_p23", False)
+        training.setdefault("train_prompt_graph_module", True)
+        training.setdefault("train_prompt_adapter", False)
+        training.setdefault("train_prompt_aware_module", False)
+        training.setdefault("class_balanced_ce", True)
+        training.setdefault("class_weight_mode", "inverse_sqrt")
+        training.setdefault("epochs", 160)
+        training.setdefault("early_stop_metric", "val_macro_f1")
+        training.setdefault("early_stop_min_epochs", 35)
+        training.setdefault("early_stop_patience", 35)
+        training.setdefault("output_dir", "outputs/gp2f_prompt_p23_selective_graphite_adapter")
     if variant in {"p23_v0_1", "p23_v0_2_message_passing"}:
         prompt_graph["enabled"] = True
         prompt_aware["enabled"] = False
@@ -1257,7 +1338,14 @@ def _build_prompt_graph_module(
     num_classes: int,
     prompt_graph_cfg: dict[str, Any],
     device: torch.device,
-) -> PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | GraphiteStylePromptGraphAdapter | P23V01PromptModule | None:
+) -> (
+    PromptGraphModuleP1
+    | SelectiveDiscreteFeaturePromptGraph
+    | GraphiteStylePromptGraphAdapter
+    | ClassAwareSelectiveGraphitePromptGraphAdapter
+    | P23V01PromptModule
+    | None
+):
     if variant == "noprompt" or not bool(prompt_graph_cfg.get("enabled", True)):
         return None
     resolved_cfg = dict(prompt_graph_cfg)
@@ -1266,6 +1354,11 @@ def _build_prompt_graph_module(
         return P23V01PromptModule(source_dim, hidden_dim, resolved_cfg).to(device)
     if variant == "p23_graphite_adapter" or str(resolved_cfg.get("module_type", "")) == "graphite_style_prompt_graph":
         return GraphiteStylePromptGraphAdapter(source_dim, hidden_dim, resolved_cfg).to(device)
+    if (
+        variant == "p23_selective_graphite_adapter"
+        or str(resolved_cfg.get("module_type", "")) == "class_aware_selective_graphite_prompt_graph"
+    ):
+        return ClassAwareSelectiveGraphitePromptGraphAdapter(source_dim, hidden_dim, resolved_cfg).to(device)
     if str(resolved_cfg.get("module_type", "")) == "selective_discrete_feature_prompt":
         return SelectiveDiscreteFeaturePromptGraph(source_dim, hidden_dim, resolved_cfg).to(device)
     return PromptGraphModuleP1(source_dim, hidden_dim, resolved_cfg).to(device)
@@ -2453,14 +2546,188 @@ def _p23_node_gate_utility_loss(
     }
 
 
+def _classification_loss(
+    *,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    num_classes: int,
+    training_cfg: dict[str, Any],
+) -> torch.Tensor:
+    mask = train_mask.to(device=logits.device, dtype=torch.bool)
+    y = labels.to(device=logits.device, dtype=torch.long)
+    selected = y[mask]
+    if not bool(training_cfg.get("class_balanced_ce", False)) or selected.numel() == 0:
+        return F.cross_entropy(logits[mask], selected)
+    counts = torch.bincount(selected, minlength=int(num_classes)).to(device=logits.device, dtype=logits.dtype)
+    mode = str(training_cfg.get("class_weight_mode", "inverse_sqrt"))
+    if mode == "inverse":
+        weights = 1.0 / counts.clamp_min(1.0)
+    elif mode == "inverse_sqrt":
+        weights = 1.0 / counts.clamp_min(1.0).sqrt()
+    else:
+        raise ValueError(f"Unsupported class_weight_mode={mode!r}")
+    present = counts > 0
+    weights = torch.where(present, weights, torch.zeros_like(weights))
+    weights = weights * (present.to(dtype=weights.dtype).sum().clamp_min(1.0) / weights[present].sum().clamp_min(1e-12))
+    return F.cross_entropy(logits[mask], selected, weight=weights)
+
+
+def _p23_feature_harmful_suppression_loss(
+    *,
+    prompt_out: dict[str, Any],
+    logits_prompt: torch.Tensor,
+    logits_no_prompt: torch.Tensor,
+    labels: torch.Tensor,
+    train_mask: torch.Tensor,
+    margin: float,
+    temperature: float,
+    harm_quantile: float = 0.70,
+    help_quantile: float = 0.70,
+    min_signal: float = 0.005,
+    help_weight: float = 0.25,
+    detach_delta: bool = True,
+    class_balanced: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    def zero_stats() -> dict[str, float]:
+        return {
+            "p23_feature_harm_loss": 0.0,
+            "p23_feature_gate_supervision_loss": 0.0,
+            "p23_feature_harm_count": 0.0,
+            "p23_feature_help_count": 0.0,
+            "p23_feature_harm_ratio": 0.0,
+            "p23_feature_help_ratio": 0.0,
+            "p23_feature_raw_harm_ratio": 0.0,
+            "p23_feature_raw_help_ratio": 0.0,
+            "p23_feature_gate_target_mean": 0.0,
+            "p23_feature_gate_delta_corr": 0.0,
+        }
+
+    aux = prompt_out.get("aux", {})
+    feature_gate = aux.get("p23_selective_feature_gate")
+    edge_feature = aux.get("p23_selective_edge_feature_local")
+    edge_node = aux.get("p23_selective_edge_node_index")
+    dominant_class = aux.get("p23_selective_feature_dominant_class")
+    fallback = logits_prompt.new_tensor(0.0)
+    if not (
+        isinstance(feature_gate, torch.Tensor)
+        and isinstance(edge_feature, torch.Tensor)
+        and isinstance(edge_node, torch.Tensor)
+    ):
+        return fallback, fallback, zero_stats()
+    if feature_gate.numel() == 0 or edge_feature.numel() == 0 or edge_node.numel() == 0:
+        return fallback, fallback, zero_stats()
+
+    y = labels.to(device=logits_prompt.device, dtype=torch.long)
+    ce_prompt = F.cross_entropy(logits_prompt, y, reduction="none")
+    ce_no_prompt = F.cross_entropy(logits_no_prompt.to(device=logits_prompt.device), y, reduction="none")
+    delta = ce_prompt - ce_no_prompt
+    if detach_delta:
+        delta = delta.detach()
+
+    edge_node = edge_node.to(device=logits_prompt.device, dtype=torch.long)
+    edge_feature = edge_feature.to(device=logits_prompt.device, dtype=torch.long)
+    train = train_mask.to(device=logits_prompt.device, dtype=torch.bool)
+    valid = train[edge_node] & (edge_feature >= 0) & (edge_feature < feature_gate.numel())
+    if not bool(valid.any()):
+        return fallback, fallback, zero_stats()
+
+    selected_feature = edge_feature[valid]
+    selected_delta = delta[edge_node[valid]]
+    num_features = int(feature_gate.numel())
+    counts = feature_gate.new_zeros(num_features)
+    counts.index_add_(0, selected_feature, torch.ones_like(selected_delta, dtype=feature_gate.dtype))
+    harm_sum = feature_gate.new_zeros(num_features)
+    help_sum = feature_gate.new_zeros(num_features)
+    harmful = F.relu(selected_delta - float(margin))
+    helpful = F.relu(-selected_delta - float(margin))
+    harm_sum.index_add_(0, selected_feature, harmful.to(dtype=feature_gate.dtype))
+    help_sum.index_add_(0, selected_feature, helpful.to(dtype=feature_gate.dtype))
+    present = counts > 0
+    harm = harm_sum / counts.clamp_min(1.0)
+    help_value = help_sum / counts.clamp_min(1.0)
+    utility = help_value - harm
+    gate = feature_gate.to(device=logits_prompt.device, dtype=logits_prompt.dtype).clamp(1e-6, 1.0 - 1e-6)
+    if not bool(present.any()):
+        return fallback, fallback, zero_stats()
+
+    harm_q = min(max(float(harm_quantile), 0.0), 1.0)
+    help_q = min(max(float(help_quantile), 0.0), 1.0)
+    signal_floor = max(float(min_signal), 0.0)
+    harm_threshold = torch.quantile(harm[present].detach(), harm_q).clamp_min(signal_floor)
+    help_threshold = torch.quantile(help_value[present].detach(), help_q).clamp_min(signal_floor)
+    harmful_feature = present & (harm >= harm_threshold) & (harm >= help_value)
+    helpful_feature = present & (help_value >= help_threshold) & (help_value > harm)
+    selected_feature_mask = harmful_feature | helpful_feature
+
+    target_gate = gate.detach().clone()
+    utility_target = torch.sigmoid(utility.detach() / max(float(temperature), 1e-6)).to(dtype=gate.dtype)
+    target_gate = torch.where(selected_feature_mask, utility_target, target_gate)
+    per_feature_harm = harm.detach() * gate
+    per_feature_help = help_value.detach() * (1.0 - gate)
+    per_feature_gate_loss = F.binary_cross_entropy(gate, target_gate.to(dtype=gate.dtype), reduction="none")
+
+    if class_balanced and isinstance(dominant_class, torch.Tensor) and dominant_class.numel() == num_features:
+        dom = dominant_class.to(device=logits_prompt.device, dtype=torch.long)
+        losses_harm: list[torch.Tensor] = []
+        losses_help: list[torch.Tensor] = []
+        losses_gate: list[torch.Tensor] = []
+        for cls in torch.unique(dom[present]):
+            cls_harm = harmful_feature & (dom == cls)
+            cls_help = helpful_feature & (dom == cls)
+            cls_selected = selected_feature_mask & (dom == cls)
+            if bool(cls_harm.any()):
+                losses_harm.append(per_feature_harm[cls_harm].mean())
+            if bool(cls_help.any()):
+                losses_help.append(per_feature_help[cls_help].mean())
+            if bool(cls_selected.any()):
+                losses_gate.append(per_feature_gate_loss[cls_selected].mean())
+        harm_part = torch.stack(losses_harm).mean() if losses_harm else fallback
+        help_part = torch.stack(losses_help).mean() if losses_help else fallback
+        harm_loss = harm_part + max(float(help_weight), 0.0) * help_part
+        gate_loss = torch.stack(losses_gate).mean() if losses_gate else fallback
+    else:
+        harm_part = per_feature_harm[harmful_feature].mean() if bool(harmful_feature.any()) else fallback
+        help_part = per_feature_help[helpful_feature].mean() if bool(helpful_feature.any()) else fallback
+        harm_loss = harm_part + max(float(help_weight), 0.0) * help_part
+        gate_loss = per_feature_gate_loss[selected_feature_mask].mean() if bool(selected_feature_mask.any()) else fallback
+
+    with torch.no_grad():
+        gate_centered = gate[present] - gate[present].mean()
+        utility_centered = utility[present] - utility[present].mean()
+        denom = gate_centered.norm() * utility_centered.norm()
+        corr = (gate_centered * utility_centered).sum() / denom.clamp_min(1e-12)
+    stats = {
+        "p23_feature_harm_loss": float(harm_loss.detach().item()),
+        "p23_feature_gate_supervision_loss": float(gate_loss.detach().item()),
+        "p23_feature_harm_count": float(harmful_feature.sum().detach().item()),
+        "p23_feature_help_count": float(helpful_feature.sum().detach().item()),
+        "p23_feature_harm_ratio": float(harmful_feature[present].float().mean().detach().item()),
+        "p23_feature_help_ratio": float(helpful_feature[present].float().mean().detach().item()),
+        "p23_feature_raw_harm_ratio": float((harm[present] > 0).float().mean().detach().item()),
+        "p23_feature_raw_help_ratio": float((help_value[present] > 0).float().mean().detach().item()),
+        "p23_feature_gate_target_mean": float(target_gate[present].mean().detach().item()),
+        "p23_feature_gate_delta_corr": float(corr.detach().item()),
+    }
+    return harm_loss, gate_loss, stats
+
+
 def _forward_prompt_graph(
     *,
     model: FaithfulGP2F,
-    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | GraphiteStylePromptGraphAdapter | P23V01PromptModule | None,
+    prompt_graph_module: (
+        PromptGraphModuleP1
+        | SelectiveDiscreteFeaturePromptGraph
+        | GraphiteStylePromptGraphAdapter
+        | ClassAwareSelectiveGraphitePromptGraphAdapter
+        | P23V01PromptModule
+        | None
+    ),
     z: torch.Tensor,
     x_raw: torch.Tensor | None = None,
     edge_index: torch.Tensor,
     train_mask: torch.Tensor,
+    labels: torch.Tensor | None = None,
     edge_scale_multiplier: float | torch.Tensor = 1.0,
     h_pre: torch.Tensor | None = None,
     no_prompt_logits: torch.Tensor | None = None,
@@ -2482,6 +2749,9 @@ def _forward_prompt_graph(
         }
         if isinstance(prompt_graph_module, GraphiteStylePromptGraphAdapter):
             prompt_kwargs["x_raw"] = x_raw
+        if isinstance(prompt_graph_module, ClassAwareSelectiveGraphitePromptGraphAdapter):
+            prompt_kwargs["x_raw"] = x_raw
+            prompt_kwargs["labels"] = labels
         prompt_out = prompt_graph_module(**prompt_kwargs)
     forward_kwargs: dict[str, Any] = {
         "h_pre": h_pre,
@@ -2535,7 +2805,14 @@ def _forward_no_prompt_with_h_pre(
 
 
 def _needs_no_prompt_pool_evidence(
-    prompt_graph_module: PromptGraphModuleP1 | SelectiveDiscreteFeaturePromptGraph | GraphiteStylePromptGraphAdapter | P23V01PromptModule | None,
+    prompt_graph_module: (
+        PromptGraphModuleP1
+        | SelectiveDiscreteFeaturePromptGraph
+        | GraphiteStylePromptGraphAdapter
+        | ClassAwareSelectiveGraphitePromptGraphAdapter
+        | P23V01PromptModule
+        | None
+    ),
 ) -> bool:
     if prompt_graph_module is None:
         return False
@@ -5807,6 +6084,7 @@ def _init_equivalence(
         x_raw=x,
         edge_index=edge_index,
         train_mask=train_mask,
+        labels=labels,
         edge_scale_multiplier=0.0,
         h_pre=h_pre,
         no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
@@ -5819,6 +6097,7 @@ def _init_equivalence(
         x_raw=x,
         edge_index=edge_index,
         train_mask=train_mask,
+        labels=labels,
         edge_scale_multiplier=1.0,
         h_pre=h_pre,
         no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
@@ -6152,6 +6431,7 @@ def evaluate_prompt_graph(
         x_raw=x,
         edge_index=edge_index,
         train_mask=train_mask,
+        labels=labels,
         edge_scale_multiplier=edge_scale_multiplier,
         h_pre=h_pre,
         no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
@@ -6401,6 +6681,7 @@ def diagnose_prompt_message_utility(
             x_raw=x,
             edge_index=edge_index,
             train_mask=train_mask,
+            labels=labels,
             edge_scale_multiplier=1.0,
             h_pre=h_pre,
             no_prompt_logits=None if model_no_prompt is None else model_no_prompt["logits"],
@@ -6820,6 +7101,17 @@ def run_single(
     keep_checkpoint = bool(training_cfg.get("keep_best_checkpoint", True))
     lambda_edge_l1 = float(prompt_graph_cfg.get("lambda_edge_l1", 0.0))
     lambda_prompt_balance = float(prompt_graph_cfg.get("lambda_prompt_balance", 0.0))
+    lambda_p23_feature_harm = float(prompt_graph_cfg.get("lambda_p23_feature_harm", 0.0))
+    lambda_p23_feature_gate_supervision = float(prompt_graph_cfg.get("lambda_p23_feature_gate_supervision", 0.0))
+    p23_feature_harm_margin = float(prompt_graph_cfg.get("p23_feature_harm_margin", 0.02))
+    p23_feature_harm_temperature = float(prompt_graph_cfg.get("p23_feature_harm_temperature", 0.15))
+    p23_feature_harm_quantile = float(prompt_graph_cfg.get("p23_feature_harm_quantile", 0.70))
+    p23_feature_help_quantile = float(prompt_graph_cfg.get("p23_feature_help_quantile", 0.70))
+    p23_feature_min_signal = float(prompt_graph_cfg.get("p23_feature_min_signal", 0.005))
+    p23_feature_help_weight = float(prompt_graph_cfg.get("p23_feature_help_weight", 0.25))
+    p23_feature_harm_warmup_epochs = int(prompt_graph_cfg.get("p23_feature_harm_warmup_epochs", 0))
+    p23_feature_harm_detach_delta = bool(prompt_graph_cfg.get("p23_feature_harm_detach_delta", True))
+    p23_feature_harm_class_balanced = bool(prompt_graph_cfg.get("p23_feature_harm_class_balanced", True))
     lambda_prompt_role_diversity = float(prompt_graph_cfg.get("lambda_prompt_role_diversity", 0.0))
     lambda_prompt_acceptance = float(prompt_graph_cfg.get("lambda_prompt_acceptance", 0.0))
     lambda_prompt_acceptance_budget = float(prompt_graph_cfg.get("lambda_prompt_acceptance_budget", 0.0))
@@ -8046,12 +8338,19 @@ def run_single(
                 x_raw=graph.x,
                 edge_index=graph.edge_index,
                 train_mask=prompt_graph_train_mask,
+                labels=graph.y,
                 edge_scale_multiplier=current_edge_scale_multiplier,
                 h_pre=h_pre_for_prompt,
                 no_prompt_logits=None if no_prompt_out is None else no_prompt_out["logits"],
                 h_adp_no_prompt=None if no_prompt_out is None else no_prompt_out["h_adp"],
             )
-            cls_loss = F.cross_entropy(model_out["logits"][label_train_mask], graph.y[label_train_mask])
+            cls_loss = _classification_loss(
+                logits=model_out["logits"],
+                labels=graph.y,
+                train_mask=label_train_mask,
+                num_classes=loaded.num_classes,
+                training_cfg=training_cfg,
+            )
         _attach_p23_ce_delta_diagnostics(
             model_out=model_out,
             prompt_out=prompt_out,
@@ -8162,6 +8461,14 @@ def run_single(
                 or (
                     (lambda_correction_alignment > 0.0 or lambda_correction_anti_harm > 0.0)
                     and epoch > correction_alignment_warmup_epochs
+                )
+                or (
+                    isinstance(prompt_graph_module, ClassAwareSelectiveGraphitePromptGraphAdapter)
+                    and (
+                        lambda_p23_feature_harm > 0.0
+                        or lambda_p23_feature_gate_supervision > 0.0
+                    )
+                    and epoch > p23_feature_harm_warmup_epochs
                 )
             )
         )
@@ -8557,6 +8864,44 @@ def run_single(
             if prompt_graph_module is not None
             else z.new_tensor(0.0)
         )
+        if (
+            isinstance(prompt_graph_module, ClassAwareSelectiveGraphitePromptGraphAdapter)
+            and no_prompt_out is not None
+            and epoch > p23_feature_harm_warmup_epochs
+            and (lambda_p23_feature_harm > 0.0 or lambda_p23_feature_gate_supervision > 0.0)
+        ):
+            p23_feature_harm_loss, p23_feature_gate_supervision_loss, p23_feature_harm_stats = (
+                _p23_feature_harmful_suppression_loss(
+                    prompt_out=prompt_out,
+                    logits_prompt=model_out["logits"],
+                    logits_no_prompt=no_prompt_out["logits"],
+                    labels=graph.y,
+                    train_mask=label_train_mask,
+                    margin=p23_feature_harm_margin,
+                    temperature=p23_feature_harm_temperature,
+                    harm_quantile=p23_feature_harm_quantile,
+                    help_quantile=p23_feature_help_quantile,
+                    min_signal=p23_feature_min_signal,
+                    help_weight=p23_feature_help_weight,
+                    detach_delta=p23_feature_harm_detach_delta,
+                    class_balanced=p23_feature_harm_class_balanced,
+                )
+            )
+        else:
+            p23_feature_harm_loss = z.new_tensor(0.0)
+            p23_feature_gate_supervision_loss = z.new_tensor(0.0)
+            p23_feature_harm_stats = {
+                "p23_feature_harm_loss": 0.0,
+                "p23_feature_gate_supervision_loss": 0.0,
+                "p23_feature_harm_count": 0.0,
+                "p23_feature_help_count": 0.0,
+                "p23_feature_harm_ratio": 0.0,
+                "p23_feature_help_ratio": 0.0,
+                "p23_feature_raw_harm_ratio": 0.0,
+                "p23_feature_raw_help_ratio": 0.0,
+                "p23_feature_gate_target_mean": 0.0,
+                "p23_feature_gate_delta_corr": 0.0,
+            }
         p22_warmup_loss = (
             lambda_p22_pattern_only * p22_pattern_only
             + lambda_p22_pattern_reg * p22_pattern_reg
@@ -8603,6 +8948,8 @@ def run_single(
             + lambda_p23_norm * p23_norm
             + lambda_p23_hub_budget * p23_hub_budget
             + lambda_p23_node_gate_utility * p23_node_gate_utility
+            + lambda_p23_feature_harm * p23_feature_harm_loss
+            + lambda_p23_feature_gate_supervision * p23_feature_gate_supervision_loss
             + lambda_prompt_adapter_update_norm * prompt_adapter_update_norm
             + lambda_prompt_adapter_gate_budget * prompt_adapter_budget
             + lambda_prompt_adapter_message_help * prompt_adapter_message_help
@@ -8650,6 +8997,7 @@ def run_single(
             train_mask=label_train_mask,
         )
         prompt_log.update(p23_node_gate_utility_stats)
+        prompt_log.update(p23_feature_harm_stats)
         prompt_aware_log = _prompt_aware_diagnostics(model_out)
         log_item = {
             "epoch": float(epoch),
@@ -8694,6 +9042,8 @@ def run_single(
             "p23_norm_loss": float(p23_norm.detach().item()),
             "p23_hub_budget_loss": float(p23_hub_budget.detach().item()),
             "p23_node_gate_utility_loss": float(p23_node_gate_utility.detach().item()),
+            "p23_feature_harm_loss": float(p23_feature_harm_loss.detach().item()),
+            "p23_feature_gate_supervision_loss": float(p23_feature_gate_supervision_loss.detach().item()),
             "prompt_adapter_update_norm_loss": float(prompt_adapter_update_norm.detach().item()),
             "prompt_adapter_gate_budget_loss": float(prompt_adapter_budget.detach().item()),
             "prompt_adapter_message_help_loss": float(prompt_adapter_message_help.detach().item()),
@@ -8727,6 +9077,17 @@ def run_single(
             "prompt_adapter_episode_count": float(prompt_adapter_episode_count),
             "lambda_edge_l1": lambda_edge_l1,
             "lambda_prompt_balance": lambda_prompt_balance,
+            "lambda_p23_feature_harm": lambda_p23_feature_harm,
+            "lambda_p23_feature_gate_supervision": lambda_p23_feature_gate_supervision,
+            "p23_feature_harm_margin": p23_feature_harm_margin,
+            "p23_feature_harm_temperature": p23_feature_harm_temperature,
+            "p23_feature_harm_quantile": p23_feature_harm_quantile,
+            "p23_feature_help_quantile": p23_feature_help_quantile,
+            "p23_feature_min_signal": p23_feature_min_signal,
+            "p23_feature_help_weight": p23_feature_help_weight,
+            "p23_feature_harm_warmup_epochs": p23_feature_harm_warmup_epochs,
+            "p23_feature_harm_detach_delta": p23_feature_harm_detach_delta,
+            "p23_feature_harm_class_balanced": p23_feature_harm_class_balanced,
             "lambda_prompt_role_diversity": lambda_prompt_role_diversity,
             "lambda_prompt_acceptance": lambda_prompt_acceptance,
             "lambda_prompt_acceptance_budget": lambda_prompt_acceptance_budget,
@@ -8753,6 +9114,17 @@ def run_single(
             "lambda_p23_hub_budget": lambda_p23_hub_budget,
             "lambda_p23_node_gate_utility": lambda_p23_node_gate_utility,
             "p23_node_gate_utility_warmup_epochs": float(p23_node_gate_utility_warmup_epochs),
+            "lambda_p23_feature_harm": lambda_p23_feature_harm,
+            "lambda_p23_feature_gate_supervision": lambda_p23_feature_gate_supervision,
+            "p23_feature_harm_margin": p23_feature_harm_margin,
+            "p23_feature_harm_temperature": p23_feature_harm_temperature,
+            "p23_feature_harm_quantile": p23_feature_harm_quantile,
+            "p23_feature_help_quantile": p23_feature_help_quantile,
+            "p23_feature_min_signal": p23_feature_min_signal,
+            "p23_feature_help_weight": p23_feature_help_weight,
+            "p23_feature_harm_warmup_epochs": float(p23_feature_harm_warmup_epochs),
+            "p23_feature_harm_detach_delta": float(p23_feature_harm_detach_delta),
+            "p23_feature_harm_class_balanced": float(p23_feature_harm_class_balanced),
             "lambda_gp2f_contrastive": gp2f_aux_loss_cfg.lambda_ctr,
             "lambda_gp2f_topology_fusion": gp2f_aux_loss_cfg.lambda_fus,
             "lambda_prompt_adapter_update_norm": lambda_prompt_adapter_update_norm,
@@ -8996,6 +9368,8 @@ def run_single(
                     "cls": float(cls_loss.detach().item()),
                     "edge_l1": float(edge_l1.detach().item()),
                     "prompt_balance": float(prompt_balance.detach().item()),
+                    "p23_feature_harm_loss": float(p23_feature_harm_loss.detach().item()),
+                    "p23_feature_gate_supervision_loss": float(p23_feature_gate_supervision_loss.detach().item()),
                     "prompt_role_diversity": float(prompt_role_diversity.detach().item()),
                     "prompt_acceptance": float(prompt_acceptance.detach().item()),
                     "prompt_acceptance_budget": float(prompt_acceptance_budget.detach().item()),
@@ -9053,6 +9427,7 @@ def run_single(
                     **query_proto_alignment_stats,
                     **edge_utility_stats,
                     **correction_alignment_stats,
+                    **p23_feature_harm_stats,
                     **adapter_train_stats,
                     **p22_grad_stats,
                     **prompt_adapter_message_help_stats,
@@ -9099,9 +9474,12 @@ def run_single(
                         "full_loss": float(full_loss.detach().item()),
                         "p22_aux_loss": float(p22_aux_loss.detach().item()),
                         "p22_stage1_active": float(p22_stage1_active),
+                        "p23_feature_harm_loss": float(p23_feature_harm_loss.detach().item()),
+                        "p23_feature_gate_supervision_loss": float(p23_feature_gate_supervision_loss.detach().item()),
                         **metrics,
                         **adapter_train_stats,
                         **p22_deployment_stats,
+                        **p23_feature_harm_stats,
                         **p22_grad_stats,
                         **_adapter_stats(model),
                     }
@@ -10985,6 +11363,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt_update_bound_mode", type=str, choices=["norm_clip", "tanh"], default=None)
     parser.add_argument("--lambda_edge_l1", type=float, default=None)
     parser.add_argument("--lambda_prompt_balance", type=float, default=None)
+    parser.add_argument("--lambda_p23_feature_harm", type=float, default=None)
+    parser.add_argument("--lambda_p23_feature_gate_supervision", type=float, default=None)
+    parser.add_argument("--p23_feature_harm_margin", type=float, default=None)
+    parser.add_argument("--p23_feature_harm_temperature", type=float, default=None)
+    parser.add_argument("--p23_feature_harm_quantile", type=float, default=None)
+    parser.add_argument("--p23_feature_help_quantile", type=float, default=None)
+    parser.add_argument("--p23_feature_min_signal", type=float, default=None)
+    parser.add_argument("--p23_feature_help_weight", type=float, default=None)
+    parser.add_argument("--p23_feature_harm_warmup_epochs", type=int, default=None)
     parser.add_argument("--lambda_prompt_usage_consistency", type=float, default=None)
     parser.add_argument("--lambda_prompt_view_entropy", type=float, default=None)
     parser.add_argument("--lambda_class_route", type=float, default=None)
@@ -11267,6 +11654,30 @@ def main() -> None:
         overrides.setdefault("prompt_graph", {})["lambda_edge_l1"] = float(args.lambda_edge_l1)
     if args.lambda_prompt_balance is not None:
         overrides.setdefault("prompt_graph", {})["lambda_prompt_balance"] = float(args.lambda_prompt_balance)
+    if args.lambda_p23_feature_harm is not None:
+        overrides.setdefault("prompt_graph", {})["lambda_p23_feature_harm"] = float(args.lambda_p23_feature_harm)
+    if args.lambda_p23_feature_gate_supervision is not None:
+        overrides.setdefault("prompt_graph", {})["lambda_p23_feature_gate_supervision"] = float(
+            args.lambda_p23_feature_gate_supervision
+        )
+    if args.p23_feature_harm_margin is not None:
+        overrides.setdefault("prompt_graph", {})["p23_feature_harm_margin"] = float(args.p23_feature_harm_margin)
+    if args.p23_feature_harm_temperature is not None:
+        overrides.setdefault("prompt_graph", {})["p23_feature_harm_temperature"] = float(
+            args.p23_feature_harm_temperature
+        )
+    if args.p23_feature_harm_quantile is not None:
+        overrides.setdefault("prompt_graph", {})["p23_feature_harm_quantile"] = float(args.p23_feature_harm_quantile)
+    if args.p23_feature_help_quantile is not None:
+        overrides.setdefault("prompt_graph", {})["p23_feature_help_quantile"] = float(args.p23_feature_help_quantile)
+    if args.p23_feature_min_signal is not None:
+        overrides.setdefault("prompt_graph", {})["p23_feature_min_signal"] = float(args.p23_feature_min_signal)
+    if args.p23_feature_help_weight is not None:
+        overrides.setdefault("prompt_graph", {})["p23_feature_help_weight"] = float(args.p23_feature_help_weight)
+    if args.p23_feature_harm_warmup_epochs is not None:
+        overrides.setdefault("prompt_graph", {})["p23_feature_harm_warmup_epochs"] = int(
+            args.p23_feature_harm_warmup_epochs
+        )
     if args.lambda_prompt_usage_consistency is not None:
         overrides.setdefault("prompt_graph", {})["lambda_prompt_usage_consistency"] = float(args.lambda_prompt_usage_consistency)
     if args.lambda_prompt_view_entropy is not None:

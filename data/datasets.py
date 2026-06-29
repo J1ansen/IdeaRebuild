@@ -29,6 +29,21 @@ DATASET_ALIASES: dict[str, str] = {
     "PubMed": "PubMed",
     "minesweeper": "minesweeper",
     "Minesweeper": "minesweeper",
+    "amazon_ratings": "amazon_ratings",
+    "amazon-ratings": "amazon_ratings",
+    "amazon-rating": "amazon_ratings",
+    "AmazonRatings": "amazon_ratings",
+    "Amazon-Ratings": "amazon_ratings",
+    "Amazon-Rating": "amazon_ratings",
+    "roman_empire": "roman_empire",
+    "roman-empire": "roman_empire",
+    "RomanEmpire": "roman_empire",
+    "Roman-empire": "roman_empire",
+    "Roman-Empire": "roman_empire",
+    "tolokers": "tolokers",
+    "Tolokers": "tolokers",
+    "questions": "questions",
+    "Questions": "questions",
 }
 
 
@@ -46,7 +61,8 @@ def resolve_dataset_name(name: str) -> str:
         return DATASET_ALIASES[key]
     raise ValueError(
         f"Unsupported dataset {name!r}. Supported names: "
-        "Actor, chameleon, squirrel, minesweeper, Cora, CiteSeer, PubMed."
+        "Actor, chameleon, squirrel, minesweeper, amazon_ratings, roman_empire, "
+        "tolokers, questions, Cora, CiteSeer, PubMed."
     )
 
 
@@ -87,7 +103,7 @@ def load_node_dataset(
             name=canonical,
             transform=transform,
         )
-    elif canonical == "minesweeper":
+    elif canonical in {"minesweeper", "amazon_ratings", "roman_empire", "tolokers", "questions"}:
         processed = root_path / "HeterophilousGraphDataset" / canonical / "processed"
         _require_processed(processed, download_if_missing=download_if_missing)
         dataset = HeterophilousGraphDataset(
