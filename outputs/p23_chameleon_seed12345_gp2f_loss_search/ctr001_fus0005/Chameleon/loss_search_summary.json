@@ -1,0 +1,64 @@
+{
+  "tag": "ctr001_fus0005",
+  "override": {
+    "loss": {
+      "use_original_contrastive": true,
+      "use_original_topology_fusion": true,
+      "lambda_ctr": 0.001,
+      "lambda_fus": 0.0005
+    }
+  },
+  "items": [
+    {
+      "best_acc": 0.3874538838863373,
+      "best_f1": 0.36808395981788633,
+      "best_auroc": 0.637520968914032,
+      "best_auprc": 0.3018334239721298,
+      "final_acc": 0.38218238949775696,
+      "final_f1": 0.36448375284671786,
+      "best_epoch": 150.0,
+      "contrastive_loss": 4.964701175689697,
+      "topology_loss": 4.1759843826293945
+    },
+    {
+      "best_acc": 0.36109647154808044,
+      "best_f1": 0.34657177329063416,
+      "best_auroc": 0.6682605743408203,
+      "best_auprc": 0.32274735569953916,
+      "final_acc": 0.35898786783218384,
+      "final_f1": 0.3476359784603119,
+      "best_epoch": 95.0,
+      "contrastive_loss": 4.929915428161621,
+      "topology_loss": 4.552475452423096
+    },
+    {
+      "best_acc": 0.36794939637184143,
+      "best_f1": 0.35558168292045594,
+      "best_auroc": 0.6562107086181641,
+      "best_auprc": 0.3079349875450134,
+      "final_acc": 0.376910924911499,
+      "final_f1": 0.34683135598897935,
+      "best_epoch": 15.0,
+      "contrastive_loss": 5.020352363586426,
+      "topology_loss": 6.822904586791992
+    }
+  ],
+  "summary": {
+    "best_acc_mean": 0.37216658393541974,
+    "best_acc_std": 0.01116592433857054,
+    "best_f1_mean": 0.35674580534299216,
+    "best_f1_std": 0.008820806012181697,
+    "best_auroc_mean": 0.6539974172910055,
+    "best_auroc_std": 0.012646602424440998,
+    "best_auprc_mean": 0.31083858907222744,
+    "best_auprc_std": 0.008781469559867326,
+    "final_acc_mean": 0.3726937274138133,
+    "final_acc_std": 0.009927571870789971,
+    "final_f1_mean": 0.35298369576533634,
+    "final_f1_std": 0.008138400292711815,
+    "contrastive_loss_mean": 4.971656322479248,
+    "contrastive_loss_std": 0.03724683765015693,
+    "topology_loss_mean": 5.183788140614827,
+    "topology_loss_std": 1.169177324590513
+  }
+}
