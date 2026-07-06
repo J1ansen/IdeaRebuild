@@ -13,6 +13,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from models.p23_static_pool import P23StaticPoolSelector
+
 
 def _safe_entropy(prob: torch.Tensor) -> torch.Tensor:
     if prob.numel() == 0:
@@ -65,12 +67,25 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
         self.edge_dropout = float(self.config.get("edge_dropout", 0.0))
         self.learn_feature_edge_weight = bool(self.config.get("learn_feature_edge_weight", True))
         self.use_feature_gate = bool(self.config.get("use_feature_gate", True))
+        self.use_node_feature_edge_gate = bool(self.config.get("use_node_feature_edge_gate", False))
+        self.node_feature_edge_gate_strength = float(self.config.get("node_feature_edge_gate_strength", 0.25))
         self.feature_edge_min_scale = float(self.config.get("feature_edge_min_scale", 0.0))
         self.feature_gate_floor = float(self.config.get("feature_gate_floor", 0.0))
+        static_pool_cfg = dict(self.config.get("static_pool", {}))
+        static_pool_cfg.setdefault("tokenizer", self.tokenizer)
+        static_pool_cfg.setdefault("feature_topk", self.topk)
+        static_pool_cfg.setdefault("binary_threshold", self.binary_threshold)
+        static_pool_cfg.setdefault("binary_topk", self.binary_topk)
+        self.static_pool = P23StaticPoolSelector(static_pool_cfg)
+        self.static_pool_apply_to = str(static_pool_cfg.get("apply_to", "prompt_to_node"))
+        if self.static_pool_apply_to not in {"prompt_to_node", "both"}:
+            raise ValueError("static_pool.apply_to must be 'prompt_to_node' or 'both'")
         if not 0.0 <= self.feature_gate_floor < 1.0:
             raise ValueError("feature_gate_floor must be in [0, 1)")
         if self.feature_edge_min_scale < 0.0:
             raise ValueError("feature_edge_min_scale must be non-negative")
+        if not 0.0 <= self.node_feature_edge_gate_strength < 1.0:
+            raise ValueError("node_feature_edge_gate_strength must be in [0, 1)")
 
         if self.learn_feature_edge_weight:
             init_dynamic = max(self.feature_edge_weight - self.feature_edge_min_scale, 1e-6)
@@ -86,6 +101,16 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
         )
         nn.init.zeros_(self.feature_gate[-1].weight)
         nn.init.zeros_(self.feature_gate[-1].bias)
+
+        edge_gate_input_dim = 11
+        self.node_feature_edge_gate = nn.Sequential(
+            nn.LayerNorm(edge_gate_input_dim),
+            nn.Linear(edge_gate_input_dim, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+        nn.init.zeros_(self.node_feature_edge_gate[-1].weight)
+        nn.init.zeros_(self.node_feature_edge_gate[-1].bias)
 
         self._cached_graph: dict[str, Any] | None = None
         self._cache_signature: tuple[int, int, int, int, str] | None = None
@@ -141,6 +166,16 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
 
         train = train_mask.to(device=device, dtype=torch.bool)
         y = labels.to(device=device, dtype=torch.long) if labels is not None else None
+        pool_result = self.static_pool.select(
+            x=x_raw.to(device=device, dtype=dtype),
+            edge_index=edge_index.to(device=device),
+            labels=y,
+            train_mask=train,
+            num_classes=max(1, self.num_classes),
+        )
+        pool_mask = pool_result.mask.to(device=device, dtype=torch.bool)
+        pool_score = pool_result.score.to(device=device, dtype=dtype)
+        pool_receive_scale = pool_result.receive_scale.to(device=device, dtype=dtype)
         class_count = max(1, self.num_classes)
         label_counts = z.new_zeros((num_features, class_count))
         if y is not None and bool(train.any()):
@@ -173,6 +208,8 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
             prompt_edges = torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
             edge_feature_local = torch.empty(0, dtype=torch.long, device=device)
             edge_node_index = torch.empty(0, dtype=torch.long, device=device)
+            edge_direction = torch.empty(0, dtype=torch.long, device=device)
+            edge_receive_scale = z.new_zeros(0)
             feature_stats = z.new_zeros((0, 6))
             base_edge_weight = z.new_zeros(0)
             usage = z.new_zeros(0)
@@ -200,11 +237,29 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
                 prompt_x = prompt_x.detach()
 
             prompt_node = feature_local + num_nodes
-            node_to_prompt = torch.stack([node_idx, prompt_node], dim=0)
-            prompt_to_node = torch.stack([prompt_node, node_idx], dim=0)
+            hard_pool = self.static_pool.enabled and self.static_pool.mode == "hard"
+            if hard_pool and self.static_pool_apply_to == "both":
+                node_edge_mask = pool_mask[node_idx]
+            else:
+                node_edge_mask = torch.ones_like(node_idx, dtype=torch.bool)
+            receive_edge_mask = pool_mask[node_idx] if hard_pool else torch.ones_like(node_idx, dtype=torch.bool)
+            node_to_prompt = torch.stack([node_idx[node_edge_mask], prompt_node[node_edge_mask]], dim=0)
+            prompt_to_node = torch.stack([prompt_node[receive_edge_mask], node_idx[receive_edge_mask]], dim=0)
             prompt_edges = torch.cat([node_to_prompt, prompt_to_node], dim=1).to(device=edge_index.device)
-            edge_feature_local = torch.cat([feature_local, feature_local], dim=0)
-            edge_node_index = torch.cat([node_idx, node_idx], dim=0)
+            edge_feature_local = torch.cat([feature_local[node_edge_mask], feature_local[receive_edge_mask]], dim=0)
+            edge_node_index = torch.cat([node_idx[node_edge_mask], node_idx[receive_edge_mask]], dim=0)
+            node_edge_scale = torch.ones(int(node_edge_mask.sum().item()), dtype=dtype, device=device)
+            receive_scale = pool_receive_scale[node_idx[receive_edge_mask]]
+            if self.static_pool.enabled and self.static_pool_apply_to == "both" and self.static_pool.mode == "soft":
+                node_edge_scale = pool_receive_scale[node_idx[node_edge_mask]]
+            edge_receive_scale = torch.cat([node_edge_scale, receive_scale], dim=0)
+            edge_direction = torch.cat(
+                [
+                    torch.zeros(int(node_edge_mask.sum().item()), dtype=torch.long, device=device),
+                    torch.ones(int(receive_edge_mask.sum().item()), dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
             usage = torch.zeros(feature_ids.numel(), dtype=dtype, device=device)
             usage.index_add_(0, feature_local, torch.ones_like(feature_local, dtype=dtype))
             rel = reliability[feature_ids].clamp_min(0.0)
@@ -236,8 +291,12 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
             "prompt_edges": prompt_edges,
             "edge_feature_local": edge_feature_local,
             "edge_node_index": edge_node_index,
+            "edge_direction": edge_direction,
+            "edge_receive_scale": edge_receive_scale.detach(),
             "base_edge_weight": base_edge_weight,
-            "pool_mask": torch.ones(num_nodes, dtype=torch.bool, device=device),
+            "pool_mask": pool_mask.detach(),
+            "pool_score": pool_score.detach(),
+            "pool_receive_scale": pool_receive_scale.detach(),
             "feature_stats": feature_stats.detach(),
             "feature_ids": feature_ids.detach(),
             "feature_dominant_class": feature_dominant_class.detach(),
@@ -248,7 +307,22 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
                 "connected_edge_count": int(prompt_edges.size(1)),
                 "edge_type_counts": [int(edge_index.size(1)), int(prompt_edges.size(1)), 0],
                 "p23_selective_graphite_enabled": z.new_tensor(1.0),
-                "p23_pool_ratio": z.new_tensor(1.0),
+                "p23_pool_ratio": z.new_tensor(float(pool_result.ratio)),
+                "p23_static_pool_enabled": z.new_tensor(float(self.static_pool.enabled)),
+                "p23_static_pool_ratio": z.new_tensor(float(pool_result.ratio)),
+                "p23_static_pool_core_ratio": z.new_tensor(float(pool_result.core_ratio)),
+                "p23_static_pool_expand_ratio": z.new_tensor(float(pool_result.expand_ratio)),
+                "p23_static_pool_mode_soft": z.new_tensor(float(self.static_pool.mode == "soft")),
+                "p23_static_pool_receive_scale_mean": pool_receive_scale.mean() if pool_receive_scale.numel() > 0 else z.new_tensor(0.0),
+                "p23_static_pool_receive_scale_pool_mean": (
+                    pool_receive_scale[pool_mask].mean() if bool(pool_mask.any()) else z.new_tensor(0.0)
+                ),
+                "p23_static_pool_receive_scale_nonpool_mean": (
+                    pool_receive_scale[~pool_mask].mean() if bool((~pool_mask).any()) else z.new_tensor(0.0)
+                ),
+                "p23_static_pool_score_mean": pool_score.mean() if pool_score.numel() > 0 else z.new_tensor(0.0),
+                "p23_static_pool_score_pool_mean": pool_score[pool_mask].mean() if bool(pool_mask.any()) else z.new_tensor(0.0),
+                "p23_static_pool_score_nonpool_mean": pool_score[~pool_mask].mean() if bool((~pool_mask).any()) else z.new_tensor(0.0),
                 "p23_feature_prompt_count": z.new_tensor(float(feature_ids.numel())),
                 "p23_prompt_edge_count": z.new_tensor(float(prompt_edges.size(1))),
                 "p23_selective_feature_prompt_count": z.new_tensor(float(feature_ids.numel())),
@@ -270,6 +344,11 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
             gate = self._feature_gate_values(graph, ref)
             edge_feature_local = graph["edge_feature_local"].to(device=ref.device)
             base = base * gate[edge_feature_local]
+        edge_receive_scale = graph.get("edge_receive_scale")
+        if isinstance(edge_receive_scale, torch.Tensor) and edge_receive_scale.numel() == base.numel():
+            base = base * edge_receive_scale.to(device=ref.device, dtype=ref.dtype)
+        if self.use_node_feature_edge_gate:
+            base = base * self._node_feature_edge_gate_values(graph, ref)
         weight = base * self._feature_scale(ref, edge_scale_multiplier)
         if self.training and self.edge_dropout > 0.0:
             keep = torch.rand_like(weight) >= self.edge_dropout
@@ -287,6 +366,31 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
             floor = ref.new_tensor(float(self.feature_gate_floor))
             gate = floor + (1.0 - floor) * gate
         return gate
+
+    def _node_feature_edge_gate_values(self, graph: dict[str, Any], ref: torch.Tensor) -> torch.Tensor:
+        raw_gate = self._node_feature_edge_gate_probability(graph, ref)
+        strength = ref.new_tensor(float(self.node_feature_edge_gate_strength))
+        return 1.0 + strength * (2.0 * raw_gate - 1.0)
+
+    def _node_feature_edge_gate_probability(self, graph: dict[str, Any], ref: torch.Tensor) -> torch.Tensor:
+        edge_feature = graph["edge_feature_local"].to(device=ref.device, dtype=torch.long)
+        edge_node = graph["edge_node_index"].to(device=ref.device, dtype=torch.long)
+        if edge_feature.numel() == 0:
+            return ref.new_zeros(0)
+        feature_stats = graph["feature_stats"].to(device=ref.device, dtype=ref.dtype)
+        feature_edge_stats = feature_stats[edge_feature]
+        node_norm = ref.norm(dim=-1)
+        node_norm = node_norm / node_norm.mean().clamp_min(1e-6)
+        node_norm = node_norm[edge_node].unsqueeze(-1)
+        pool_score = graph["pool_score"].to(device=ref.device, dtype=ref.dtype)[edge_node].unsqueeze(-1)
+        receive_scale = graph["edge_receive_scale"].to(device=ref.device, dtype=ref.dtype).unsqueeze(-1)
+        direction = graph["edge_direction"].to(device=ref.device, dtype=ref.dtype).unsqueeze(-1)
+        base_weight = graph["base_edge_weight"].to(device=ref.device, dtype=ref.dtype).unsqueeze(-1)
+        gate_input = torch.cat(
+            [feature_edge_stats, node_norm, pool_score, receive_scale, direction, base_weight],
+            dim=-1,
+        )
+        return torch.sigmoid(self.node_feature_edge_gate(gate_input).squeeze(-1))
 
     def forward(
         self,
@@ -325,6 +429,16 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
         prompt_edges = graph["prompt_edges"].to(device=edge_index.device)
         prompt_edge_weight = self._edge_weight(graph, z, edge_scale_multiplier)
         feature_gate = self._feature_gate_values(graph, z)
+        edge_gate = (
+            self._node_feature_edge_gate_values(graph, z)
+            if self.use_node_feature_edge_gate
+            else torch.ones_like(prompt_edge_weight)
+        )
+        edge_gate_probability = (
+            self._node_feature_edge_gate_probability(graph, z)
+            if self.use_node_feature_edge_gate
+            else torch.ones_like(prompt_edge_weight)
+        )
         adapted_x = torch.cat([z, prompt_x], dim=0)
         base_weight = torch.ones(edge_index.size(1), dtype=z.dtype, device=z.device) * float(self.original_edge_weight)
         adapted_edge_index = torch.cat([edge_index, prompt_edges], dim=1)
@@ -343,10 +457,16 @@ class ClassAwareSelectiveGraphitePromptGraphAdapter(nn.Module):
         aux["prompt_edge_weight"] = prompt_edge_weight
         aux["p23_selective_edge_feature_local"] = graph["edge_feature_local"].to(device=z.device)
         aux["p23_selective_edge_node_index"] = graph["edge_node_index"].to(device=z.device)
+        aux["p23_selective_edge_direction"] = graph["edge_direction"].to(device=z.device)
         aux["p23_selective_feature_gate"] = feature_gate
+        aux["p23_selective_edge_gate"] = edge_gate
+        aux["p23_selective_edge_gate_probability"] = edge_gate_probability
         aux["p23_selective_feature_dominant_class"] = graph["feature_dominant_class"].to(device=z.device)
         aux["p23_selective_static_cache_hit"] = z.new_tensor(float(cache_hit))
         aux["p23_selective_feature_edge_weight_mean"] = prompt_edge_weight.mean() if prompt_edge_weight.numel() > 0 else z.new_tensor(0.0)
+        aux["p23_selective_edge_gate_mean"] = edge_gate.mean() if edge_gate.numel() > 0 else z.new_tensor(0.0)
+        aux["p23_selective_edge_gate_min"] = edge_gate.min() if edge_gate.numel() > 0 else z.new_tensor(0.0)
+        aux["p23_selective_edge_gate_max"] = edge_gate.max() if edge_gate.numel() > 0 else z.new_tensor(0.0)
         return {
             "adapted_x": adapted_x,
             "adapted_edge_index": adapted_edge_index,

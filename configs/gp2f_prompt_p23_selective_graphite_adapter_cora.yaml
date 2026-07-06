@@ -1,10 +1,10 @@
 experiment:
-  name: gp2f_prompt_p23_selective_graphite_adapter_chameleon
+  name: gp2f_prompt_p23_selective_graphite_adapter_cora
   seed: 12345
   runs: 1
   trials_per_seed: 10
   source_dataset: Cora
-  target_dataset: Chameleon
+  target_dataset: Cora
   prompt_variant: p23_selective_graphite_adapter
 
 data:
@@ -65,8 +65,8 @@ prompt_graph:
   original_edge_weight: 1.0
   learn_feature_edge_weight: true
   use_feature_gate: true
-  use_node_feature_edge_gate: true
-  node_feature_edge_gate_strength: 0.10
+  use_node_feature_edge_gate: false
+  node_feature_edge_gate_strength: 0.25
   anti_hub_power: 0.50
   label_node_weight: 4.0
   unlabeled_node_weight: 0.20
@@ -99,21 +99,21 @@ prompt_adapter:
   enabled: false
 
 training:
-  epochs: 160
-  lr: 0.0005
-  prompt_lr: 0.0005
+  epochs: 300
+  lr: 0.001
+  prompt_lr: 0.001
   prompt_lr_multiplier: 1.0
   weight_decay: 0.0005
   prompt_weight_decay: 0.0
   grad_clip: 1.0
   log_every: 5
   eval_every: 5
-  output_dir: outputs/gp2f_prompt_p23_selective_graphite_adapter_chameleon_fixed
-  early_stop_patience: 35
-  early_stop_min_epochs: 35
-  early_stop_metric: val_macro_f1
+  output_dir: outputs/gp2f_prompt_p23_selective_graphite_adapter_cora_fixed
+  early_stop_patience: 20
+  early_stop_min_epochs: 100
+  early_stop_metric: val_acc
   keep_best_checkpoint: true
-  class_balanced_ce: true
+  class_balanced_ce: false
   class_weight_mode: inverse_sqrt
   freeze_base_model: false
   freeze_input_aligner_for_p23: false

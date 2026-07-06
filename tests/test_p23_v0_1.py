@@ -88,8 +88,11 @@ def test_p23_selective_graphite_variant_uses_balanced_defaults():
     assert cfg["training"]["class_balanced_ce"] is True
     assert cfg["training"]["early_stop_metric"] == "val_macro_f1"
     assert cfg["prompt_graph"]["use_feature_gate"] is True
+    assert cfg["prompt_graph"]["use_node_feature_edge_gate"] is True
+    assert cfg["prompt_graph"]["node_feature_edge_gate_strength"] == 0.25
     assert cfg["prompt_graph"]["feature_edge_min_scale"] == 0.05
     assert cfg["prompt_graph"]["feature_gate_floor"] == 0.20
+    assert cfg["prompt_graph"]["static_pool"]["non_pool_scale"] == 1.0
 
 
 def test_train_nodes_are_forced_into_pool():
@@ -503,6 +506,189 @@ def test_selective_graphite_adapter_keeps_prompt_edge_floor():
     assert float(prompt_weight.detach().max()) > 0.0
 
 
+def test_selective_graphite_static_pool_filters_prompt_to_node_edges():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    labels = torch.tensor([0, 0, 1, 1, 0])
+    base_cfg = {
+        "num_classes": 2,
+        "feature_tokenizer": {"mode": "binary_nonzero", "binary_threshold": 0.0},
+        "feature_filter": {
+            "min_df_global": 1,
+            "max_df_global_ratio": 1.0,
+            "min_label_count": 1,
+            "min_purity": 0.0,
+            "max_entropy": 1.0,
+        },
+        "learn_feature_edge_weight": False,
+    }
+    no_pool = ClassAwareSelectiveGraphitePromptGraphAdapter(source_dim=3, hidden_dim=6, config=base_cfg)
+    pooled = ClassAwareSelectiveGraphitePromptGraphAdapter(
+        source_dim=3,
+        hidden_dim=6,
+        config={
+            **base_cfg,
+            "static_pool": {
+                "enabled": True,
+                "strategy": "feature_label_ambiguity",
+                "ratio": 0.4,
+                "apply_to": "prompt_to_node",
+            },
+        },
+    )
+    out_all = no_pool(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    out_pool = pooled(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    original_edges = edge_index.size(1)
+    all_prompt_edges = out_all["adapted_edge_index"][:, original_edges:]
+    pooled_prompt_edges = out_pool["adapted_edge_index"][:, original_edges:]
+    all_to_node = (all_prompt_edges[0] >= z.size(0)) & (all_prompt_edges[1] < z.size(0))
+    pooled_to_node = (pooled_prompt_edges[0] >= z.size(0)) & (pooled_prompt_edges[1] < z.size(0))
+    all_to_prompt = (all_prompt_edges[0] < z.size(0)) & (all_prompt_edges[1] >= z.size(0))
+    pooled_to_prompt = (pooled_prompt_edges[0] < z.size(0)) & (pooled_prompt_edges[1] >= z.size(0))
+
+    assert out_pool["aux"]["p23_static_pool_enabled"].item() == 1.0
+    assert 0.0 < out_pool["aux"]["p23_static_pool_ratio"].item() < 1.0
+    assert int(pooled_to_node.sum().item()) < int(all_to_node.sum().item())
+    assert int(pooled_to_prompt.sum().item()) == int(all_to_prompt.sum().item())
+    pool_mask = out_pool["pool_mask"]
+    assert torch.all(pool_mask[pooled_prompt_edges[1, pooled_to_node]])
+
+
+def test_selective_graphite_soft_pool_keeps_edges_and_boosts_pool_receivers():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    labels = torch.tensor([0, 0, 1, 1, 0])
+    cfg = {
+        "num_classes": 2,
+        "feature_tokenizer": {"mode": "binary_nonzero", "binary_threshold": 0.0},
+        "feature_filter": {
+            "min_df_global": 1,
+            "max_df_global_ratio": 1.0,
+            "min_label_count": 1,
+            "min_purity": 0.0,
+            "max_entropy": 1.0,
+        },
+        "learn_feature_edge_weight": False,
+        "use_feature_gate": False,
+        "static_pool": {
+            "enabled": True,
+            "mode": "soft",
+            "strategy": "feature_label_ambiguity",
+            "ratio": 0.4,
+            "core_ratio": 0.2,
+            "expand_ratio": 0.4,
+            "core_scale": 1.2,
+            "expand_scale": 1.1,
+            "non_pool_scale": 1.0,
+            "apply_to": "prompt_to_node",
+        },
+    }
+    no_pool = ClassAwareSelectiveGraphitePromptGraphAdapter(
+        source_dim=3,
+        hidden_dim=6,
+        config={k: v for k, v in cfg.items() if k != "static_pool"},
+    )
+    soft_pool = ClassAwareSelectiveGraphitePromptGraphAdapter(source_dim=3, hidden_dim=6, config=cfg)
+    out_all = no_pool(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    out_soft = soft_pool(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    original_edges = edge_index.size(1)
+    assert out_soft["prompt_edge_count"] == out_all["prompt_edge_count"]
+    assert out_soft["aux"]["p23_static_pool_mode_soft"].item() == 1.0
+    prompt_edges = out_soft["adapted_edge_index"][:, original_edges:]
+    prompt_weight = out_soft["adapted_edge_weight"][original_edges:]
+    to_node = (prompt_edges[0] >= z.size(0)) & (prompt_edges[1] < z.size(0))
+    recv_nodes = prompt_edges[1, to_node]
+    pool_mask = out_soft["pool_mask"]
+    assert bool((~pool_mask[recv_nodes]).any())
+    to_node_weight = prompt_weight[to_node]
+    all_prompt_edges = out_all["adapted_edge_index"][:, original_edges:]
+    all_prompt_weight = out_all["adapted_edge_weight"][original_edges:]
+    all_to_node = (all_prompt_edges[0] >= z.size(0)) & (all_prompt_edges[1] < z.size(0))
+    all_recv_nodes = all_prompt_edges[1, all_to_node]
+    all_to_node_weight = all_prompt_weight[all_to_node]
+    assert torch.allclose(
+        to_node_weight[~pool_mask[recv_nodes]],
+        all_to_node_weight[~pool_mask[all_recv_nodes]],
+    )
+    assert float(to_node_weight[pool_mask[recv_nodes]].min().item()) > float(
+        all_to_node_weight[pool_mask[all_recv_nodes]].min().item()
+    )
+
+
+def test_selective_graphite_node_feature_edge_gate_is_neutral_at_init_and_trainable():
+    x_raw, z, edge_index, train_mask, logits, h_pre, h_adp = _toy_inputs()
+    labels = torch.tensor([0, 0, 1, 1, 0])
+    cfg = {
+        "num_classes": 2,
+        "feature_tokenizer": {"mode": "binary_nonzero", "binary_threshold": 0.0},
+        "feature_filter": {
+            "min_df_global": 1,
+            "max_df_global_ratio": 1.0,
+            "min_label_count": 1,
+            "min_purity": 0.0,
+            "max_entropy": 1.0,
+        },
+        "learn_feature_edge_weight": False,
+        "use_feature_gate": False,
+        "use_node_feature_edge_gate": True,
+        "node_feature_edge_gate_strength": 0.25,
+    }
+    module = ClassAwareSelectiveGraphitePromptGraphAdapter(source_dim=3, hidden_dim=6, config=cfg)
+    out = module(
+        z=z,
+        x_raw=x_raw,
+        h_pre=h_pre,
+        edge_index=edge_index,
+        train_mask=train_mask,
+        labels=labels,
+        no_prompt_logits=logits,
+        h_adp_no_prompt=h_adp,
+    )
+    edge_gate = out["aux"]["p23_selective_edge_gate"]
+    edge_gate_probability = out["aux"]["p23_selective_edge_gate_probability"]
+    assert torch.allclose(edge_gate, torch.ones_like(edge_gate))
+    assert torch.allclose(edge_gate_probability, torch.full_like(edge_gate_probability, 0.5))
+
+    loss = edge_gate_probability.sum()
+    loss.backward()
+    assert module.node_feature_edge_gate[-1].bias.grad is not None
+    assert torch.isfinite(module.node_feature_edge_gate[-1].bias.grad).all()
+
+
 def test_p23_feature_harmful_suppression_trains_feature_gate():
     feature_gate = torch.tensor([0.8, 0.8], requires_grad=True)
     prompt_out = {
@@ -534,6 +720,43 @@ def test_p23_feature_harmful_suppression_trains_feature_gate():
     assert feature_gate.grad is not None
     assert stats["p23_feature_harm_count"] > 0.0
     assert stats["p23_feature_help_count"] > 0.0
+
+
+def test_p23_feature_harmful_suppression_trains_edge_gate_when_available():
+    edge_gate = torch.tensor([0.8, 0.8, 0.8, 0.8], requires_grad=True)
+    prompt_out = {
+        "aux": {
+            "p23_selective_feature_gate": torch.tensor([0.8, 0.8]),
+            "p23_selective_edge_gate_probability": edge_gate,
+            "p23_selective_edge_feature_local": torch.tensor([0, 0, 1, 1]),
+            "p23_selective_edge_node_index": torch.tensor([0, 1, 2, 3]),
+            "p23_selective_edge_direction": torch.ones(4, dtype=torch.long),
+            "p23_selective_feature_dominant_class": torch.tensor([0, 1]),
+        }
+    }
+    labels = torch.tensor([0, 0, 1, 1])
+    logits_no_prompt = torch.tensor([[3.0, 0.0], [3.0, 0.0], [0.0, 3.0], [0.0, 3.0]])
+    logits_prompt = torch.tensor([[0.0, 3.0], [3.0, 0.0], [0.0, 3.0], [3.0, 0.0]])
+    harm, gate, stats = _p23_feature_harmful_suppression_loss(
+        prompt_out=prompt_out,
+        logits_prompt=logits_prompt,
+        logits_no_prompt=logits_no_prompt,
+        labels=labels,
+        train_mask=torch.ones(4, dtype=torch.bool),
+        margin=0.0,
+        temperature=0.05,
+        harm_quantile=0.0,
+        help_quantile=0.0,
+        min_signal=0.0,
+        help_weight=0.5,
+        detach_delta=True,
+        class_balanced=False,
+    )
+    total = harm + gate
+    total.backward()
+    assert edge_gate.grad is not None
+    assert torch.isfinite(edge_gate.grad).all()
+    assert stats["p23_edge_harm_ratio"] > 0.0
 
 
 def test_class_balanced_loss_differs_from_plain_ce_on_imbalanced_labels():

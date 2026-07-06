@@ -1,6 +1,6 @@
 experiment:
   name: gp2f_prompt_p23_selective_graphite_adapter_actor
-  seed: 0
+  seed: 12345
   runs: 1
   trials_per_seed: 10
   source_dataset: Cora
@@ -65,6 +65,8 @@ prompt_graph:
   original_edge_weight: 1.0
   learn_feature_edge_weight: true
   use_feature_gate: true
+  use_node_feature_edge_gate: true
+  node_feature_edge_gate_strength: 0.25
   anti_hub_power: 0.50
   label_node_weight: 4.0
   unlabeled_node_weight: 0.20
@@ -97,9 +99,9 @@ prompt_adapter:
   enabled: false
 
 training:
-  epochs: 160
-  lr: 0.001
-  prompt_lr: 0.001
+  epochs: 300
+  lr: 0.0005
+  prompt_lr: 0.0005
   prompt_lr_multiplier: 1.0
   weight_decay: 0.0005
   prompt_weight_decay: 0.0

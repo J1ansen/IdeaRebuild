@@ -325,10 +325,28 @@ def _config_for_variant(config: dict[str, Any], variant: str) -> dict[str, Any]:
         prompt_graph.setdefault("original_edge_weight", 1.0)
         prompt_graph.setdefault("learn_feature_edge_weight", True)
         prompt_graph.setdefault("use_feature_gate", True)
+        prompt_graph.setdefault("use_node_feature_edge_gate", True)
+        prompt_graph.setdefault("node_feature_edge_gate_strength", 0.25)
         prompt_graph.setdefault("anti_hub_power", 0.5)
         prompt_graph.setdefault("label_node_weight", 4.0)
         prompt_graph.setdefault("unlabeled_node_weight", 0.25)
         prompt_graph.setdefault("offclass_label_weight", 0.05)
+        prompt_graph.setdefault(
+            "static_pool",
+            {
+                "enabled": False,
+                "mode": "hard",
+                "strategy": "feature_label_ambiguity",
+                "ratio": 0.15,
+                "core_ratio": 0.15,
+                "expand_ratio": 0.35,
+                "core_scale": 1.2,
+                "expand_scale": 1.1,
+                "non_pool_scale": 1.0,
+                "apply_to": "prompt_to_node",
+                "feature_topk": 16,
+            },
+        )
         prompt_graph.setdefault("detach_feature_prompt", True)
         prompt_graph.setdefault("edge_scale_warmup_epochs", 0)
         prompt_graph.setdefault("edge_scale_warmup_start", 1.0)
@@ -2601,12 +2619,18 @@ def _p23_feature_harmful_suppression_loss(
             "p23_feature_raw_help_ratio": 0.0,
             "p23_feature_gate_target_mean": 0.0,
             "p23_feature_gate_delta_corr": 0.0,
+            "p23_edge_harm_ratio": 0.0,
+            "p23_edge_help_ratio": 0.0,
+            "p23_edge_gate_target_mean": 0.0,
+            "p23_edge_gate_delta_corr": 0.0,
         }
 
     aux = prompt_out.get("aux", {})
     feature_gate = aux.get("p23_selective_feature_gate")
     edge_feature = aux.get("p23_selective_edge_feature_local")
     edge_node = aux.get("p23_selective_edge_node_index")
+    edge_direction = aux.get("p23_selective_edge_direction")
+    edge_gate = aux.get("p23_selective_edge_gate_probability", aux.get("p23_selective_edge_gate"))
     dominant_class = aux.get("p23_selective_feature_dominant_class")
     fallback = logits_prompt.new_tensor(0.0)
     if not (
@@ -2629,8 +2653,80 @@ def _p23_feature_harmful_suppression_loss(
     edge_feature = edge_feature.to(device=logits_prompt.device, dtype=torch.long)
     train = train_mask.to(device=logits_prompt.device, dtype=torch.bool)
     valid = train[edge_node] & (edge_feature >= 0) & (edge_feature < feature_gate.numel())
+    if isinstance(edge_direction, torch.Tensor) and edge_direction.numel() == edge_feature.numel():
+        direction = edge_direction.to(device=logits_prompt.device, dtype=torch.long)
+        valid = valid & (direction == 1)
     if not bool(valid.any()):
         return fallback, fallback, zero_stats()
+
+    if isinstance(edge_gate, torch.Tensor) and edge_gate.numel() == edge_feature.numel():
+        selected_delta = delta[edge_node[valid]]
+        selected_gate = edge_gate.to(device=logits_prompt.device, dtype=logits_prompt.dtype)[valid].clamp(1e-6, 1.0 - 1e-6)
+        harmful = F.relu(selected_delta - float(margin))
+        helpful = F.relu(-selected_delta - float(margin))
+        harm_q = min(max(float(harm_quantile), 0.0), 1.0)
+        help_q = min(max(float(help_quantile), 0.0), 1.0)
+        signal_floor = max(float(min_signal), 0.0)
+        harm_threshold = torch.quantile(harmful.detach(), harm_q).clamp_min(signal_floor)
+        help_threshold = torch.quantile(helpful.detach(), help_q).clamp_min(signal_floor)
+        harmful_edge = (harmful >= harm_threshold) & (harmful >= helpful)
+        helpful_edge = (helpful >= help_threshold) & (helpful > harmful)
+        selected_edge = harmful_edge | helpful_edge
+        utility_target = torch.sigmoid((-selected_delta.detach()) / max(float(temperature), 1e-6)).to(
+            dtype=selected_gate.dtype
+        )
+        per_edge_harm = harmful.detach() * selected_gate
+        per_edge_help = helpful.detach() * (1.0 - selected_gate)
+        per_edge_gate_loss = F.binary_cross_entropy(selected_gate, utility_target, reduction="none")
+
+        if class_balanced:
+            selected_labels = y[edge_node[valid]]
+            losses_harm: list[torch.Tensor] = []
+            losses_help: list[torch.Tensor] = []
+            losses_gate: list[torch.Tensor] = []
+            for cls in torch.unique(selected_labels):
+                cls_mask = selected_labels == cls
+                cls_harm = harmful_edge & cls_mask
+                cls_help = helpful_edge & cls_mask
+                cls_selected = selected_edge & cls_mask
+                if bool(cls_harm.any()):
+                    losses_harm.append(per_edge_harm[cls_harm].mean())
+                if bool(cls_help.any()):
+                    losses_help.append(per_edge_help[cls_help].mean())
+                if bool(cls_selected.any()):
+                    losses_gate.append(per_edge_gate_loss[cls_selected].mean())
+            harm_part = torch.stack(losses_harm).mean() if losses_harm else fallback
+            help_part = torch.stack(losses_help).mean() if losses_help else fallback
+            harm_loss = harm_part + max(float(help_weight), 0.0) * help_part
+            gate_loss = torch.stack(losses_gate).mean() if losses_gate else fallback
+        else:
+            harm_part = per_edge_harm[harmful_edge].mean() if bool(harmful_edge.any()) else fallback
+            help_part = per_edge_help[helpful_edge].mean() if bool(helpful_edge.any()) else fallback
+            harm_loss = harm_part + max(float(help_weight), 0.0) * help_part
+            gate_loss = per_edge_gate_loss[selected_edge].mean() if bool(selected_edge.any()) else fallback
+
+        with torch.no_grad():
+            gate_centered = selected_gate - selected_gate.mean()
+            utility_centered = (-selected_delta) - (-selected_delta).mean()
+            denom = gate_centered.norm() * utility_centered.norm()
+            corr = (gate_centered * utility_centered).sum() / denom.clamp_min(1e-12)
+        stats = {
+            "p23_feature_harm_loss": float(harm_loss.detach().item()),
+            "p23_feature_gate_supervision_loss": float(gate_loss.detach().item()),
+            "p23_feature_harm_count": float(harmful_edge.sum().detach().item()),
+            "p23_feature_help_count": float(helpful_edge.sum().detach().item()),
+            "p23_feature_harm_ratio": float(harmful_edge.float().mean().detach().item()),
+            "p23_feature_help_ratio": float(helpful_edge.float().mean().detach().item()),
+            "p23_feature_raw_harm_ratio": float((harmful > 0).float().mean().detach().item()),
+            "p23_feature_raw_help_ratio": float((helpful > 0).float().mean().detach().item()),
+            "p23_feature_gate_target_mean": float(utility_target.mean().detach().item()),
+            "p23_feature_gate_delta_corr": float(corr.detach().item()),
+            "p23_edge_harm_ratio": float(harmful_edge.float().mean().detach().item()),
+            "p23_edge_help_ratio": float(helpful_edge.float().mean().detach().item()),
+            "p23_edge_gate_target_mean": float(utility_target.mean().detach().item()),
+            "p23_edge_gate_delta_corr": float(corr.detach().item()),
+        }
+        return harm_loss, gate_loss, stats
 
     selected_feature = edge_feature[valid]
     selected_delta = delta[edge_node[valid]]
@@ -6864,7 +6960,8 @@ def run_single(
     seed = int(experiment_cfg.get("seed", 0))
     split_seed = int(experiment_cfg.get("split_seed", seed))
     trial_index = int(experiment_cfg.get("trial_index", 0))
-    set_seed(seed)
+    if bool(experiment_cfg.get("reset_seed", True)):
+        set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     target_dataset = str(experiment_cfg.get("target_dataset", "Cora"))
     variant = _prompt_variant(config)
@@ -6912,6 +7009,8 @@ def run_single(
         device=device,
         freeze=bool(pretrained_cfg.get("freeze_backbone", True)),
     )
+    if "dropout" in model_cfg and model_cfg["dropout"] is not None:
+        setattr(backbone, "dropout", float(model_cfg["dropout"]))
     source_dim = int(backbone.convs[0].lin.weight.shape[1])
     hidden_dim = int(backbone.convs[0].lin.weight.shape[0])
     input_aligner = InputAligner(
@@ -9627,6 +9726,7 @@ def run_single(
         "aligner_style": str(model_cfg.get("input_aligner", "linear")),
         "adapter_style": str(model_cfg.get("adapter_style", "stable_zero_init")),
         "fusion_alpha_style": str(model_cfg.get("fusion_alpha_style", "sigmoid")),
+        "model_dropout": float(model_cfg.get("dropout", getattr(backbone, "dropout", 0.0))),
         "model_variant": _model_variant(model_cfg),
         "final": {**final_metrics, **init_eq},
         "best": {**best_metrics, **init_eq},
@@ -9836,14 +9936,16 @@ def run(config: dict[str, Any], *, repo_root: Path) -> dict[str, Any]:
     total_run_count = len(seeds) * trials_per_seed
     run_counter = 0
     for seed in seeds:
+        set_seed(int(seed))
         for trial_idx in range(trials_per_seed):
-            trial_seed = int(seed) if trials_per_seed == 1 else int(seed) * 1000003 + int(trial_idx)
+            split_seed = int(seed) if trials_per_seed == 1 else int(seed) * 1000 + int(trial_idx) + 1
             trial_update = {
                 "experiment": {
-                    "seed": trial_seed,
-                    "split_seed": int(seed),
+                    "seed": int(seed),
+                    "split_seed": split_seed,
                     "trial_index": int(trial_idx),
                     "base_seed": int(seed),
+                    "reset_seed": False,
                 }
             }
             current_run_index = run_counter
@@ -11365,6 +11467,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_prompt_balance", type=float, default=None)
     parser.add_argument("--lambda_p23_feature_harm", type=float, default=None)
     parser.add_argument("--lambda_p23_feature_gate_supervision", type=float, default=None)
+    parser.add_argument("--enable_p23_node_feature_edge_gate", action="store_true")
+    parser.add_argument("--disable_p23_node_feature_edge_gate", action="store_true")
+    parser.add_argument("--p23_node_feature_edge_gate_strength", type=float, default=None)
     parser.add_argument("--p23_feature_harm_margin", type=float, default=None)
     parser.add_argument("--p23_feature_harm_temperature", type=float, default=None)
     parser.add_argument("--p23_feature_harm_quantile", type=float, default=None)
@@ -11372,6 +11477,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p23_feature_min_signal", type=float, default=None)
     parser.add_argument("--p23_feature_help_weight", type=float, default=None)
     parser.add_argument("--p23_feature_harm_warmup_epochs", type=int, default=None)
+    parser.add_argument("--enable_p23_static_pool", action="store_true")
+    parser.add_argument("--disable_p23_static_pool", action="store_true")
+    parser.add_argument("--p23_static_pool_strategy", type=str, default=None)
+    parser.add_argument("--p23_static_pool_mode", type=str, choices=["hard", "soft"], default=None)
+    parser.add_argument("--p23_static_pool_ratio", type=float, default=None)
+    parser.add_argument("--p23_static_pool_core_ratio", type=float, default=None)
+    parser.add_argument("--p23_static_pool_expand_ratio", type=float, default=None)
+    parser.add_argument("--p23_static_pool_core_scale", type=float, default=None)
+    parser.add_argument("--p23_static_pool_expand_scale", type=float, default=None)
+    parser.add_argument("--p23_static_pool_non_pool_scale", type=float, default=None)
+    parser.add_argument("--p23_static_pool_apply_to", type=str, choices=["prompt_to_node", "both"], default=None)
+    parser.add_argument("--p23_static_pool_feature_topk", type=int, default=None)
     parser.add_argument("--lambda_prompt_usage_consistency", type=float, default=None)
     parser.add_argument("--lambda_prompt_view_entropy", type=float, default=None)
     parser.add_argument("--lambda_class_route", type=float, default=None)
@@ -11437,6 +11554,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_label_cheat_fraction", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--prompt_lr", type=float, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--use_original_contrastive", action="store_true")
+    parser.add_argument("--disable_original_contrastive", action="store_true")
+    parser.add_argument("--use_original_topology_fusion", action="store_true")
+    parser.add_argument("--disable_original_topology_fusion", action="store_true")
+    parser.add_argument("--lambda_ctr", type=float, default=None)
+    parser.add_argument("--lambda_fus", type=float, default=None)
+    parser.add_argument("--tau_ctr", type=float, default=None)
+    parser.add_argument("--tau_fus", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--prompt_weight_decay", type=float, default=None)
     parser.add_argument("--patience", type=int, default=None)
@@ -11482,6 +11608,24 @@ def main() -> None:
         overrides.setdefault("training", {})["lr"] = args.lr
     if args.prompt_lr is not None:
         overrides.setdefault("training", {})["prompt_lr"] = args.prompt_lr
+    if args.dropout is not None:
+        overrides.setdefault("model", {})["dropout"] = float(args.dropout)
+    if args.use_original_contrastive:
+        overrides.setdefault("loss", {})["use_original_contrastive"] = True
+    if args.disable_original_contrastive:
+        overrides.setdefault("loss", {})["use_original_contrastive"] = False
+    if args.use_original_topology_fusion:
+        overrides.setdefault("loss", {})["use_original_topology_fusion"] = True
+    if args.disable_original_topology_fusion:
+        overrides.setdefault("loss", {})["use_original_topology_fusion"] = False
+    if args.lambda_ctr is not None:
+        overrides.setdefault("loss", {})["lambda_ctr"] = float(args.lambda_ctr)
+    if args.lambda_fus is not None:
+        overrides.setdefault("loss", {})["lambda_fus"] = float(args.lambda_fus)
+    if args.tau_ctr is not None:
+        overrides.setdefault("loss", {})["tau_ctr"] = float(args.tau_ctr)
+    if args.tau_fus is not None:
+        overrides.setdefault("loss", {})["tau_fus"] = float(args.tau_fus)
     if args.weight_decay is not None:
         overrides.setdefault("training", {})["weight_decay"] = args.weight_decay
     if args.prompt_weight_decay is not None:
@@ -11660,6 +11804,14 @@ def main() -> None:
         overrides.setdefault("prompt_graph", {})["lambda_p23_feature_gate_supervision"] = float(
             args.lambda_p23_feature_gate_supervision
         )
+    if args.enable_p23_node_feature_edge_gate:
+        overrides.setdefault("prompt_graph", {})["use_node_feature_edge_gate"] = True
+    if args.disable_p23_node_feature_edge_gate:
+        overrides.setdefault("prompt_graph", {})["use_node_feature_edge_gate"] = False
+    if args.p23_node_feature_edge_gate_strength is not None:
+        overrides.setdefault("prompt_graph", {})["node_feature_edge_gate_strength"] = float(
+            args.p23_node_feature_edge_gate_strength
+        )
     if args.p23_feature_harm_margin is not None:
         overrides.setdefault("prompt_graph", {})["p23_feature_harm_margin"] = float(args.p23_feature_harm_margin)
     if args.p23_feature_harm_temperature is not None:
@@ -11677,6 +11829,46 @@ def main() -> None:
     if args.p23_feature_harm_warmup_epochs is not None:
         overrides.setdefault("prompt_graph", {})["p23_feature_harm_warmup_epochs"] = int(
             args.p23_feature_harm_warmup_epochs
+        )
+    if args.enable_p23_static_pool:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["enabled"] = True
+    if args.disable_p23_static_pool:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["enabled"] = False
+    if args.p23_static_pool_strategy is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["strategy"] = str(
+            args.p23_static_pool_strategy
+        )
+    if args.p23_static_pool_mode is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["mode"] = str(args.p23_static_pool_mode)
+    if args.p23_static_pool_ratio is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["ratio"] = float(args.p23_static_pool_ratio)
+    if args.p23_static_pool_core_ratio is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["core_ratio"] = float(
+            args.p23_static_pool_core_ratio
+        )
+    if args.p23_static_pool_expand_ratio is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["expand_ratio"] = float(
+            args.p23_static_pool_expand_ratio
+        )
+    if args.p23_static_pool_core_scale is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["core_scale"] = float(
+            args.p23_static_pool_core_scale
+        )
+    if args.p23_static_pool_expand_scale is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["expand_scale"] = float(
+            args.p23_static_pool_expand_scale
+        )
+    if args.p23_static_pool_non_pool_scale is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["non_pool_scale"] = float(
+            args.p23_static_pool_non_pool_scale
+        )
+    if args.p23_static_pool_apply_to is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["apply_to"] = str(
+            args.p23_static_pool_apply_to
+        )
+    if args.p23_static_pool_feature_topk is not None:
+        overrides.setdefault("prompt_graph", {}).setdefault("static_pool", {})["feature_topk"] = int(
+            args.p23_static_pool_feature_topk
         )
     if args.lambda_prompt_usage_consistency is not None:
         overrides.setdefault("prompt_graph", {})["lambda_prompt_usage_consistency"] = float(args.lambda_prompt_usage_consistency)
